@@ -1,0 +1,12 @@
+services:
+  lite-one-api:
+    build: .
+    container_name: lite-one-api
+    ports:
+      - "3000:3000"
+    environment:
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - LITE_ONE_API_DB=/app/data/lite-one-api.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

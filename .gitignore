@@ -1,0 +1,17 @@
+# one-api reference source (not part of this project)
+one-api/
+
+# rust
+backend/target/
+
+# node
+frontend/node_modules/
+frontend/dist/
+
+# runtime data
+data/
+*.db
+*.db-journal
+
+# env
+.env
