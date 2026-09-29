@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # LiteRouter
 
-A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI / Claude / relay stations, etc.) behind a single unified endpoint, issues internal access keys, and provides model routing, multi-channel failover, and usage tracking. Single Rust binary + SQLite, no external dependencies, ready out of the box.
+A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI / Claude / relay stations, etc.) behind a single unified endpoint, issues its own access keys to downstream clients, and provides model routing, multi-channel failover, and usage tracking. Single Rust binary + SQLite, no external dependencies, ready out of the box.
 
 ## Features
 
@@ -15,7 +15,7 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 - **Protocol conversion**: automatically converts bidirectionally when the client protocol doesn't match the channel's (Anthropic Messages ⇄ OpenAI ChatCompletions), including streaming and tool calls. For example, an OpenAI-protocol channel can directly serve Claude Code (an Anthropic-protocol client) with zero configuration
 - **Model routing (Mappings)**: maps the model name in client requests (e.g. `my-model`) to a list of real upstream model IDs, one-to-many with adjustable order; requests are forwarded in list order and automatically fall back to the next target when earlier ones fail or have no available channel
 - **Multi-channel failover**: on upstream transport errors or retryable status codes (408 / 429 / 5xx / 524), automatically switches to the next candidate channel; non-retryable 4xx errors are returned to the client as-is
-- **Internal tokens + quotas**: issue `sk-` keys for internal services, with per-token RPM limits and daily token-usage limits (429 on exceeding)
+- **Internal tokens + quotas**: issue `sk-` keys for your own services/users, with per-token RPM limits and daily token-usage limits (429 on exceeding)
 - **Usage tracking & call logs**: records the channel, model, status code, and prompt / completion / total tokens of every request, with a usage dashboard in the admin UI
 - **Client-disconnect cancellation**: upstream requests are cancelled automatically when the client disconnects, saving upstream quota
 - **Zero maintenance**: SQLite storage, no external dependencies, database schema migrates automatically
