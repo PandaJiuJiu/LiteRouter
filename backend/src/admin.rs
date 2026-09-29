@@ -339,7 +339,7 @@ pub async fn test_model(
     // OpenAI-compatible attempt
     if !openai_base.is_empty() {
         let url = format!("{}/chat/completions", openai_base);
-        let mut r = state.http
+        let r = state.http
             .post(&url)
             .header("Authorization", format!("Bearer {}", req.api_key))
             .json(&minimal_body);
@@ -358,7 +358,7 @@ pub async fn test_model(
     // Anthropic-compatible attempt
     if !anthropic_base.is_empty() {
         let url = format!("{}/v1/messages", anthropic_base);
-        let mut r = state.http
+        let r = state.http
             .post(&url)
             .header("x-api-key", &req.api_key)
             .header("anthropic-version", "2023-06-01")

@@ -1,4 +1,5 @@
 mod admin;
+mod convert;
 mod auth;
 mod db;
 mod proxy;

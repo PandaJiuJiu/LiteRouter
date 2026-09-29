@@ -10,6 +10,7 @@
 //! don't burn quota on a misrouted / malformed request.
 
 use crate::admin;
+use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::state::AppState;
 use axum::body::Body;
@@ -103,17 +104,27 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
     Ok(name)
 }
 
+/// One routable upstream hop: the URL/key to hit and, when the channel only
+/// speaks the other protocol, the conversion the relay must apply.
+struct Candidate {
+    name: String,
+    base_url: String,
+    api_key: String,
+    convert: ConvertMode,
+}
+
 /// All enabled *external* channels that claim to serve `model` on `protocol`.
 /// Every request reaching this relay is an internal request, and internal
 /// requests are routed to external channels only — 'internal' channels never
-/// serve relay traffic. Returned in DB order (caller can override by stable
-/// sort, but row id is monotonic so the "first registered channel wins" rule
-/// is preserved).
+/// serve relay traffic. Channels without a URL for the client's protocol but
+/// with one for the other protocol are included with a conversion mode.
+/// Returned in DB order (caller can override by stable sort, but row id is
+/// monotonic so the "first registered channel wins" rule is preserved).
 async fn candidate_channels(
     state: &AppState,
     model: &str,
     protocol: &str,
-) -> Result<Vec<(String, String, String)>, StatusCode> {
+) -> Result<Vec<Candidate>, StatusCode> {
     let rows = sqlx::query(
         "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1 AND kind='external'",
     )
@@ -130,18 +141,34 @@ async fn candidate_channels(
         if !matches {
             continue;
         }
-        let base_url = match protocol {
-            "anthropic" => row.get::<String, _>("base_url_anthropic"),
-            _ => row.get::<String, _>("base_url"),
+        let openai_url: String = row.get("base_url");
+        let anthropic_url: String = row.get("base_url_anthropic");
+        let (base_url, convert) = match protocol {
+            "anthropic" => {
+                if !anthropic_url.is_empty() {
+                    (anthropic_url, ConvertMode::None)
+                } else if !openai_url.is_empty() {
+                    (openai_url, ConvertMode::ToOpenAI)
+                } else {
+                    continue; // channel serves neither protocol
+                }
+            }
+            _ => {
+                if !openai_url.is_empty() {
+                    (openai_url, ConvertMode::None)
+                } else if !anthropic_url.is_empty() {
+                    (anthropic_url, ConvertMode::ToAnthropic)
+                } else {
+                    continue;
+                }
+            }
         };
-        if base_url.is_empty() {
-            continue; // this channel doesn't serve the requested protocol
-        }
-        out.push((
-            row.get::<String, _>("name"),
+        out.push(Candidate {
+            name: row.get("name"),
             base_url,
-            row.get::<String, _>("api_key"),
-        ));
+            api_key: row.get("api_key"),
+            convert,
+        });
     }
     Ok(out)
 }
@@ -199,31 +226,45 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
     out
 }
 
-/// A target pinned to a named channel: (base_url, api_key) for `protocol`,
-/// or None when the channel doesn't exist / is disabled / doesn't serve the
-/// protocol.
+/// A target pinned to a named channel: the URL/key/conversion to reach it on
+/// `protocol`, or None when the channel doesn't exist / is disabled / serves
+/// neither protocol.
 async fn pinned_channel(
     state: &AppState,
     name: &str,
     protocol: &str,
-) -> Option<(String, String)> {
+) -> Option<Candidate> {
     let row = sqlx::query(
-        "SELECT base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1 AND kind='external'",
+        "SELECT name, base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1 AND kind='external'",
     )
     .bind(name)
     .fetch_optional(&state.pool)
     .await
     .ok()
     .flatten()?;
-    let base_url = if protocol == "anthropic" {
-        row.get::<String, _>("base_url_anthropic")
+    let openai_url: String = row.get("base_url");
+    let anthropic_url: String = row.get("base_url_anthropic");
+    let (base_url, convert) = if protocol == "anthropic" {
+        if !anthropic_url.is_empty() {
+            (anthropic_url, ConvertMode::None)
+        } else if !openai_url.is_empty() {
+            (openai_url, ConvertMode::ToOpenAI)
+        } else {
+            return None;
+        }
+    } else if !openai_url.is_empty() {
+        (openai_url, ConvertMode::None)
+    } else if !anthropic_url.is_empty() {
+        (anthropic_url, ConvertMode::ToAnthropic)
     } else {
-        row.get::<String, _>("base_url")
-    };
-    if base_url.is_empty() {
         return None;
-    }
-    Some((base_url, row.get::<String, _>("api_key")))
+    };
+    Some(Candidate {
+        name: row.get("name"),
+        base_url,
+        api_key: row.get("api_key"),
+        convert,
+    })
 }
 
 async fn log_request(
@@ -286,14 +327,16 @@ fn is_retriable_status(code: u16) -> bool {
 
 /// Build the upstream request with auth + protocol-appropriate headers. The
 /// caller still owns the body, so this is just a header recipe.
+/// `upstream_protocol` is the protocol the upstream actually speaks (which
+/// may differ from the client's when converting).
 fn build_request(
     state: &AppState,
     base_url: &str,
     api_key: &str,
-    protocol: &str,
+    upstream_protocol: &str,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
-    let req = if protocol == "anthropic" {
+    let req = if upstream_protocol == "anthropic" {
         let version = headers
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
@@ -312,19 +355,106 @@ fn build_request(
     req.header("Content-Type", "application/json")
 }
 
+/// Pass the upstream body through unchanged, preserving the
+/// drop-cancels-upstream mechanism: when the client disconnects, axum drops
+/// the body, which drops the stream, which drops `resp`, which cancels the
+/// upstream connection.
+fn passthrough_stream(resp: reqwest::Response, status: StatusCode, content_type: Option<axum::http::HeaderValue>) -> Response {
+    let body_stream = stream::unfold(resp, |mut r| async move {
+        match r.chunk().await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, reqwest::Error>(bytes), r)),
+            Ok(None) => None,
+            Err(e) => Some((Err(e), r)),
+        }
+    });
+    let mut response = Response::builder().status(status);
+    if let Some(ct) = content_type {
+        if let Some(h) = response.headers_mut() {
+            h.insert(axum::http::header::CONTENT_TYPE, ct);
+        }
+    }
+    response
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+}
+
+/// Convert an upstream SSE byte stream to the client's protocol, line by
+/// line, via an `SseConverter`. Same drop-cancels-upstream property as the
+/// passthrough stream.
+fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Response {
+    let mut response = Response::builder().status(StatusCode::OK);
+    if let Some(h) = response.headers_mut() {
+        h.insert(axum::http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    }
+    let state = (resp, String::new(), conv, false);
+    let body_stream = stream::unfold(state, |mut st| async move {
+        let (resp, buf, conv, done) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
+        loop {
+            if *done {
+                return None;
+            }
+            if let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim_end_matches('\r').to_string();
+                buf.drain(..=pos);
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    let events = if payload == "[DONE]" {
+                        *done = true;
+                        conv.finish()
+                    } else {
+                        conv.on_data(payload)
+                    };
+                    if !events.is_empty() {
+                        return Some((Ok::<Bytes, reqwest::Error>(Bytes::from(events.concat())), st));
+                    }
+                    if *done {
+                        return None; // finish() produced nothing
+                    }
+                }
+                // non-data lines (event:, comments, blanks) are dropped
+                continue;
+            }
+            match resp.chunk().await {
+                Ok(Some(bytes)) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                Ok(None) => {
+                    // upstream ended; flush converter's remaining events once
+                    *done = true;
+                    let events = conv.finish();
+                    if events.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(Bytes::from(events.concat())), st));
+                }
+                Err(e) => {
+                    *done = true;
+                    return Some((Err(e), st));
+                }
+            }
+        }
+    });
+    response
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+}
+
 /// Convert a successful upstream response into the client response, logging
 /// the outcome against `channel_name`. Streaming requests pass through
 /// unchanged; non-streaming responses are buffered so we can extract usage.
+/// `convert` says which protocol translation this hop needs.
 async fn respond_from_upstream(
     state: &AppState,
     token_name: &str,
     model: &str,
-    channel_name: &str,
+    cand: &Candidate,
     resp: reqwest::Response,
     is_streaming: bool,
 ) -> Response {
+    let channel_name = cand.name.as_str();
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let convert = cand.convert;
 
     if !is_streaming {
         let content_type = resp.headers().get("content-type").cloned();
@@ -356,6 +486,30 @@ async fn respond_from_upstream(
             usage,
         )
         .await;
+        // translate the buffered body when converting
+        let out_bytes = if convert != ConvertMode::None {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => {
+                    let converted = if status.is_success() {
+                        match convert {
+                            ConvertMode::ToOpenAI => convert::openai_resp_to_anthropic(&v, model),
+                            ConvertMode::ToAnthropic => convert::anthropic_resp_to_openai(&v, model),
+                            ConvertMode::None => unreachable!(),
+                        }
+                    } else {
+                        match convert {
+                            ConvertMode::ToOpenAI => convert::openai_err_to_anthropic(&v),
+                            ConvertMode::ToAnthropic => convert::anthropic_err_to_openai(&v),
+                            ConvertMode::None => unreachable!(),
+                        }
+                    };
+                    serde_json::to_vec(&converted).unwrap_or_else(|_| bytes.to_vec())
+                }
+                Err(_) => bytes.to_vec(), // not JSON — pass through untouched
+            }
+        } else {
+            bytes.to_vec()
+        };
         let mut builder = Response::builder().status(status);
         if let Some(ct) = content_type {
             if let Some(h) = builder.headers_mut() {
@@ -363,7 +517,7 @@ async fn respond_from_upstream(
             }
         }
         return builder
-            .body(Body::from(bytes))
+            .body(Body::from(out_bytes))
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"));
     }
 
@@ -377,28 +531,20 @@ async fn respond_from_upstream(
         None,
     )
     .await;
-    let content_type = resp.headers().get("content-type").cloned();
-    // Move the upstream Response into the streaming body via `unfold` so that
-    // when the client disconnects, axum drops the body, which drops the
-    // stream, which drops `resp`, which cancels the upstream connection. This
-    // is what stops a cancelled streaming request from burning the rest of
-    // its quota on the provider side.
-    let body_stream = stream::unfold(resp, |mut r| async move {
-        match r.chunk().await {
-            Ok(Some(bytes)) => Some((Ok::<Bytes, reqwest::Error>(bytes), r)),
-            Ok(None) => None,
-            Err(e) => Some((Err(e), r)),
+    match convert {
+        ConvertMode::None => {
+            let content_type = resp.headers().get("content-type").cloned();
+            passthrough_stream(resp, status, content_type)
         }
-    });
-    let mut response = Response::builder().status(status);
-    if let Some(ct) = content_type {
-        if let Some(h) = response.headers_mut() {
-            h.insert(axum::http::header::CONTENT_TYPE, ct);
+        ConvertMode::ToOpenAI => {
+            let conv = convert::OpenAiToAnthropicStream::new(model);
+            converted_stream(resp, Box::new(conv))
+        }
+        ConvertMode::ToAnthropic => {
+            let conv = convert::AnthropicToOpenAiStream::new(model);
+            converted_stream(resp, Box::new(conv))
         }
     }
-    response
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
 }
 
 /// Common relay: auth -> route -> forward with multi-channel failover.
@@ -447,11 +593,11 @@ async fn relay(
             }
         } else {
             match pinned_channel(state, pin_channel, protocol).await {
-                Some((base_url, api_key)) => vec![(pin_channel.clone(), base_url, api_key)],
+                Some(c) => vec![c],
                 None => {
                     last_err = format!(
-                        "pinned channel `{}` is disabled, missing, or has no {} URL",
-                        pin_channel, protocol
+                        "pinned channel `{}` is disabled, missing, or serves neither protocol",
+                        pin_channel
                     );
                     continue;
                 }
@@ -461,14 +607,31 @@ async fn relay(
             last_err = format!("no enabled channel provides model `{}`", target_model);
             continue;
         }
-        // rewrite the upstream request body to the target model
-        let mut body_json = req_json.clone();
-        body_json["model"] = json!(target_model);
-        let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
-        for (channel_name, base_url, api_key) in &candidates {
+        for cand in &candidates {
+            // rewrite the request to the target model, in the upstream's
+            // protocol when this channel needs conversion
+            let upstream_protocol = match cand.convert {
+                ConvertMode::ToOpenAI => "openai",
+                ConvertMode::ToAnthropic => "anthropic",
+                ConvertMode::None => protocol,
+            };
+            let body_json = match cand.convert {
+                ConvertMode::None => {
+                    let mut b = req_json.clone();
+                    b["model"] = json!(target_model);
+                    b
+                }
+                ConvertMode::ToOpenAI => {
+                    convert::anthropic_req_to_openai(&req_json, target_model)
+                }
+                ConvertMode::ToAnthropic => {
+                    convert::openai_req_to_anthropic(&req_json, target_model)
+                }
+            };
+            let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
             attempted += 1;
-            let req = build_request(state, base_url, api_key, protocol, headers)
-                .body(target_body.clone());
+            let req = build_request(state, &cand.base_url, &cand.api_key, upstream_protocol, headers)
+                .body(target_body);
             match req.send().await {
                 Ok(resp) => {
                     let code = resp.status().as_u16();
@@ -477,7 +640,7 @@ async fn relay(
                             state,
                             &token_name,
                             target_model,
-                            channel_name,
+                            cand,
                             resp,
                             is_streaming,
                         )
@@ -489,19 +652,19 @@ async fn relay(
                             state,
                             &token_name,
                             target_model,
-                            channel_name,
+                            cand,
                             resp,
                             is_streaming,
                         )
                         .await;
                     }
                     // retriable: log + try next
-                    log_request(state, &token_name, target_model, channel_name, code as i64, None).await;
-                    last_err = format!("{} ({}) -> HTTP {}", channel_name, target_model, code);
+                    log_request(state, &token_name, target_model, &cand.name, code as i64, None).await;
+                    last_err = format!("{} ({}) -> HTTP {}", cand.name, target_model, code);
                 }
                 Err(e) => {
-                    log_request(state, &token_name, target_model, channel_name, -1, None).await;
-                    last_err = format!("{} ({}): {}", channel_name, target_model, e);
+                    log_request(state, &token_name, target_model, &cand.name, -1, None).await;
+                    last_err = format!("{} ({}): {}", cand.name, target_model, e);
                 }
             }
         }
