@@ -37,6 +37,11 @@ async fn main() {
         )
         .route("/api/logs", get(admin::list_logs))
         .route("/api/usage", get(admin::usage))
+        .route(
+            "/api/mappings",
+            get(admin::list_mappings).post(admin::create_mapping),
+        )
+        .route("/api/mappings/:id", axum::routing::delete(admin::delete_mapping))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 

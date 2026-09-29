@@ -1,5 +1,7 @@
 //! OpenAI-compatible relay: auth with internal token, route model -> channel,
-//! forward request (streaming included) to the upstream channel.
+//! forward request (streaming included) to the upstream channel. All incoming
+//! requests are internal and are routed to external channels only
+//! (channels.kind='internal' never serves relay traffic).
 //!
 //! Failover: when a model is provided by more than one enabled channel, the
 //! relay tries them in order and falls over to the next candidate on transport
@@ -100,16 +102,19 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
     Ok(name)
 }
 
-/// All enabled channels that claim to serve `model` on `protocol`. Returned in
-/// DB order (caller can override by stable sort, but row id is monotonic so the
-/// "first registered channel wins" rule is preserved).
+/// All enabled *external* channels that claim to serve `model` on `protocol`.
+/// Every request reaching this relay is an internal request, and internal
+/// requests are routed to external channels only — 'internal' channels never
+/// serve relay traffic. Returned in DB order (caller can override by stable
+/// sort, but row id is monotonic so the "first registered channel wins" rule
+/// is preserved).
 async fn candidate_channels(
     state: &AppState,
     model: &str,
     protocol: &str,
 ) -> Result<Vec<(String, String, String)>, StatusCode> {
     let rows = sqlx::query(
-        "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1",
+        "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1 AND kind='external'",
     )
     .fetch_all(&state.pool)
     .await
@@ -138,6 +143,23 @@ async fn candidate_channels(
         ));
     }
     Ok(out)
+}
+
+/// If `alias` is configured to map to another model id, return that target;
+/// otherwise return `alias` unchanged. Single-level rewrite — `a → b → c` is
+/// treated as `a → b`.
+async fn resolve_alias(state: &AppState, alias: &str) -> String {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT target_model FROM model_mappings WHERE alias=?",
+    )
+    .bind(alias)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    match row {
+        Some((target,)) => target,
+        None => alias.to_string(),
+    }
 }
 
 async fn log_request(
@@ -341,6 +363,7 @@ async fn relay(
         Some(m) => m.to_string(),
         None => return error_response(StatusCode::BAD_REQUEST, "missing model in request"),
     };
+    let model = resolve_alias(state, &model).await;
     let is_streaming = req_json
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -439,7 +462,10 @@ pub async fn list_models(
     if let Err((s, msg)) = auth_token(&state, &key).await {
         return error_response(s, msg);
     }
-    let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
+    // only external channels serve relay traffic (see candidate_channels)
+    let rows = match sqlx::query(
+        "SELECT models FROM channels WHERE enabled=1 AND kind='external'",
+    )
         .fetch_all(&state.pool)
         .await
     {

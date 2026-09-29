@@ -49,4 +49,8 @@ export const listLogs = (page = 1, size = 50) =>
 export const fetchUsage = (range = 7) =>
   api.get('/usage', { params: { range } }).then((r) => r.data)
 
+export const listMappings = () => api.get('/mappings').then((r) => r.data.mappings)
+export const createMapping = (m) => api.post('/mappings', m)
+export const deleteMapping = (id) => api.delete(`/mappings/${id}`)
+
 export default api

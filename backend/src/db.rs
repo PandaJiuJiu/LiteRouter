@@ -17,6 +17,7 @@ pub async fn init_pool(path: &str) -> SqlitePool {
             api_key     TEXT NOT NULL,
             models      TEXT NOT NULL DEFAULT '',
             enabled     INTEGER NOT NULL DEFAULT 1,
+            kind        TEXT NOT NULL DEFAULT 'external',
             created_at  INTEGER NOT NULL
         );",
     )
@@ -26,6 +27,13 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     // migrate existing databases (add column if missing)
     let _ = sqlx::query(
         "ALTER TABLE channels ADD COLUMN base_url_anthropic TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(&pool)
+    .await;
+    // channel kind: 'external' channels serve relay traffic (all incoming
+    // requests are internal); 'internal' channels are excluded from routing
+    let _ = sqlx::query(
+        "ALTER TABLE channels ADD COLUMN kind TEXT NOT NULL DEFAULT 'external'",
     )
     .execute(&pool)
     .await;
@@ -84,6 +92,19 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     )
     .execute(&pool)
     .await;
+    // model aliases: rewrite a user-supplied name (e.g. "gpt-4o") into the
+    // upstream's real model id before channel routing
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS model_mappings (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias        TEXT NOT NULL UNIQUE,
+            target_model TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );",
+    )
+    .execute(&pool)
+    .await
+    .expect("create model_mappings table");
     pool
 }
 

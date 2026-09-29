@@ -19,6 +19,7 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
         "api_key": row.get::<String, _>("api_key"),
         "models": row.get::<String, _>("models"),
         "enabled": row.get::<i64, _>("enabled"),
+        "kind": row.get::<String, _>("kind"),
         "created_at": row.get::<i64, _>("created_at"),
     })
 }
@@ -55,9 +56,16 @@ pub struct ChannelReq {
     pub models: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 'external' (default, serves relay traffic) or 'internal' (excluded
+    /// from routing)
+    #[serde(default = "default_external")]
+    pub kind: Option<String>,
 }
 fn default_true() -> bool {
     true
+}
+fn default_external() -> Option<String> {
+    Some("external".to_string())
 }
 
 #[derive(Deserialize)]
@@ -93,6 +101,15 @@ pub async fn list_channels(
     })))
 }
 
+/// Only 'internal' is special; anything else (or missing) means 'external'.
+fn normalize_kind(kind: Option<&str>) -> String {
+    if kind == Some("internal") {
+        "internal".to_string()
+    } else {
+        "external".to_string()
+    }
+}
+
 pub async fn create_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -102,13 +119,15 @@ pub async fn create_channel(
     if req.base_url.trim().is_empty() && req.base_url_anthropic.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    sqlx::query("INSERT INTO channels (name, base_url, base_url_anthropic, api_key, models, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    let kind = normalize_kind(req.kind.as_deref());
+    sqlx::query("INSERT INTO channels (name, base_url, base_url_anthropic, api_key, models, enabled, kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&req.name)
         .bind(req.base_url.trim_end_matches('/'))
         .bind(req.base_url_anthropic.trim_end_matches('/'))
         .bind(&req.api_key)
         .bind(req.models.unwrap_or_default())
         .bind(req.enabled as i64)
+        .bind(&kind)
         .bind(now())
         .execute(&state.pool)
         .await
@@ -137,13 +156,25 @@ pub async fn update_channel(
             .map(|r| r.get::<String, _>("models"))
             .unwrap_or_default(),
     };
-    sqlx::query("UPDATE channels SET name=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=? WHERE id=?")
+    // keep existing kind when the request omits it (older clients)
+    let kind = match req.kind {
+        Some(ref k) => normalize_kind(Some(k)),
+        None => sqlx::query("SELECT kind FROM channels WHERE id=?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map(|r| r.get::<String, _>("kind"))
+            .unwrap_or_else(|| "external".to_string()),
+    };
+    sqlx::query("UPDATE channels SET name=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=?, kind=? WHERE id=?")
         .bind(&req.name)
         .bind(req.base_url.trim_end_matches('/'))
         .bind(req.base_url_anthropic.trim_end_matches('/'))
         .bind(&req.api_key)
         .bind(&models)
         .bind(req.enabled as i64)
+        .bind(&kind)
         .bind(id)
         .execute(&state.pool)
         .await
@@ -432,6 +463,78 @@ pub async fn delete_token(
 ) -> Result<Json<Value>, StatusCode> {
     check_admin(&state, &headers)?;
     sqlx::query("DELETE FROM tokens WHERE id=?")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------- model mappings ----------
+
+#[derive(Deserialize)]
+pub struct MappingReq {
+    pub alias: String,
+    pub target_model: String,
+}
+
+pub async fn list_mappings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let rows = sqlx::query("SELECT * FROM model_mappings ORDER BY id ASC")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mappings: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<i64, _>("id"),
+                "alias": r.get::<String, _>("alias"),
+                "target_model": r.get::<String, _>("target_model"),
+                "created_at": r.get::<i64, _>("created_at"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "mappings": mappings })))
+}
+
+pub async fn create_mapping(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<MappingReq>,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    if req.alias.trim().is_empty() || req.target_model.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let res = sqlx::query(
+        "INSERT INTO model_mappings (alias, target_model, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(req.alias.trim())
+    .bind(req.target_model.trim())
+    .bind(now())
+    .execute(&state.pool)
+    .await;
+    match res {
+        Ok(_) => Ok(Json(json!({ "ok": true }))),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
+            // SQLITE_CONSTRAINT_UNIQUE — alias already exists
+            Err(StatusCode::CONFLICT)
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+pub async fn delete_mapping(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    sqlx::query("DELETE FROM model_mappings WHERE id=?")
         .bind(id)
         .execute(&state.pool)
         .await
