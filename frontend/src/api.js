@@ -41,10 +41,12 @@ export const testModel = (c) =>
 
 export const listTokens = () => api.get('/tokens').then((r) => r.data.tokens)
 export const createToken = (t) => api.post('/tokens', t).then((r) => r.data)
-export const toggleToken = (id, enabled) => api.put(`/tokens/${id}`, { enabled })
+export const updateToken = (id, t) => api.put(`/tokens/${id}`, t).then((r) => r.data)
 export const deleteToken = (id) => api.delete(`/tokens/${id}`)
 
 export const listLogs = (page = 1, size = 50) =>
   api.get('/logs', { params: { page, size } }).then((r) => r.data.logs)
+export const fetchUsage = (range = 7) =>
+  api.get('/usage', { params: { range } }).then((r) => r.data)
 
 export default api

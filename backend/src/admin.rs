@@ -30,6 +30,8 @@ fn row_token(row: &sqlx::sqlite::SqliteRow, show_key: bool) -> Value {
         "enabled": row.get::<i64, _>("enabled"),
         "created_at": row.get::<i64, _>("created_at"),
         "accessed_at": row.get::<i64, _>("accessed_at"),
+        "rpm_limit": row.get::<i64, _>("rpm_limit"),
+        "daily_token_limit": row.get::<i64, _>("daily_token_limit"),
     });
     if show_key {
         v["key"] = json!(row.get::<String, _>("key"));
@@ -345,6 +347,23 @@ pub struct TokenReq {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// requests per minute; 0 = unlimited
+    #[serde(default)]
+    pub rpm_limit: i64,
+    /// total tokens per UTC day; 0 = unlimited
+    #[serde(default)]
+    pub daily_token_limit: i64,
+}
+
+/// PATCH-able fields for an existing token (everything except name + key)
+#[derive(Deserialize)]
+pub struct TokenUpdateReq {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rpm_limit: i64,
+    #[serde(default)]
+    pub daily_token_limit: i64,
 }
 
 pub async fn list_tokens(
@@ -368,11 +387,13 @@ pub async fn create_token(
 ) -> Result<Json<Value>, StatusCode> {
     check_admin(&state, &headers)?;
     let key = format!("sk-{}", uuid::Uuid::new_v4().simple());
-    sqlx::query("INSERT INTO tokens (name, key, enabled, created_at) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO tokens (name, key, enabled, created_at, rpm_limit, daily_token_limit) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&req.name)
         .bind(&key)
         .bind(req.enabled as i64)
         .bind(now())
+        .bind(req.rpm_limit.max(0))
+        .bind(req.daily_token_limit.max(0))
         .execute(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -388,19 +409,19 @@ pub async fn toggle_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-    Json(body): Json<Value>,
+    Json(req): Json<TokenUpdateReq>,
 ) -> Result<Json<Value>, StatusCode> {
     check_admin(&state, &headers)?;
-    let enabled = body
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .ok_or(StatusCode::BAD_REQUEST)? as i64;
-    sqlx::query("UPDATE tokens SET enabled=? WHERE id=?")
-        .bind(enabled)
-        .bind(id)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query(
+        "UPDATE tokens SET enabled=?, rpm_limit=?, daily_token_limit=? WHERE id=?",
+    )
+    .bind(req.enabled as i64)
+    .bind(req.rpm_limit.max(0))
+    .bind(req.daily_token_limit.max(0))
+    .bind(id)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -456,9 +477,128 @@ pub async fn list_logs(
                 "model": r.get::<String, _>("model"),
                 "channel_name": r.get::<String, _>("channel_name"),
                 "status_code": r.get::<i64, _>("status_code"),
+                "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
+                "completion_tokens": r.get::<i64, _>("completion_tokens"),
+                "total_tokens": r.get::<i64, _>("total_tokens"),
                 "created_at": r.get::<i64, _>("created_at"),
             })
         })
         .collect();
     Ok(Json(json!({ "logs": logs })))
+}
+
+/// GET /api/usage?range=7d — aggregated token usage & request counts,
+/// broken down by day / token / model / channel.
+#[derive(Deserialize)]
+pub struct UsageQuery {
+    #[serde(default = "default_range")]
+    pub range: i64,
+}
+fn default_range() -> i64 {
+    7
+}
+
+pub async fn usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let days = q.range.max(1).min(90);
+    let since = crate::db::now() - days * 86400;
+
+    // by day
+    let day_rows = sqlx::query(
+        "SELECT
+            (created_at / 86400) * 86400 AS k,
+            COUNT(*) AS reqs,
+            SUM(prompt_tokens) AS p,
+            SUM(completion_tokens) AS c,
+            SUM(total_tokens) AS t
+         FROM logs WHERE created_at >= ? GROUP BY k ORDER BY k",
+    )
+    .bind(since)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // by token / model / channel: separate queries (SQLite has no GROUPING SETS)
+    let group_q = |col: &str| {
+        format!(
+            "SELECT {0} AS k, COUNT(*) AS reqs,
+                SUM(prompt_tokens) AS p,
+                SUM(completion_tokens) AS c,
+                SUM(total_tokens) AS t
+             FROM logs WHERE created_at >= ? GROUP BY {0} ORDER BY t DESC",
+            col
+        )
+    };
+    let token_rows = sqlx::query(&group_q("token_name"))
+        .bind(since)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let model_rows = sqlx::query(&group_q("model"))
+        .bind(since)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let channel_rows = sqlx::query(&group_q("channel_name"))
+        .bind(since)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let totals = sqlx::query(
+        "SELECT COUNT(*) AS reqs, COALESCE(SUM(prompt_tokens),0) AS p,
+                COALESCE(SUM(completion_tokens),0) AS c,
+                COALESCE(SUM(total_tokens),0) AS t
+         FROM logs WHERE created_at >= ?",
+    )
+    .bind(since)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    fn map_group(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Value> {
+        rows.into_iter()
+            .map(|r| {
+                json!({
+                    "key": r.get::<String, _>("k"),
+                    "requests": r.get::<i64, _>("reqs"),
+                    "prompt_tokens": r.get::<i64, _>("p"),
+                    "completion_tokens": r.get::<i64, _>("c"),
+                    "total_tokens": r.get::<i64, _>("t"),
+                })
+            })
+            .collect()
+    }
+
+    // by_day uses unix-day timestamp as the key (integer), not a string
+    let by_day: Vec<Value> = day_rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "day": r.get::<i64, _>("k"),
+                "requests": r.get::<i64, _>("reqs"),
+                "prompt_tokens": r.get::<i64, _>("p"),
+                "completion_tokens": r.get::<i64, _>("c"),
+                "total_tokens": r.get::<i64, _>("t"),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "range_days": days,
+        "totals": {
+            "requests": totals.get::<i64, _>("reqs"),
+            "prompt_tokens": totals.get::<i64, _>("p"),
+            "completion_tokens": totals.get::<i64, _>("c"),
+            "total_tokens": totals.get::<i64, _>("t"),
+        },
+        "by_day": by_day,
+        "by_token": map_group(token_rows),
+        "by_model": map_group(model_rows),
+        "by_channel": map_group(channel_rows),
+    })))
 }

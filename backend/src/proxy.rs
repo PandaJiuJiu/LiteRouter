@@ -28,18 +28,62 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Validate internal token, update accessed_at. Returns token name.
-async fn auth_token(state: &AppState, key: &str) -> Result<String, StatusCode> {
-    let row = sqlx::query("SELECT name, enabled FROM tokens WHERE key=?")
+/// Validate internal token and enforce per-token quotas. Returns token name.
+/// Errors carry a status + user-facing message:
+///   (UNAUTHORIZED, "invalid or disabled token") — bad/disabled key
+///   (TOO_MANY_REQUESTS, msg) — rpm or daily-token limit exceeded
+async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, &'static str)> {
+    let row = sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit FROM tokens WHERE key=?")
         .bind(key)
         .fetch_optional(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
+        .ok_or((StatusCode::UNAUTHORIZED, "invalid or disabled token"))?;
     if row.get::<i64, _>("enabled") != 1 {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err((StatusCode::UNAUTHORIZED, "invalid or disabled token"));
     }
     let name = row.get::<String, _>("name");
+    let rpm_limit: i64 = row.get::<i64, _>("rpm_limit");
+    let daily_limit: i64 = row.get::<i64, _>("daily_token_limit");
+
+    // rpm check: count requests in last 60s
+    if rpm_limit > 0 {
+        let since = now() - 60;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM logs WHERE token_name=? AND created_at >= ?",
+        )
+        .bind(&name)
+        .bind(since)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+        if count >= rpm_limit {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded (rpm)",
+            ));
+        }
+    }
+
+    // daily token check: sum total_tokens since start of UTC day
+    if daily_limit > 0 {
+        let since_day = (now() / 86400) * 86400;
+        let used: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM logs WHERE token_name=? AND created_at >= ?",
+        )
+        .bind(&name)
+        .bind(since_day)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+        if used >= daily_limit {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "daily token quota exceeded",
+            ));
+        }
+    }
+
     let _ = sqlx::query("UPDATE tokens SET accessed_at=? WHERE key=?")
         .bind(now())
         .bind(key)
@@ -152,7 +196,7 @@ async fn relay(
     };
     let token_name = match auth_token(state, &key).await {
         Ok(n) => n,
-        Err(s) => return error_response(s, "invalid or disabled token"),
+        Err((s, msg)) => return error_response(s, msg),
     };
 
     // 2. parse body to find model
@@ -317,8 +361,8 @@ pub async fn list_models(
         Some(k) => k,
         None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token"),
     };
-    if let Err(s) = auth_token(&state, &key).await {
-        return error_response(s, "invalid or disabled token");
+    if let Err((s, msg)) = auth_token(&state, &key).await {
+        return error_response(s, msg);
     }
     let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
         .fetch_all(&state.pool)

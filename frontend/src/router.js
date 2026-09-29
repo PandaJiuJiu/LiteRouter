@@ -9,6 +9,7 @@ const routes = [
       { path: '', redirect: '/channels' },
       { path: 'channels', component: () => import('./views/Channels.vue') },
       { path: 'models', component: () => import('./views/Models.vue') },
+      { path: 'usage', component: () => import('./views/Usage.vue') },
       { path: 'tokens', component: () => import('./views/Tokens.vue') },
       { path: 'logs', component: () => import('./views/Logs.vue') },
     ],

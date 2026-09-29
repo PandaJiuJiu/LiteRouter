@@ -36,12 +36,23 @@ pub async fn init_pool(path: &str) -> SqlitePool {
             key         TEXT NOT NULL UNIQUE,
             enabled     INTEGER NOT NULL DEFAULT 1,
             created_at  INTEGER NOT NULL,
-            accessed_at INTEGER NOT NULL DEFAULT 0
+            accessed_at INTEGER NOT NULL DEFAULT 0,
+            rpm_limit         INTEGER NOT NULL DEFAULT 0,
+            daily_token_limit INTEGER NOT NULL DEFAULT 0
         );",
     )
     .execute(&pool)
     .await
     .expect("create tokens table");
+    // migrate: add quota columns if missing (idempotent)
+    for col in ["rpm_limit", "daily_token_limit"] {
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE tokens ADD COLUMN {} INTEGER NOT NULL DEFAULT 0",
+            col
+        ))
+        .execute(&pool)
+        .await;
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS logs (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,12 +60,30 @@ pub async fn init_pool(path: &str) -> SqlitePool {
             model        TEXT NOT NULL,
             channel_name TEXT NOT NULL,
             status_code  INTEGER NOT NULL,
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens      INTEGER NOT NULL DEFAULT 0,
             created_at   INTEGER NOT NULL
         );",
     )
     .execute(&pool)
     .await
     .expect("create logs table");
+    // migrate existing databases: add token columns if missing (idempotent)
+    for col in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+        let _ = sqlx::query(&format!(
+            "ALTER TABLE logs ADD COLUMN {} INTEGER NOT NULL DEFAULT 0",
+            col
+        ))
+        .execute(&pool)
+        .await;
+    }
+    // index for per-token usage lookups (RPM check + daily quota check)
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_logs_token_created ON logs (token_name, created_at)",
+    )
+    .execute(&pool)
+    .await;
     pool
 }
 
