@@ -14,6 +14,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
+use futures_util::stream;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
@@ -290,7 +292,18 @@ async fn respond_from_upstream(
     )
     .await;
     let content_type = resp.headers().get("content-type").cloned();
-    let stream = resp.bytes_stream();
+    // Move the upstream Response into the streaming body via `unfold` so that
+    // when the client disconnects, axum drops the body, which drops the
+    // stream, which drops `resp`, which cancels the upstream connection. This
+    // is what stops a cancelled streaming request from burning the rest of
+    // its quota on the provider side.
+    let body_stream = stream::unfold(resp, |mut r| async move {
+        match r.chunk().await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, reqwest::Error>(bytes), r)),
+            Ok(None) => None,
+            Err(e) => Some((Err(e), r)),
+        }
+    });
     let mut response = Response::builder().status(status);
     if let Some(ct) = content_type {
         if let Some(h) = response.headers_mut() {
@@ -298,7 +311,7 @@ async fn respond_from_upstream(
         }
     }
     response
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(body_stream))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
 }
 
