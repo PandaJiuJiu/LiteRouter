@@ -8,7 +8,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
@@ -94,17 +93,42 @@ async fn log_request(
     model: &str,
     channel_name: &str,
     status: i64,
+    usage: Option<(i64, i64, i64)>,
 ) {
+    let (p, c, t) = usage.unwrap_or((0, 0, 0));
     let _ = sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(token_name)
     .bind(model)
     .bind(channel_name)
     .bind(status)
+    .bind(p)
+    .bind(c)
+    .bind(t)
     .bind(now())
     .execute(&state.pool)
     .await;
+}
+
+/// Extract (prompt, completion, total) token counts from an upstream JSON body.
+/// Supports OpenAI ({prompt_tokens, completion_tokens, total_tokens}) and
+/// Anthropic ({input_tokens, output_tokens}) shapes.
+fn parse_usage(body: &[u8]) -> Option<(i64, i64, i64)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let u = v.get("usage")?;
+    let prompt = u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    let completion = u.get("completion_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    // Anthropic uses input_tokens/output_tokens
+    let input = u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    let output = u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+    let p = if prompt > 0 { prompt } else { input };
+    let c = if completion > 0 { completion } else { output };
+    if p == 0 && c == 0 {
+        return None;
+    }
+    let t = u.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(p + c);
+    Some((p, c, t))
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -182,7 +206,7 @@ async fn relay(
     let resp = match resp {
         Ok(r) => r,
         Err(e) => {
-            log_request(state, &token_name, &model, &channel_name, -1).await;
+            log_request(state, &token_name, &model, &channel_name, -1, None).await;
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream request failed: {}", e),
@@ -191,27 +215,70 @@ async fn relay(
     };
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    eprintln!(
-        "[relay] upstream {} -> {} ct={:?} len={:?}",
-        resp.status(),
-        status,
-        resp.headers().get("content-type").map(|v| v.to_str().ok()),
-        resp.headers().get("content-length")
-    );
-    log_request(state, &token_name, &model, &channel_name, status.as_u16() as i64).await;
 
-    // 5. pass response through — reqwest stream directly into axum body so
-    //    SSE streaming works without buffering.
-    let content_type = resp.headers().get("content-type").cloned();
-    let stream = resp
-        .bytes_stream()
-        .inspect(|chunk| {
-            if let Ok(b) = chunk {
-                eprintln!("[relay] chunk {} bytes", b.len());
-            } else {
-                eprintln!("[relay] stream error: {:?}", chunk);
+    // Detect streaming requests so we can capture usage for non-streaming ones
+    // (parsing streamed SSE chunks for usage is a future enhancement).
+    let is_streaming = req_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !is_streaming {
+        // Non-streaming: buffer the body so we can extract usage and then
+        // serve it to the client unchanged.
+        // capture content-type before consuming the body
+        let content_type = resp.headers().get("content-type").cloned();
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                log_request(
+                    state,
+                    &token_name,
+                    &model,
+                    &channel_name,
+                    status.as_u16() as i64,
+                    None,
+                )
+                .await;
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body read failed: {}", e),
+                );
             }
-        });
+        };
+        let usage = parse_usage(&bytes);
+        log_request(
+            state,
+            &token_name,
+            &model,
+            &channel_name,
+            status.as_u16() as i64,
+            usage,
+        )
+        .await;
+        let mut builder = Response::builder().status(status);
+        if let Some(ct) = content_type {
+            if let Some(h) = builder.headers_mut() {
+                h.insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+        }
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"));
+    }
+
+    // Streaming: log without counts (LOTS), pass upstream through.
+    log_request(
+        state,
+        &token_name,
+        &model,
+        &channel_name,
+        status.as_u16() as i64,
+        None,
+    )
+    .await;
+    let content_type = resp.headers().get("content-type").cloned();
+    let stream = resp.bytes_stream();
     let mut response = Response::builder().status(status);
     if let Some(ct) = content_type {
         if let Some(h) = response.headers_mut() {

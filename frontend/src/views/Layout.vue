@@ -5,6 +5,7 @@
       <el-menu :default-active="$route.path" router>
         <el-menu-item index="/channels">渠道管理</el-menu-item>
         <el-menu-item index="/tokens">令牌管理</el-menu-item>
+        <el-menu-item index="/usage">用量统计</el-menu-item>
         <el-menu-item index="/logs">调用日志</el-menu-item>
       </el-menu>
       <div class="logout">
