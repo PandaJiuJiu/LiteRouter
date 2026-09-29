@@ -19,9 +19,10 @@
       </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
-          <el-tag :type="row.enabled ? 'success' : 'danger'">
-            {{ row.enabled ? '启用' : '禁用' }}
-          </el-tag>
+          <el-switch
+            :model-value="!!row.enabled"
+            @change="(val) => toggleEnabled(row, val)"
+          />
         </template>
       </el-table-column>
       <el-table-column label="操作" width="230">
@@ -122,6 +123,18 @@ async function save() {
 async function remove(id) {
   await deleteChannel(id)
   await load()
+}
+
+async function toggleEnabled(row, val) {
+  const prev = row.enabled
+  row.enabled = val ? 1 : 0   // optimistic update — flip locally first
+  try {
+    await updateChannel(row.id, { ...row, enabled: val })
+  } catch (e) {
+    row.enabled = prev        // revert on failure
+    const detail = e?.response?.data?.message || e.message || '未知错误'
+    ElMessage.error(`切换失败：${detail}`)
+  }
 }
 
 onMounted(load)
