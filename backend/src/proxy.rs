@@ -1,5 +1,11 @@
 //! OpenAI-compatible relay: auth with internal token, route model -> channel,
 //! forward request (streaming included) to the upstream channel.
+//!
+//! Failover: when a model is provided by more than one enabled channel, the
+//! relay tries them in order and falls over to the next candidate on transport
+//! errors or retriable upstream statuses (5xx, 408, 429, 524). Non-retriable
+//! upstream statuses (4xx other than 408/429) are returned immediately so we
+//! don't burn quota on a misrouted / malformed request.
 
 use crate::db::now;
 use crate::state::AppState;
@@ -92,43 +98,44 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
     Ok(name)
 }
 
-/// Pick an enabled channel whose models list contains `model`.
-/// `protocol` selects which upstream base URL to use: "openai" or "anthropic".
-async fn find_channel(
+/// All enabled channels that claim to serve `model` on `protocol`. Returned in
+/// DB order (caller can override by stable sort, but row id is monotonic so the
+/// "first registered channel wins" rule is preserved).
+async fn candidate_channels(
     state: &AppState,
     model: &str,
     protocol: &str,
-) -> Result<(String, String, String), StatusCode> {
+) -> Result<Vec<(String, String, String)>, StatusCode> {
     let rows = sqlx::query(
         "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1",
     )
     .fetch_all(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut out = Vec::new();
     for row in rows {
         let models_str: String = row.get::<String, _>("models");
-        let models: Vec<&str> = models_str
+        let matches = models_str
             .split(',')
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        // "*" is a wildcard: channel accepts any model
-        if models.iter().any(|m| *m == model || *m == "*") {
-            let base_url = match protocol {
-                "anthropic" => row.get::<String, _>("base_url_anthropic"),
-                _ => row.get::<String, _>("base_url"),
-            };
-            if base_url.is_empty() {
-                continue; // this channel doesn't serve the requested protocol
-            }
-            return Ok((
-                row.get::<String, _>("name"),
-                base_url,
-                row.get::<String, _>("api_key"),
-            ));
+            .any(|m| m == model || m == "*");
+        if !matches {
+            continue;
         }
+        let base_url = match protocol {
+            "anthropic" => row.get::<String, _>("base_url_anthropic"),
+            _ => row.get::<String, _>("base_url"),
+        };
+        if base_url.is_empty() {
+            continue; // this channel doesn't serve the requested protocol
+        }
+        out.push((
+            row.get::<String, _>("name"),
+            base_url,
+            row.get::<String, _>("api_key"),
+        ));
     }
-    Err(StatusCode::NOT_FOUND)
+    Ok(out)
 }
 
 async fn log_request(
@@ -182,7 +189,120 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Common relay: auth -> route -> forward, streaming the upstream response back.
+/// Status codes that signal "this upstream is having a bad time, try the next
+/// channel". 4xx other than these are the client's fault — no point failing
+/// over to a second provider only to get the same 400.
+fn is_retriable_status(code: u16) -> bool {
+    code == 408 || code == 429 || code >= 500
+}
+
+/// Build the upstream request with auth + protocol-appropriate headers. The
+/// caller still owns the body, so this is just a header recipe.
+fn build_request(
+    state: &AppState,
+    base_url: &str,
+    api_key: &str,
+    protocol: &str,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let req = if protocol == "anthropic" {
+        let version = headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("2023-06-01");
+        state
+            .http
+            .post(format!("{}/v1/messages", base_url))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", version)
+    } else {
+        state
+            .http
+            .post(format!("{}/chat/completions", base_url))
+            .header("Authorization", format!("Bearer {}", api_key))
+    };
+    req.header("Content-Type", "application/json")
+}
+
+/// Convert a successful upstream response into the client response, logging
+/// the outcome against `channel_name`. Streaming requests pass through
+/// unchanged; non-streaming responses are buffered so we can extract usage.
+async fn respond_from_upstream(
+    state: &AppState,
+    token_name: &str,
+    model: &str,
+    channel_name: &str,
+    resp: reqwest::Response,
+    is_streaming: bool,
+) -> Response {
+    let status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    if !is_streaming {
+        let content_type = resp.headers().get("content-type").cloned();
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                log_request(
+                    state,
+                    token_name,
+                    model,
+                    channel_name,
+                    status.as_u16() as i64,
+                    None,
+                )
+                .await;
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body read failed: {}", e),
+                );
+            }
+        };
+        let usage = parse_usage(&bytes);
+        log_request(
+            state,
+            token_name,
+            model,
+            channel_name,
+            status.as_u16() as i64,
+            usage,
+        )
+        .await;
+        let mut builder = Response::builder().status(status);
+        if let Some(ct) = content_type {
+            if let Some(h) = builder.headers_mut() {
+                h.insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+        }
+        return builder
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"));
+    }
+
+    // Streaming: pass upstream through, log status only.
+    log_request(
+        state,
+        token_name,
+        model,
+        channel_name,
+        status.as_u16() as i64,
+        None,
+    )
+    .await;
+    let content_type = resp.headers().get("content-type").cloned();
+    let stream = resp.bytes_stream();
+    let mut response = Response::builder().status(status);
+    if let Some(ct) = content_type {
+        if let Some(h) = response.headers_mut() {
+            h.insert(axum::http::header::CONTENT_TYPE, ct);
+        }
+    }
+    response
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+}
+
+/// Common relay: auth -> route -> forward with multi-channel failover.
 async fn relay(
     state: &AppState,
     headers: &HeaderMap,
@@ -199,7 +319,7 @@ async fn relay(
         Err((s, msg)) => return error_response(s, msg),
     };
 
-    // 2. parse body to find model
+    // 2. parse body to find model + streaming flag
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
@@ -208,130 +328,72 @@ async fn relay(
         Some(m) => m.to_string(),
         None => return error_response(StatusCode::BAD_REQUEST, "missing model in request"),
     };
-
-    // 3. route to channel (protocol-aware)
-    let (channel_name, base_url, api_key) = match find_channel(state, &model, protocol).await {
-        Ok(c) => c,
-        Err(StatusCode::NOT_FOUND) => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                &format!(
-                    "no enabled channel provides model `{}` on the {} protocol",
-                    model, protocol
-                ),
-            )
-        }
-        Err(s) => return error_response(s, "internal error"),
-    };
-
-    // 4. forward
-    let req = if protocol == "anthropic" {
-        let version = headers
-            .get("anthropic-version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("2023-06-01");
-        state
-            .http
-            .post(format!("{}/v1/messages", base_url))
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", version)
-    } else {
-        state
-            .http
-            .post(format!("{}/chat/completions", base_url))
-            .header("Authorization", format!("Bearer {}", api_key))
-    };
-    let resp = req
-        .header("Content-Type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await;
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            log_request(state, &token_name, &model, &channel_name, -1, None).await;
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream request failed: {}", e),
-            );
-        }
-    };
-
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-
-    // Detect streaming requests so we can capture usage for non-streaming ones
-    // (parsing streamed SSE chunks for usage is a future enhancement).
     let is_streaming = req_json
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if !is_streaming {
-        // Non-streaming: buffer the body so we can extract usage and then
-        // serve it to the client unchanged.
-        // capture content-type before consuming the body
-        let content_type = resp.headers().get("content-type").cloned();
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                log_request(
-                    state,
-                    &token_name,
-                    &model,
-                    &channel_name,
-                    status.as_u16() as i64,
-                    None,
-                )
-                .await;
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream body read failed: {}", e),
-                );
-            }
-        };
-        let usage = parse_usage(&bytes);
-        log_request(
-            state,
-            &token_name,
-            &model,
-            &channel_name,
-            status.as_u16() as i64,
-            usage,
-        )
-        .await;
-        let mut builder = Response::builder().status(status);
-        if let Some(ct) = content_type {
-            if let Some(h) = builder.headers_mut() {
-                h.insert(axum::http::header::CONTENT_TYPE, ct);
-            }
-        }
-        return builder
-            .body(Body::from(bytes))
-            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"));
+    // 3. collect all candidate channels for this model+protocol
+    let candidates = match candidate_channels(state, &model, protocol).await {
+        Ok(c) => c,
+        Err(s) => return error_response(s, "internal error"),
+    };
+    if candidates.is_empty() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "no enabled channel provides model `{}` on the {} protocol",
+                model, protocol
+            ),
+        );
     }
 
-    // Streaming: log without counts (LOTS), pass upstream through.
-    log_request(
-        state,
-        &token_name,
-        &model,
-        &channel_name,
-        status.as_u16() as i64,
-        None,
-    )
-    .await;
-    let content_type = resp.headers().get("content-type").cloned();
-    let stream = resp.bytes_stream();
-    let mut response = Response::builder().status(status);
-    if let Some(ct) = content_type {
-        if let Some(h) = response.headers_mut() {
-            h.insert(axum::http::header::CONTENT_TYPE, ct);
+    // 4. try each candidate; failover on transport errors and retriable status.
+    let mut last_err = String::new();
+    for (channel_name, base_url, api_key) in &candidates {
+        let req = build_request(state, base_url, api_key, protocol, headers)
+            .body(body.to_vec());
+        match req.send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                if resp.status().is_success() {
+                    return respond_from_upstream(
+                        state,
+                        &token_name,
+                        &model,
+                        channel_name,
+                        resp,
+                        is_streaming,
+                    )
+                    .await;
+                }
+                if !is_retriable_status(code) {
+                    // non-retriable: surface upstream's response as-is
+                    return respond_from_upstream(
+                        state,
+                        &token_name,
+                        &model,
+                        channel_name,
+                        resp,
+                        is_streaming,
+                    )
+                    .await;
+                }
+                // retriable: log + try next
+                log_request(state, &token_name, &model, channel_name, code as i64, None).await;
+                last_err = format!("{} -> HTTP {}", channel_name, code);
+            }
+            Err(e) => {
+                log_request(state, &token_name, &model, channel_name, -1, None).await;
+                last_err = format!("{}: {}", channel_name, e);
+            }
         }
     }
-    response
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        &format!("all {} candidate(s) failed: {}", candidates.len(), last_err),
+    )
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible relay.
