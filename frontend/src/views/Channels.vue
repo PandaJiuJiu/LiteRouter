@@ -5,7 +5,6 @@
       <el-button type="primary" @click="openDialog()">添加渠道</el-button>
     </div>
     <el-table :data="channels" v-loading="loading">
-      <el-table-column prop="id" label="ID" width="60" />
       <el-table-column prop="name" label="名称" width="160" />
       <el-table-column label="Base URL" min-width="240" show-overflow-tooltip>
         <template #default="{ row }">

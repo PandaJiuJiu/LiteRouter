@@ -5,7 +5,6 @@
       <el-button type="primary" @click="openCreate">添加路由</el-button>
     </div>
     <el-table :data="mappings" v-loading="loading">
-      <el-table-column prop="id" label="ID" width="60" />
       <el-table-column prop="alias" label="客户端模型名" min-width="160" />
       <el-table-column label="→" width="50" align="center">
         <template #default>→</template>

@@ -5,7 +5,6 @@
       <el-button type="primary" @click="openCreate">创建令牌</el-button>
     </div>
     <el-table :data="tokens" v-loading="loading">
-      <el-table-column prop="id" label="ID" width="60" />
       <el-table-column prop="name" label="名称" width="160" />
       <el-table-column label="Key" min-width="280">
         <template #default="{ row }">
