@@ -270,6 +270,7 @@ async fn pinned_channel(
 async fn log_request(
     state: &AppState,
     token_name: &str,
+    request_model: &str,
     model: &str,
     channel_name: &str,
     status: i64,
@@ -277,7 +278,7 @@ async fn log_request(
 ) {
     let (p, c, t) = usage.unwrap_or((0, 0, 0));
     let _ = sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(token_name)
     .bind(model)
@@ -287,6 +288,7 @@ async fn log_request(
     .bind(c)
     .bind(t)
     .bind(now())
+    .bind(request_model)
     .execute(&state.pool)
     .await;
 }
@@ -311,11 +313,22 @@ fn parse_usage(body: &[u8]) -> Option<(i64, i64, i64)> {
     Some((p, c, t))
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+fn error_response(status: StatusCode, message: &str, retry_after: Option<&str>) -> Response {
     let body = json!({
         "error": { "message": message, "type": "literouter_error" }
     });
-    (status, Json(body)).into_response()
+    let mut resp = (status, Json(body)).into_response();
+    // Pass through the upstream's Retry-After when we know the failure is a
+    // rate-limit (429). Other libraries don't deserve the hint.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(ra) = retry_after {
+            if let Ok(v) = axum::http::HeaderValue::from_str(ra) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
+            }
+        }
+    }
+    resp
 }
 
 /// Status codes that signal "this upstream is having a bad time, try the next
@@ -375,7 +388,7 @@ fn passthrough_stream(resp: reqwest::Response, status: StatusCode, content_type:
     }
     response
         .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
 
 /// Convert an upstream SSE byte stream to the client's protocol, line by
@@ -436,7 +449,7 @@ fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Res
     });
     response
         .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
 
 /// Convert a successful upstream response into the client response, logging
@@ -446,6 +459,7 @@ fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Res
 async fn respond_from_upstream(
     state: &AppState,
     token_name: &str,
+    request_model: &str,
     model: &str,
     cand: &Candidate,
     resp: reqwest::Response,
@@ -464,6 +478,7 @@ async fn respond_from_upstream(
                 log_request(
                     state,
                     token_name,
+                    request_model,
                     model,
                     channel_name,
                     status.as_u16() as i64,
@@ -473,6 +488,7 @@ async fn respond_from_upstream(
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream body read failed: {}", e),
+                    None,
                 );
             }
         };
@@ -480,6 +496,7 @@ async fn respond_from_upstream(
         log_request(
             state,
             token_name,
+            request_model,
             model,
             channel_name,
             status.as_u16() as i64,
@@ -518,13 +535,14 @@ async fn respond_from_upstream(
         }
         return builder
             .body(Body::from(out_bytes))
-            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed"));
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
     }
 
     // Streaming: pass upstream through, log status only.
     log_request(
         state,
         token_name,
+        request_model,
         model,
         channel_name,
         status.as_u16() as i64,
@@ -557,21 +575,21 @@ async fn relay(
     // 1. internal token auth
     let key = match extract_token(headers) {
         Some(k) => k,
-        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token"),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", None),
     };
     let token_name = match auth_token(state, &key).await {
         Ok(n) => n,
-        Err((s, msg)) => return error_response(s, msg),
+        Err((s, msg)) => return error_response(s, msg, None),
     };
 
     // 2. parse body to find model + streaming flag
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body", None),
     };
     let model = match req_json.get("model").and_then(|m| m.as_str()) {
         Some(m) => m.to_string(),
-        None => return error_response(StatusCode::BAD_REQUEST, "missing model in request"),
+        None => return error_response(StatusCode::BAD_REQUEST, "missing model in request", None),
     };
     let targets = resolve_targets(state, &model).await;
     let is_streaming = req_json
@@ -583,28 +601,37 @@ async fn relay(
     // rewrite the request body's model field and try it — pinned targets go
     // to their channel only, unpinned ones fail over across every channel
     // serving that model. Fall through to the next target on failure.
-    let mut last_err = String::new();
+    //
+    // We track every candidate's failure (not just the last one) so the
+    // final response can (a) report all of them in the body and (b) pick the
+    // most informative status code — 429 if every failure was a rate-limit,
+    // 504 if they were all transport errors, 502 otherwise. The first
+    // upstream's `Retry-After` is captured so we can pass it through on 429.
+    let mut all_errors: Vec<String> = Vec::new();
+    let mut retry_after: Option<String> = None;
     let mut attempted = 0usize;
+    let mut retriable_429_count = 0usize;
+    let mut transport_err_count = 0usize;
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
                 Ok(c) => c,
-                Err(s) => return error_response(s, "internal error"),
+                Err(s) => return error_response(s, "internal error", None),
             }
         } else {
             match pinned_channel(state, pin_channel, protocol).await {
                 Some(c) => vec![c],
                 None => {
-                    last_err = format!(
+                    all_errors.push(format!(
                         "pinned channel `{}` is disabled, missing, or serves neither protocol",
                         pin_channel
-                    );
+                    ));
                     continue;
                 }
             }
         };
         if candidates.is_empty() {
-            last_err = format!("no enabled channel provides model `{}`", target_model);
+            all_errors.push(format!("no enabled channel provides model `{}`", target_model));
             continue;
         }
         for cand in &candidates {
@@ -639,6 +666,7 @@ async fn relay(
                         return respond_from_upstream(
                             state,
                             &token_name,
+                            &model,
                             target_model,
                             cand,
                             resp,
@@ -651,6 +679,7 @@ async fn relay(
                         return respond_from_upstream(
                             state,
                             &token_name,
+                            &model,
                             target_model,
                             cand,
                             resp,
@@ -658,13 +687,24 @@ async fn relay(
                         )
                         .await;
                     }
-                    // retriable: log + try next
-                    log_request(state, &token_name, target_model, &cand.name, code as i64, None).await;
-                    last_err = format!("{} ({}) -> HTTP {}", cand.name, target_model, code);
+                    // retriable: capture Retry-After (first one wins), log, try next
+                    if retry_after.is_none() {
+                        if let Some(v) = resp.headers().get(reqwest::header::RETRY_AFTER) {
+                            if let Ok(s) = v.to_str() {
+                                retry_after = Some(s.to_string());
+                            }
+                        }
+                    }
+                    log_request(state, &token_name, &model, target_model, &cand.name, code as i64, None).await;
+                    all_errors.push(format!("{} ({}) -> HTTP {}", cand.name, target_model, code));
+                    if code == 429 {
+                        retriable_429_count += 1;
+                    }
                 }
                 Err(e) => {
-                    log_request(state, &token_name, target_model, &cand.name, -1, None).await;
-                    last_err = format!("{} ({}): {}", cand.name, target_model, e);
+                    log_request(state, &token_name, &model, target_model, &cand.name, -1, None).await;
+                    all_errors.push(format!("{} ({}): {}", cand.name, target_model, e));
+                    transport_err_count += 1;
                 }
             }
         }
@@ -691,11 +731,31 @@ async fn relay(
                 wanted.join("`, `"),
                 protocol
             ),
+            None,
         );
     }
+    // Pick the most informative status code:
+    //   - all retriable failures were 429 -> 429 (so SDKs that honor 429's
+    //     Retry-After can back off correctly instead of blind exponential)
+    //   - all failures were transport-level -> 504 (none of the upstreams
+    //     even responded)
+    //   - anything else (5xx mix, 429+5xx mix) -> 502 (gateway saw responses
+    //     but couldn't serve the request)
+    let final_status = if retriable_429_count == attempted {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if transport_err_count == attempted {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     error_response(
-        StatusCode::BAD_GATEWAY,
-        &format!("all {} candidate(s) failed: {}", attempted, last_err),
+        final_status,
+        &format!(
+            "all {} candidate(s) failed:\n  - {}",
+            attempted,
+            all_errors.join("\n  - ")
+        ),
+        retry_after.as_deref(),
     )
 }
 
@@ -724,10 +784,10 @@ pub async fn list_models(
 ) -> Response {
     let key = match extract_token(&headers) {
         Some(k) => k,
-        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token"),
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", None),
     };
     if let Err((s, msg)) = auth_token(&state, &key).await {
-        return error_response(s, msg);
+        return error_response(s, msg, None);
     }
     // only external channels serve relay traffic (see candidate_channels)
     let rows = match sqlx::query(
@@ -737,7 +797,7 @@ pub async fn list_models(
         .await
     {
         Ok(r) => r,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "db error"),
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "db error", None),
     };
     let mut models: Vec<String> = Vec::new();
     for row in rows {
