@@ -18,6 +18,24 @@ async fn main() {
     let pool = db::init_pool(&db_path).await;
     let state = Arc::new(AppState::new(pool));
 
+    // background: keep the `logs` table bounded — relay traffic is high
+    // volume and every row is an INSERT, so without this the DB grows
+    // unbounded. retention window is 7 days; sweep runs once on startup
+    // and every hour after.
+    {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            loop {
+                match db::cleanup_old_logs(&pool, 7).await {
+                    Ok(n) if n > 0 => println!("log cleanup: removed {} rows older than 7d", n),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("log cleanup failed: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     let app = Router::new()
         // relay endpoints (OpenAI compatible)
         .route("/v1/chat/completions", post(proxy::chat_completions))

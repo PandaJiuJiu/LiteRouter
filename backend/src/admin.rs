@@ -709,9 +709,9 @@ pub async fn list_logs(
         .iter()
         .map(|r| {
             json!({
-                "id": r.get::<i64, _>("id"),
                 "token_name": r.get::<String, _>("token_name"),
                 "model": r.get::<String, _>("model"),
+                "request_model": r.get::<String, _>("request_model"),
                 "channel_name": r.get::<String, _>("channel_name"),
                 "status_code": r.get::<i64, _>("status_code"),
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),

@@ -71,7 +71,8 @@ pub async fn init_pool(path: &str) -> SqlitePool {
             prompt_tokens     INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens      INTEGER NOT NULL DEFAULT 0,
-            created_at   INTEGER NOT NULL
+            created_at   INTEGER NOT NULL,
+            request_model TEXT NOT NULL DEFAULT ''
         );",
     )
     .execute(&pool)
@@ -86,6 +87,13 @@ pub async fn init_pool(path: &str) -> SqlitePool {
         .execute(&pool)
         .await;
     }
+    // migrate: track the original client-requested model alongside the
+    // upstream model the request was actually rewritten to (model column).
+    let _ = sqlx::query(
+        "ALTER TABLE logs ADD COLUMN request_model TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(&pool)
+    .await;
     // index for per-token usage lookups (RPM check + daily quota check)
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_logs_token_created ON logs (token_name, created_at)",
@@ -127,4 +135,19 @@ pub fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// Delete log rows older than `retention_days` days. Returns the number of
+/// rows removed so the caller can log it. Called by the background sweeper
+/// in main.rs so the `logs` table doesn't grow unbounded under relay load.
+pub async fn cleanup_old_logs(
+    pool: &SqlitePool,
+    retention_days: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now() - retention_days * 86400;
+    let res = sqlx::query("DELETE FROM logs WHERE created_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }

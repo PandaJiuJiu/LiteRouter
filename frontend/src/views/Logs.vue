@@ -5,10 +5,26 @@
       <el-button @click="load">刷新</el-button>
     </div>
     <el-table :data="logs" v-loading="loading">
-      <el-table-column prop="id" label="ID" width="80" />
+      <el-table-column label="请求时间" min-width="180">
+        <template #default="{ row }">
+          {{ new Date(row.created_at * 1000).toLocaleString() }}
+        </template>
+      </el-table-column>
       <el-table-column prop="token_name" label="令牌" width="160" />
-      <el-table-column prop="model" label="模型" width="220" />
-      <el-table-column prop="channel_name" label="渠道" width="160" />
+      <el-table-column prop="request_model" label="请求模型" width="180">
+        <template #default="{ row }">
+          <span v-if="row.request_model">{{ row.request_model }}</span>
+          <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="上游模型" min-width="280">
+        <template #default="{ row }">
+          <span v-if="row.model" :title="row.token_name">
+            {{ row.channel_name }}<span class="hint">：</span>{{ row.model }}
+          </span>
+          <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
       <el-table-column label="状态码" width="90">
         <template #default="{ row }">
           <el-tag :type="row.status_code >= 200 && row.status_code < 300 ? 'success' : 'danger'">
@@ -23,11 +39,6 @@
             <span class="hint">= {{ fmt(row.total_tokens) }}</span>
           </span>
           <span v-else class="hint">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="时间" min-width="180">
-        <template #default="{ row }">
-          {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
     </el-table>
