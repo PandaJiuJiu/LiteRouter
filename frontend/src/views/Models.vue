@@ -20,6 +20,10 @@
           <el-tag v-if="ch.base_url_anthropic" size="small">Anthropic</el-tag>
         </div>
         <div>
+          <el-button size="small" :loading="ch._testingAll"
+            :disabled="!modelList(ch).length" @click="testAll(ch)">
+            全部测试
+          </el-button>
           <el-button size="small" :loading="ch._fetching"
             :disabled="!ch.base_url && !ch.base_url_anthropic" @click="fetchList(ch)">
             获取模型列表
@@ -229,6 +233,44 @@ async function pingModel(ch, m) {
     ElMessage.error(`${m}: 测试失败`)
   } finally {
     ch._testingModel = null
+  }
+}
+
+async function testAll(ch) {
+  const list = modelList(ch)
+  if (!list.length) return
+  ch._testingAll = true
+  let ok = 0
+  let fail = 0
+  try {
+    for (const m of list) {
+      // piggy-back on pingModel so the per-card spinner and `_testResult`
+      // stay consistent with single-model tests. Sequential is intentional:
+      // upstream rate-limits often bite on bursts, and one model timing out
+      // doesn't block the rest from being judged.
+      ch._testingModel = m
+      try {
+        const r = await testModel({
+          base_url: ch.base_url,
+          base_url_anthropic: ch.base_url_anthropic,
+          api_key: ch.api_key,
+          model: m,
+        })
+        if (!ch._testResult) ch._testResult = {}
+        ch._testResult[m] = r
+        if (r.ok) ok++
+        else fail++
+      } catch (_) {
+        if (!ch._testResult) ch._testResult = {}
+        ch._testResult[m] = { ok: false, protocols: {} }
+        fail++
+      }
+    }
+    if (fail === 0) ElMessage.success(`${ch.name}：${ok} 个模型全部可用`)
+    else ElMessage.warning(`${ch.name}：${ok} 个可用，${fail} 个不可用`)
+  } finally {
+    ch._testingModel = null
+    ch._testingAll = false
   }
 }
 
