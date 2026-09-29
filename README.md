@@ -1,3 +1,5 @@
+简体中文 | [English](README.en.md)
+
 # LiteRouter
 
 一个轻量级的 LLM API 网关。将多个上游 LLM 服务（OpenAI / Claude / 各类中转站等）聚合为一个统一地址，对内签发独立的访问密钥，并提供模型路由、多渠道故障转移与用量统计能力。单个 Rust 二进制 + SQLite，无外部依赖，开箱即用。
@@ -28,8 +30,8 @@
 使用 Docker Compose 一键部署：
 
 ```bash
-git clone https://github.com/your-name/literouter.git
-cd literouter
+git clone https://github.com/qihangkong/LiteRouter.git
+cd LiteRouter
 ADMIN_PASSWORD=your-password docker compose up -d --build
 ```
 
@@ -40,6 +42,17 @@ ADMIN_PASSWORD=your-password docker compose up -d --build
 - 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，无外部依赖
 - SQLite 数据持久化在 `./data` 目录
 - `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用；`ADMIN_PASSWORD` 未设置时使用默认值
+- 老版本 Docker 用 `docker-compose`（带连字符）代替 `docker compose`
+
+### 修改端口
+
+宿主端口由 `docker-compose.yml` 的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
+
+```bash
+PORT=8080 docker compose up -d --build   # 用 http://your-host:8080 访问
+```
+
+注意这里的 `PORT` 只影响**宿主侧**端口映射；容器内进程监听端口无需修改。改回默认只需去掉 `PORT=` 前缀，重新 `up -d` 即可。
 
 Docker Hub 不可达的网络可通过 build arg 换源：
 

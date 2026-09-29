@@ -3,7 +3,7 @@ services:
     build: .
     container_name: literouter
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
       - LITEROUTER_DB=/app/data/literouter.db
