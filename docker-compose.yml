@@ -1,12 +1,12 @@
 services:
-  lite-one-api:
+  literouter:
     build: .
-    container_name: lite-one-api
+    container_name: literouter
     ports:
       - "3000:3000"
     environment:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-      - LITE_ONE_API_DB=/app/data/lite-one-api.db
+      - LITEROUTER_DB=/app/data/literouter.db
     volumes:
       - ./data:/app/data
     restart: unless-stopped

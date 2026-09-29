@@ -105,6 +105,20 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     .execute(&pool)
     .await
     .expect("create model_mappings table");
+    // one alias may route to several upstream models, tried in array order;
+    // stored as a JSON array of model-id strings
+    let _ = sqlx::query(
+        "ALTER TABLE model_mappings ADD COLUMN targets TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(&pool)
+    .await;
+    // migrate: fold pre-existing single-target rows into the new JSON column
+    sqlx::query(
+        "UPDATE model_mappings SET targets = json_array(target_model) WHERE targets = '' OR targets IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("migrate model_mappings targets");
     pool
 }
 

@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::Arc;
@@ -38,6 +38,35 @@ fn row_token(row: &sqlx::sqlite::SqliteRow, show_key: bool) -> Value {
         v["key"] = json!(row.get::<String, _>("key"));
     }
     v
+}
+
+/// GET /api/models — every enabled channel's model list, grouped by channel,
+/// so the routing UI can offer a picker instead of free-text input.
+pub async fn list_channel_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let rows = sqlx::query(
+        "SELECT name, models FROM channels WHERE enabled=1 ORDER BY id ASC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let channels: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let models: Vec<String> = r
+                .get::<String, _>("models")
+                .split(',')
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty() && m != "*")
+                .collect();
+            json!({ "name": r.get::<String, _>("name"), "models": models })
+        })
+        .filter(|c| !c["models"].as_array().unwrap().is_empty())
+        .collect();
+    Ok(Json(json!({ "channels": channels })))
 }
 
 // ---------- channels ----------
@@ -475,7 +504,76 @@ pub async fn delete_token(
 #[derive(Deserialize)]
 pub struct MappingReq {
     pub alias: String,
-    pub target_model: String,
+    /// ordered list of routing targets, tried in array order
+    pub targets: Vec<TargetEntry>,
+}
+
+/// One routing target: an upstream model, optionally pinned to a channel.
+/// Stored in the `targets` column as a JSON array of these objects. Legacy
+/// rows (plain model-name strings) are accepted and read as unpinned.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TargetEntry {
+    Obj {
+        /// empty = any channel serving this model
+        #[serde(default)]
+        channel: String,
+        /// upstream model id; "*" means every model on the pinned channel
+        model: String,
+    },
+    Str(String),
+}
+
+impl TargetEntry {
+    fn normalize(entry: TargetEntry, out: &mut Vec<(String, String)>) {
+        let (channel, model) = match entry {
+            TargetEntry::Obj { channel, model } => (channel.trim().to_string(), model.trim().to_string()),
+            TargetEntry::Str(s) => (String::new(), s.trim().to_string()),
+        };
+        // a wildcard needs a channel to expand against
+        if model.is_empty() || (model == "*" && channel.is_empty()) {
+            return;
+        }
+        if !out.iter().any(|(c, m)| c == &channel && m == &model) {
+            out.push((channel, model));
+        }
+    }
+}
+
+/// Parse the JSON-array `targets` column into ordered (channel, model)
+/// pairs; fall back to the legacy single `target_model` column when the row
+/// predates the migration. An empty channel means "any channel".
+pub fn parse_targets(targets: &str, fallback: &str) -> Vec<(String, String)> {
+    let entries: Vec<TargetEntry> =
+        serde_json::from_str(targets).unwrap_or_default();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in entries {
+        TargetEntry::normalize(e, &mut out);
+    }
+    if out.is_empty() && !fallback.trim().is_empty() {
+        out.push((String::new(), fallback.trim().to_string()));
+    }
+    out
+}
+
+/// Serialize normalized targets back into the stored JSON form.
+fn encode_targets(targets: &[(String, String)]) -> String {
+    let entries: Vec<TargetEntry> = targets
+        .iter()
+        .map(|(channel, model)| TargetEntry::Obj {
+            channel: channel.clone(),
+            model: model.clone(),
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_default()
+}
+
+fn clean_targets(raw: &[TargetEntry]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in raw {
+        TargetEntry::normalize(e.clone(), &mut out);
+    }
+    out
 }
 
 pub async fn list_mappings(
@@ -490,10 +588,14 @@ pub async fn list_mappings(
     let mappings: Vec<Value> = rows
         .iter()
         .map(|r| {
+            let targets = parse_targets(
+                &r.get::<String, _>("targets"),
+                &r.get::<String, _>("target_model"),
+            );
             json!({
                 "id": r.get::<i64, _>("id"),
                 "alias": r.get::<String, _>("alias"),
-                "target_model": r.get::<String, _>("target_model"),
+                "targets": targets.iter().map(|(c, m)| json!({ "channel": c, "model": m })).collect::<Vec<_>>(),
                 "created_at": r.get::<i64, _>("created_at"),
             })
         })
@@ -507,14 +609,17 @@ pub async fn create_mapping(
     Json(req): Json<MappingReq>,
 ) -> Result<Json<Value>, StatusCode> {
     check_admin(&state, &headers)?;
-    if req.alias.trim().is_empty() || req.target_model.trim().is_empty() {
+    let targets = clean_targets(&req.targets);
+    if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // first target's model also goes into the legacy column so old reads still work
     let res = sqlx::query(
-        "INSERT INTO model_mappings (alias, target_model, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO model_mappings (alias, target_model, targets, created_at) VALUES (?, ?, ?, ?)",
     )
     .bind(req.alias.trim())
-    .bind(req.target_model.trim())
+    .bind(targets[0].1.clone())
+    .bind(encode_targets(&targets))
     .bind(now())
     .execute(&state.pool)
     .await;
@@ -522,6 +627,35 @@ pub async fn create_mapping(
         Ok(_) => Ok(Json(json!({ "ok": true }))),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
             // SQLITE_CONSTRAINT_UNIQUE — alias already exists
+            Err(StatusCode::CONFLICT)
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+pub async fn update_mapping(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<MappingReq>,
+) -> Result<Json<Value>, StatusCode> {
+    check_admin(&state, &headers)?;
+    let targets = clean_targets(&req.targets);
+    if req.alias.trim().is_empty() || targets.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let res = sqlx::query(
+        "UPDATE model_mappings SET alias=?, target_model=?, targets=? WHERE id=?",
+    )
+    .bind(req.alias.trim())
+    .bind(targets[0].1.clone())
+    .bind(encode_targets(&targets))
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+    match res {
+        Ok(_) => Ok(Json(json!({ "ok": true }))),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
             Err(StatusCode::CONFLICT)
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),

@@ -9,6 +9,7 @@
 //! upstream statuses (4xx other than 408/429) are returned immediately so we
 //! don't burn quota on a misrouted / malformed request.
 
+use crate::admin;
 use crate::db::now;
 use crate::state::AppState;
 use axum::body::Body;
@@ -145,21 +146,84 @@ async fn candidate_channels(
     Ok(out)
 }
 
-/// If `alias` is configured to map to another model id, return that target;
-/// otherwise return `alias` unchanged. Single-level rewrite — `a → b → c` is
-/// treated as `a → b`.
-async fn resolve_alias(state: &AppState, alias: &str) -> String {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT target_model FROM model_mappings WHERE alias=?",
+/// If `alias` is configured, return its ordered (channel, model) target list
+/// (tried in array order); otherwise return `[("", alias)]` unchanged. Single
+/// level rewrite — `a → b → c` is treated as `a → b`. A `model == "*"` entry
+/// pinned to a channel expands to every model that channel advertises.
+async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT targets, target_model FROM model_mappings WHERE alias=?",
     )
     .bind(alias)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
-    match row {
-        Some((target,)) => target,
-        None => alias.to_string(),
+    let base = match row {
+        Some((targets, fallback)) => admin::parse_targets(&targets, &fallback),
+        None => Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (channel, model) in base {
+        if model == "*" && !channel.is_empty() {
+            // wildcard: every model on the pinned channel, in its list order
+            if let Ok(rows) = sqlx::query(
+                "SELECT models FROM channels WHERE name=? AND enabled=1 AND kind='external'",
+            )
+            .bind(&channel)
+            .fetch_all(&state.pool)
+            .await
+            {
+                let models: Vec<String> = rows
+                    .iter()
+                    .flat_map(|r| {
+                        r.get::<String, _>("models")
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|m| !m.is_empty() && m != "*")
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                for m in models {
+                    if !out.iter().any(|(c, x)| c == &channel && x == &m) {
+                        out.push((channel.clone(), m));
+                    }
+                }
+            }
+        } else if !out.iter().any(|(c, m)| c == &channel && m == &model) {
+            out.push((channel, model));
+        }
     }
+    if out.is_empty() {
+        out.push((String::new(), alias.to_string()));
+    }
+    out
+}
+
+/// A target pinned to a named channel: (base_url, api_key) for `protocol`,
+/// or None when the channel doesn't exist / is disabled / doesn't serve the
+/// protocol.
+async fn pinned_channel(
+    state: &AppState,
+    name: &str,
+    protocol: &str,
+) -> Option<(String, String)> {
+    let row = sqlx::query(
+        "SELECT base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1 AND kind='external'",
+    )
+    .bind(name)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()?;
+    let base_url = if protocol == "anthropic" {
+        row.get::<String, _>("base_url_anthropic")
+    } else {
+        row.get::<String, _>("base_url")
+    };
+    if base_url.is_empty() {
+        return None;
+    }
+    Some((base_url, row.get::<String, _>("api_key")))
 }
 
 async fn log_request(
@@ -208,7 +272,7 @@ fn parse_usage(body: &[u8]) -> Option<(i64, i64, i64)> {
 
 fn error_response(status: StatusCode, message: &str) -> Response {
     let body = json!({
-        "error": { "message": message, "type": "lite_one_api_error" }
+        "error": { "message": message, "type": "literouter_error" }
     });
     (status, Json(body)).into_response()
 }
@@ -363,72 +427,112 @@ async fn relay(
         Some(m) => m.to_string(),
         None => return error_response(StatusCode::BAD_REQUEST, "missing model in request"),
     };
-    let model = resolve_alias(state, &model).await;
+    let targets = resolve_targets(state, &model).await;
     let is_streaming = req_json
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // 3. collect all candidate channels for this model+protocol
-    let candidates = match candidate_channels(state, &model, protocol).await {
-        Ok(c) => c,
-        Err(s) => return error_response(s, "internal error"),
-    };
-    if candidates.is_empty() {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &format!(
-                "no enabled channel provides model `{}` on the {} protocol",
-                model, protocol
-            ),
-        );
-    }
-
-    // 4. try each candidate; failover on transport errors and retriable status.
+    // 3+4. walk the ordered target list; for each (channel, model) target,
+    // rewrite the request body's model field and try it — pinned targets go
+    // to their channel only, unpinned ones fail over across every channel
+    // serving that model. Fall through to the next target on failure.
     let mut last_err = String::new();
-    for (channel_name, base_url, api_key) in &candidates {
-        let req = build_request(state, base_url, api_key, protocol, headers)
-            .body(body.to_vec());
-        match req.send().await {
-            Ok(resp) => {
-                let code = resp.status().as_u16();
-                if resp.status().is_success() {
-                    return respond_from_upstream(
-                        state,
-                        &token_name,
-                        &model,
-                        channel_name,
-                        resp,
-                        is_streaming,
-                    )
-                    .await;
-                }
-                if !is_retriable_status(code) {
-                    // non-retriable: surface upstream's response as-is
-                    return respond_from_upstream(
-                        state,
-                        &token_name,
-                        &model,
-                        channel_name,
-                        resp,
-                        is_streaming,
-                    )
-                    .await;
-                }
-                // retriable: log + try next
-                log_request(state, &token_name, &model, channel_name, code as i64, None).await;
-                last_err = format!("{} -> HTTP {}", channel_name, code);
+    let mut attempted = 0usize;
+    for (pin_channel, target_model) in &targets {
+        let candidates = if pin_channel.is_empty() {
+            match candidate_channels(state, target_model, protocol).await {
+                Ok(c) => c,
+                Err(s) => return error_response(s, "internal error"),
             }
-            Err(e) => {
-                log_request(state, &token_name, &model, channel_name, -1, None).await;
-                last_err = format!("{}: {}", channel_name, e);
+        } else {
+            match pinned_channel(state, pin_channel, protocol).await {
+                Some((base_url, api_key)) => vec![(pin_channel.clone(), base_url, api_key)],
+                None => {
+                    last_err = format!(
+                        "pinned channel `{}` is disabled, missing, or has no {} URL",
+                        pin_channel, protocol
+                    );
+                    continue;
+                }
+            }
+        };
+        if candidates.is_empty() {
+            last_err = format!("no enabled channel provides model `{}`", target_model);
+            continue;
+        }
+        // rewrite the upstream request body to the target model
+        let mut body_json = req_json.clone();
+        body_json["model"] = json!(target_model);
+        let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
+        for (channel_name, base_url, api_key) in &candidates {
+            attempted += 1;
+            let req = build_request(state, base_url, api_key, protocol, headers)
+                .body(target_body.clone());
+            match req.send().await {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    if resp.status().is_success() {
+                        return respond_from_upstream(
+                            state,
+                            &token_name,
+                            target_model,
+                            channel_name,
+                            resp,
+                            is_streaming,
+                        )
+                        .await;
+                    }
+                    if !is_retriable_status(code) {
+                        // non-retriable: surface upstream's response as-is
+                        return respond_from_upstream(
+                            state,
+                            &token_name,
+                            target_model,
+                            channel_name,
+                            resp,
+                            is_streaming,
+                        )
+                        .await;
+                    }
+                    // retriable: log + try next
+                    log_request(state, &token_name, target_model, channel_name, code as i64, None).await;
+                    last_err = format!("{} ({}) -> HTTP {}", channel_name, target_model, code);
+                }
+                Err(e) => {
+                    log_request(state, &token_name, target_model, channel_name, -1, None).await;
+                    last_err = format!("{} ({}): {}", channel_name, target_model, e);
+                }
             }
         }
     }
 
+    if attempted == 0 {
+        // nothing even had a channel to try
+        let wanted: Vec<String> = targets
+            .iter()
+            .map(|(c, m)| {
+                if c.is_empty() {
+                    m.clone()
+                } else if m == "*" {
+                    format!("{}/所有模型", c)
+                } else {
+                    format!("{}/{}", c, m)
+                }
+            })
+            .collect();
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &format!(
+                "no enabled channel provides `{}` on the {} protocol",
+                wanted.join("`, `"),
+                protocol
+            ),
+        );
+    }
     error_response(
         StatusCode::BAD_GATEWAY,
-        &format!("all {} candidate(s) failed: {}", candidates.len(), last_err),
+        &format!("all {} candidate(s) failed: {}", attempted, last_err),
     )
 }
 
@@ -486,7 +590,7 @@ pub async fn list_models(
     }
     let data: Vec<Value> = models
         .iter()
-        .map(|m| json!({ "id": m, "object": "model", "owned_by": "lite-one-api" }))
+        .map(|m| json!({ "id": m, "object": "model", "owned_by": "literouter" }))
         .collect();
     Json(json!({ "object": "list", "data": data })).into_response()
 }

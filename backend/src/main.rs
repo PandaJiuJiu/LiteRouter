@@ -12,7 +12,8 @@ use tower_http::cors::CorsLayer;
 
 #[tokio::main]
 async fn main() {
-    let db_path = std::env::var("LITE_ONE_API_DB").unwrap_or_else(|_| "lite-one-api.db".to_string());
+    let db_path =
+        std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
     let pool = db::init_pool(&db_path).await;
     let state = Arc::new(AppState::new(pool));
 
@@ -23,6 +24,7 @@ async fn main() {
         .route("/v1/models", get(proxy::list_models))
         // admin endpoints
         .route("/api/login", post(auth::login))
+        .route("/api/models", get(admin::list_channel_models))
         .route("/api/channels", get(admin::list_channels).post(admin::create_channel))
         .route("/api/channels/fetch-models", post(admin::fetch_models))
         .route("/api/channels/test-model", post(admin::test_model))
@@ -41,7 +43,11 @@ async fn main() {
             "/api/mappings",
             get(admin::list_mappings).post(admin::create_mapping),
         )
-        .route("/api/mappings/:id", axum::routing::delete(admin::delete_mapping))
+        .route(
+            "/api/mappings/:id",
+            axum::routing::put(admin::update_mapping)
+                .delete(admin::delete_mapping),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
@@ -65,7 +71,7 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
-    println!("lite-one-api listening on http://{}", addr);
+    println!("literouter listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind failed");
     axum::serve(listener, app).await.unwrap();
 }

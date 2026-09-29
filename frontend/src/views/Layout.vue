@@ -1,11 +1,11 @@
 <template>
   <el-container style="height: 100vh">
     <el-aside width="200px" style="border-right: 1px solid #e4e7ed">
-      <div class="logo">Lite One API</div>
+      <div class="logo">LiteRouter</div>
       <el-menu :default-active="$route.path" router>
         <el-menu-item index="/channels">渠道管理</el-menu-item>
         <el-menu-item index="/tokens">令牌管理</el-menu-item>
-        <el-menu-item index="/mappings">模型别名</el-menu-item>
+        <el-menu-item index="/mappings">模型路由</el-menu-item>
         <el-menu-item index="/usage">用量统计</el-menu-item>
         <el-menu-item index="/logs">调用日志</el-menu-item>
       </el-menu>

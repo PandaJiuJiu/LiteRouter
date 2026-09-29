@@ -1,7 +1,7 @@
 <template>
   <div class="login-wrap">
     <el-card class="login-card">
-      <h2>Lite One API</h2>
+      <h2>LiteRouter</h2>
       <el-input v-model="password" type="password" placeholder="管理员密码" show-password
         @keyup.enter="doLogin" />
       <el-button type="primary" style="width: 100%; margin-top: 16px" :loading="loading"

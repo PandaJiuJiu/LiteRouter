@@ -1,46 +1,49 @@
-# Lite One API
+# LiteRouter
 
-一个轻量级的 LLM API 网关，参考 [one-api](https://github.com/songquanpeng/one-api) 的核心概念，但只保留最必要的功能：**渠道管理 + 内部令牌 + API 转发**。
+一个轻量级的 LLM API 网关。将多个上游 LLM 服务（OpenAI / Claude / 各类中转站等）聚合为一个统一地址，对内签发独立的访问密钥，并提供模型路由、多渠道故障转移与用量统计能力。单个 Rust 二进制 + SQLite，无外部依赖，开箱即用。
 
-## 适用场景
+## 功能特性
 
-你拥有多个付费上游 API（OpenAI / Claude / 各类中转站等），希望对内提供**一个统一地址 + 一套内部 key**：
-- 内部服务统一访问 `http://your-host:3000/v1/chat/completions`
-- 网关按请求中的 `model` 自动路由到支持该模型的上游渠道
-- 上游渠道密钥只保存在网关，不对外暴露
-- 支持流式（SSE）透传
-
-不做的功能（与 one-api 的差异）：多用户、计费配额、兑换码、模型重试/负载均衡等。
+- **统一接入**：对内提供 `http://your-host:3000/v1` 一个地址，同时兼容两种协议：
+  - `POST /v1/chat/completions` — OpenAI 协议（`Authorization: Bearer sk-...`）
+  - `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`）
+  - 均支持流式（SSE）透传
+- **渠道管理**：上游渠道（OpenAI / Claude / 各类中转站）的密钥只保存在网关，不对外暴露；支持 OpenAI / Anthropic 双协议地址（同一个 key 双协议的渠道如火山方舟，两个地址都填即可）
+- **渠道路由**：按请求中的 `model` 自动路由到支持该模型的上游渠道；支持通配符 `*`
+- **模型路由（Mappings）**：把客户端请求中的模型名（如 `my-model`）映射到一列上游真实模型 ID，可一对多并调整顺序；请求按列表顺序依次转发，前面的目标失败或无可用渠道时自动回退到后面的
+- **多渠道故障转移**：上游出现传输错误或可重试状态码（408 / 429 / 5xx / 524）时自动切换到下一个候选渠道；不可重试的 4xx 原样返回给客户端
+- **内部令牌 + 配额**：为内部服务签发 `sk-` 开头的 key，支持按令牌的 RPM 限额与每日 token 用量限额（超限返回 429）
+- **用量统计与调用日志**：记录每次请求的渠道、模型、状态码与 prompt / completion / total tokens，后台提供用量看板
+- **客户端断连取消**：客户端断开连接时自动取消上游请求，不浪费上游配额
+- **免运维**：SQLite 存储，无外部依赖，数据库 schema 自动迁移
 
 ## 技术栈
 
 - 后端：Rust（axum + sqlx/SQLite + reqwest）
 - 前端：Vue 3 + Vite + Element Plus
 
-## 快速开始
+## 部署
 
-### 开发模式
+使用 Docker Compose 一键部署：
 
 ```bash
-# 后端（默认监听 :3000，SQLite 文件 lite-one-api.db）
-cd backend
-cargo run
-
-# 前端（:5173，/api 与 /v1 已代理到后端）
-cd frontend
-npm install
-npm run dev
+git clone https://github.com/your-name/literouter.git
+cd literouter
+ADMIN_PASSWORD=your-password docker compose up -d --build
 ```
 
-打开 http://localhost:5173 ，默认管理员密码 `admin123`（环境变量 `ADMIN_PASSWORD` 可修改）。
+启动后访问 `http://your-host:3000` 进入管理后台（默认密码 `admin123`，通过 `ADMIN_PASSWORD` 环境变量修改）。
 
-### 生产部署
+说明：
+
+- 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，无外部依赖
+- SQLite 数据持久化在 `./data` 目录
+- `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用；`ADMIN_PASSWORD` 未设置时使用默认值
+
+Docker Hub 不可达的网络可通过 build arg 换源：
 
 ```bash
-cd frontend && npm run build   # 产物输出到 frontend/dist
-cd backend && cargo build --release
-PORT=3000 ADMIN_PASSWORD=your-password ./target/release/lite-one-api
-# 后端会自动托管 frontend/dist 静态文件
+docker compose build --build-arg REGISTRY=docker.io/library
 ```
 
 ### 环境变量
@@ -49,17 +52,18 @@ PORT=3000 ADMIN_PASSWORD=your-password ./target/release/lite-one-api
 |---|---|---|
 | `PORT` | `3000` | 监听端口 |
 | `ADMIN_PASSWORD` | `admin123` | 管理后台密码 |
-| `LITE_ONE_API_DB` | `lite-one-api.db` | SQLite 数据库路径 |
+| `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径（compose 已指向持久卷 `/app/data/literouter.db`） |
 
 ## 使用流程
 
-1. 登录后台 → **渠道管理** 添加上游渠道
+1. 登录后台 → **渠道管理** 添加上游渠道：
    - **OpenAI URL**：兼容 OpenAI 协议的**完整地址**，含路径版本（如 `https://api.openai.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan/v3`）。网关在此基础上追加 `/chat/completions`、`/models`
-   - **Anthropic URL**（可选）：兼容 Anthropic 协议的**完整地址**（如 `https://api.anthropic.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan`）。网关追加 `/v1/messages`（Anthropic API 所有端点都在 `/v1/` 下）
-   - 同一个 key 双协议的渠道（如火山方舟）两个地址都填即可
-   - **模型**：可手填（逗号分隔），或点"自动获取模型"从上游 `/v1/models` 拉取
-2. **令牌管理** 创建内部 key（`sk-` 开头）
-3. 内部服务把 OpenAI SDK 的 `base_url` 指向本网关，`api_key` 用内部 key：
+   - **Anthropic URL**（可选）：兼容 Anthropic 协议的**完整地址**（如 `https://api.anthropic.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan`）。网关追加 `/v1/messages`
+   - **模型**：可手填（逗号分隔），或点「自动获取模型」从上游 `/v1/models` 拉取；填 `*` 表示匹配任意模型
+   - **类型**：外部（参与路由）或内部（不参与路由，仅做密钥托管）
+2. **令牌管理** 创建内部 key（`sk-` 开头），可按需设置 RPM 限额与每日 token 限额
+3. （可选）**模型路由** 配置映射规则：客户端模型名 → 一列上游模型（按顺序转发、失败回退），对客户端完全透明
+4. 内部服务把 SDK 的 `base_url` 指向本网关，`api_key` 用内部 key：
 
 ```python
 from openai import OpenAI
@@ -72,16 +76,23 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 
 ## API
 
-内部（对外提供两种协议）：
-- `POST /v1/chat/completions` — OpenAI 协议（`Authorization: Bearer sk-...`，支持 `stream: true`）
-- `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`，支持流式）
-- `GET /v1/models`
+对外（需内部令牌）：
 
-管理后台：
-- `POST /api/login`、`/api/channels`、`/api/tokens`、`/api/logs`（Bearer session）
+| 端点 | 说明 |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI 协议，支持 `stream: true` |
+| `POST /v1/messages` | Anthropic Messages 协议，支持流式 |
+| `GET /v1/models` | 合并所有启用渠道的模型列表 |
 
-## Roadmap
+管理后台（Bearer session）：
 
-- [ ] 渠道优先级 / 负载均衡与失败重试
-- [ ] 模型重映射（model_mapping）
-- [ ] 多用户与配额
+| 端点 | 说明 |
+|---|---|
+| `POST /api/login` | 管理员登录 |
+| `GET/POST /api/channels`、`PUT/DELETE /api/channels/:id` | 渠道管理 |
+| `POST /api/channels/fetch-models` | 从上游拉取模型列表 |
+| `POST /api/channels/test-model` | 测试渠道可用性 |
+| `GET/POST /api/tokens`、`PUT/DELETE /api/tokens/:id` | 令牌管理 |
+| `GET/POST /api/mappings`、`PUT/DELETE /api/mappings/:id` | 模型路由管理 |
+| `GET /api/logs` | 调用日志 |
+| `GET /api/usage` | 用量统计 |

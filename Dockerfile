@@ -22,11 +22,11 @@ RUN cargo build --release
 FROM ${REGISTRY}/alpine:3.20
 WORKDIR /app
 RUN apk add --no-cache ca-certificates
-COPY --from=backend /build/target/release/lite-one-api /app/lite-one-api
+COPY --from=backend /build/target/release/literouter /app/literouter
 COPY --from=frontend /build/dist /app/dist
 
 ENV PORT=3000
 EXPOSE 3000
 VOLUME ["/app/data"]
 
-CMD ["/app/lite-one-api"]
+CMD ["/app/literouter"]
