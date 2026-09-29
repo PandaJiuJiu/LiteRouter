@@ -86,8 +86,8 @@
             </el-select>
           </div>
           <div class="target-row-ops">
-            <el-button size="small" :disabled="i === 0" @click="move(i, -1)">↑</el-button>
-            <el-button size="small" :disabled="i === form.targets.length - 1" @click="move(i, 1)">↓</el-button>
+            <el-button class="arrow-btn" size="small" :disabled="i === 0" @click="move(i, -1)">↑</el-button>
+            <el-button class="arrow-btn" size="small" :disabled="i === form.targets.length - 1" @click="move(i, 1)">↓</el-button>
             <el-button
               size="small"
               type="danger"
@@ -276,8 +276,17 @@ onMounted(load)
 .target-row-ops {
   display: flex;
   align-items: center;
-  gap: 4px;
   flex-shrink: 0;
+}
+/* ↑↓ 箭头按钮：缩窄外框、两按钮紧挨 */
+.target-row-ops :deep(.arrow-btn) {
+  padding: 5px 6px;
+}
+.target-row-ops :deep(.arrow-btn + .arrow-btn) {
+  margin-left: 4px;
+}
+.target-row-ops :deep(.el-button + .el-button:not(.arrow-btn)) {
+  margin-left: 12px;
 }
 .target-index {
   color: #909399;
