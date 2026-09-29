@@ -17,7 +17,10 @@ api.interceptors.response.use(
       localStorage.removeItem('session')
       router.push('/login')
     }
-    ElMessage.error(err.response?.data?.error?.message || err.message || '请求失败')
+    // backend errors: {error: "message"} / {error: {message}} / OpenAI style
+    const e = err.response?.data?.error
+    const msg = typeof e === 'string' ? e : e?.message
+    ElMessage.error(msg || err.message || '请求失败')
     return Promise.reject(err)
   },
 )
@@ -31,6 +34,10 @@ export const listChannels = () => api.get('/channels').then((r) => r.data.channe
 export const createChannel = (c) => api.post('/channels', c)
 export const updateChannel = (id, c) => api.put(`/channels/${id}`, c)
 export const deleteChannel = (id) => api.delete(`/channels/${id}`)
+export const fetchModels = (c) =>
+  api.post('/channels/fetch-models', c).then((r) => r.data)
+export const testModel = (c) =>
+  api.post('/channels/test-model', c).then((r) => r.data)
 
 export const listTokens = () => api.get('/tokens').then((r) => r.data.tokens)
 export const createToken = (t) => api.post('/tokens', t).then((r) => r.data)

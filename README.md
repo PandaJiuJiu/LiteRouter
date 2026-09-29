@@ -53,7 +53,11 @@ PORT=3000 ADMIN_PASSWORD=your-password ./target/release/lite-one-api
 
 ## 使用流程
 
-1. 登录后台 → **渠道管理** 添加上游渠道（Base URL 不含 `/v1`，模型逗号分隔）
+1. 登录后台 → **渠道管理** 添加上游渠道
+   - **OpenAI URL**：兼容 OpenAI 协议的**完整地址**，含路径版本（如 `https://api.openai.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan/v3`）。网关在此基础上追加 `/chat/completions`、`/models`
+   - **Anthropic URL**（可选）：兼容 Anthropic 协议的**完整地址**（如 `https://api.anthropic.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan`）。网关追加 `/v1/messages`（Anthropic API 所有端点都在 `/v1/` 下）
+   - 同一个 key 双协议的渠道（如火山方舟）两个地址都填即可
+   - **模型**：可手填（逗号分隔），或点"自动获取模型"从上游 `/v1/models` 拉取
 2. **令牌管理** 创建内部 key（`sk-` 开头）
 3. 内部服务把 OpenAI SDK 的 `base_url` 指向本网关，`api_key` 用内部 key：
 
@@ -68,8 +72,9 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 
 ## API
 
-内部（OpenAI 兼容）：
-- `POST /v1/chat/completions`（支持 `stream: true`）
+内部（对外提供两种协议）：
+- `POST /v1/chat/completions` — OpenAI 协议（`Authorization: Bearer sk-...`，支持 `stream: true`）
+- `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`，支持流式）
 - `GET /v1/models`
 
 管理后台：

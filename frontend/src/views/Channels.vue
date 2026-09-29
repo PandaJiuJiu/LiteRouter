@@ -7,8 +7,17 @@
     <el-table :data="channels" v-loading="loading">
       <el-table-column prop="id" label="ID" width="60" />
       <el-table-column prop="name" label="名称" width="160" />
-      <el-table-column prop="base_url" label="Base URL" min-width="220" show-overflow-tooltip />
-      <el-table-column prop="models" label="模型" min-width="200" show-overflow-tooltip />
+      <el-table-column label="Base URL" min-width="240" show-overflow-tooltip>
+        <template #default="{ row }">
+          <div>OpenAI: {{ row.base_url || '-' }}</div>
+          <div v-if="row.base_url_anthropic">Anthropic: {{ row.base_url_anthropic }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column prop="models" label="模型" min-width="200" show-overflow-tooltip>
+        <template #default="{ row }">
+          {{ row.models === '*' ? '全部模型（*）' : (row.models || '未配置（去"模型管理"页配置）') }}
+        </template>
+      </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag :type="row.enabled ? 'success' : 'danger'">
@@ -16,9 +25,10 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="160">
+      <el-table-column label="操作" width="230">
         <template #default="{ row }">
           <el-button size="small" @click="openDialog(row)">编辑</el-button>
+          <el-button size="small" type="primary" plain @click="manageModels(row)">模型管理</el-button>
           <el-popconfirm title="确认删除该渠道？" @confirm="remove(row.id)">
             <template #reference>
               <el-button size="small" type="danger">删除</el-button>
@@ -29,19 +39,20 @@
     </el-table>
 
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑渠道' : '添加渠道'" width="560px">
-      <el-form label-width="90px">
+      <el-form label-width="120px">
         <el-form-item label="名称">
-          <el-input v-model="form.name" placeholder="如 openai-main" />
+          <el-input v-model="form.name" placeholder="渠道名称" />
         </el-form-item>
-        <el-form-item label="Base URL">
-          <el-input v-model="form.base_url" placeholder="https://api.openai.com（不带 /v1）" />
+        <el-form-item label="OpenAI URL">
+          <el-input v-model="form.base_url"
+            placeholder="兼容 OpenAI 协议的地址（含完整路径，如 https://api.openai.com/v1）" />
+        </el-form-item>
+        <el-form-item label="Anthropic URL">
+          <el-input v-model="form.base_url_anthropic"
+            placeholder="兼容 Anthropic 协议的地址（含完整路径，如 https://api.anthropic.com/v1）" />
         </el-form-item>
         <el-form-item label="API Key">
           <el-input v-model="form.api_key" placeholder="上游渠道密钥" show-password />
-        </el-form-item>
-        <el-form-item label="模型">
-          <el-input v-model="form.models" type="textarea" :rows="3"
-            placeholder="逗号分隔，如 gpt-4o,gpt-4o-mini,claude-3-5-sonnet" />
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
@@ -57,6 +68,7 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { listChannels, createChannel, updateChannel, deleteChannel } from '../api'
 
@@ -64,7 +76,7 @@ const channels = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
-const form = ref({ name: '', base_url: '', api_key: '', models: '', enabled: true })
+const form = ref({ name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true })
 
 async function load() {
   loading.value = true
@@ -75,21 +87,32 @@ async function load() {
   }
 }
 
+const router = useRouter()
+
+function manageModels(row) {
+  router.push(`/models?channel=${row.id}`)
+}
+
 function openDialog(row) {
   editing.value = row || null
   form.value = row
-    ? { name: row.name, base_url: row.base_url, api_key: row.api_key, models: row.models, enabled: !!row.enabled }
-    : { name: '', base_url: '', api_key: '', models: '', enabled: true }
+    ? { name: row.name, base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled }
+    : { name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true }
   dialogVisible.value = true
 }
 
 async function save() {
-  if (!form.value.name || !form.value.base_url || !form.value.api_key) {
-    ElMessage.warning('名称、Base URL、API Key 不能为空')
+  if (!form.value.name || !form.value.api_key) {
+    ElMessage.warning('名称、API Key 不能为空')
+    return
+  }
+  if (!form.value.base_url && !form.value.base_url_anthropic) {
+    ElMessage.warning('OpenAI URL 和 Anthropic URL 至少填写一个')
     return
   }
   if (editing.value) {
-    await updateChannel(editing.value.id, form.value)
+    // models are managed on the models page — pass current value through
+    await updateChannel(editing.value.id, { ...form.value, models: editing.value.models })
   } else {
     await createChannel(form.value)
   }

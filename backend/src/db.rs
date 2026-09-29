@@ -12,7 +12,8 @@ pub async fn init_pool(path: &str) -> SqlitePool {
         "CREATE TABLE IF NOT EXISTS channels (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT NOT NULL,
-            base_url    TEXT NOT NULL,
+            base_url    TEXT NOT NULL DEFAULT '',
+            base_url_anthropic TEXT NOT NULL DEFAULT '',
             api_key     TEXT NOT NULL,
             models      TEXT NOT NULL DEFAULT '',
             enabled     INTEGER NOT NULL DEFAULT 1,
@@ -22,6 +23,12 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     .execute(&pool)
     .await
     .expect("create channels table");
+    // migrate existing databases (add column if missing)
+    let _ = sqlx::query(
+        "ALTER TABLE channels ADD COLUMN base_url_anthropic TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(&pool)
+    .await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tokens (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,

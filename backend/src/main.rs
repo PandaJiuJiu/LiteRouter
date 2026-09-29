@@ -19,10 +19,13 @@ async fn main() {
     let app = Router::new()
         // relay endpoints (OpenAI compatible)
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/messages", post(proxy::anthropic_messages))
         .route("/v1/models", get(proxy::list_models))
         // admin endpoints
         .route("/api/login", post(auth::login))
         .route("/api/channels", get(admin::list_channels).post(admin::create_channel))
+        .route("/api/channels/fetch-models", post(admin::fetch_models))
+        .route("/api/channels/test-model", post(admin::test_model))
         .route(
             "/api/channels/:id",
             axum::routing::put(admin::update_channel).delete(admin::delete_channel),
@@ -43,7 +46,13 @@ async fn main() {
         .map(std::path::Path::new)
         .find(|p| p.exists());
     let app = if let Some(dist) = dist {
-        app.fallback_service(tower_http::services::ServeDir::new(dist))
+        // SPA fallback: unknown paths serve index.html so frontend routes
+        // like /channels survive a full page refresh
+        let index = dist.join("index.html");
+        app.fallback_service(
+            tower_http::services::ServeDir::new(dist)
+                .fallback(tower_http::services::ServeFile::new(index)),
+        )
     } else {
         app
     };
