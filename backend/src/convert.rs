@@ -523,6 +523,10 @@ pub trait SseConverter: Send {
     fn on_data(&mut self, payload: &str) -> Vec<String>;
     /// Emit any remaining events when the upstream stream ends.
     fn finish(&mut self) -> Vec<String>;
+    /// Final (prompt, completion) token counts the converter captured from
+    /// upstream chunks. None means no usage was reported in the stream — the
+    /// log row will record 0 tokens in that case.
+    fn usage(&self) -> Option<(i64, i64)> { None }
 }
 
 fn sse_event(name: &str, data: &Value) -> String {
@@ -749,6 +753,17 @@ impl SseConverter for OpenAiToAnthropicStream {
         out.push(sse_event("message_stop", &json!({ "type": "message_stop" })));
         out
     }
+
+    fn usage(&self) -> Option<(i64, i64)> {
+        // OpenAI's chunk.usage uses prompt_tokens / completion_tokens. We've
+        // been storing them as-is into self.usage, so we can just return it
+        // whenever any non-zero count was observed.
+        if self.usage.0 > 0 || self.usage.1 > 0 {
+            Some(self.usage)
+        } else {
+            None
+        }
+    }
 }
 
 /// Anthropic event SSE -> OpenAI chunk stream.
@@ -901,5 +916,15 @@ impl SseConverter for AnthropicToOpenAiStream {
         ));
         out.push("data: [DONE]\n\n".to_string());
         out
+    }
+
+    fn usage(&self) -> Option<(i64, i64)> {
+        // Anthropic SSE reports input_tokens / output_tokens. We copy them
+        // straight into self.usage, so return as-is when any non-zero.
+        if self.usage.0 > 0 || self.usage.1 > 0 {
+            Some(self.usage)
+        } else {
+            None
+        }
     }
 }

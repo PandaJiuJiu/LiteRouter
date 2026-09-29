@@ -22,7 +22,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     // OpenAI clients: "Authorization: Bearer sk-..."
@@ -268,7 +268,8 @@ async fn pinned_channel(
 }
 
 async fn log_request(
-    state: &AppState,
+    pool: &sqlx::SqlitePool,
+    _http: &reqwest::Client,
     token_name: &str,
     request_model: &str,
     model: &str,
@@ -289,7 +290,7 @@ async fn log_request(
     .bind(t)
     .bind(now())
     .bind(request_model)
-    .execute(&state.pool)
+    .execute(pool)
     .await;
 }
 
@@ -372,14 +373,179 @@ fn build_request(
 /// drop-cancels-upstream mechanism: when the client disconnects, axum drops
 /// the body, which drops the stream, which drops `resp`, which cancels the
 /// upstream connection.
-fn passthrough_stream(resp: reqwest::Response, status: StatusCode, content_type: Option<axum::http::HeaderValue>) -> Response {
-    let body_stream = stream::unfold(resp, |mut r| async move {
-        match r.chunk().await {
-            Ok(Some(bytes)) => Some((Ok::<Bytes, reqwest::Error>(bytes), r)),
-            Ok(None) => None,
-            Err(e) => Some((Err(e), r)),
+/// Bundles everything needed to write the final log row once the stream ends.
+/// The stream closure captures one of these by value; when the upstream body
+/// exhausts, the closure spawns a tokio task that calls `log_request` with
+/// the captured usage. This lets the response body be streamed straight to
+/// the client (no buffering) while still recording the eventual token count.
+struct StreamLog {
+    pool: sqlx::SqlitePool,
+    http: reqwest::Client,
+    token_name: String,
+    request_model: String,
+    model: String,
+    channel_name: String,
+    status: i64,
+}
+
+impl StreamLog {
+    async fn spawn_inline(self, usage: Option<(i64, i64)>) {
+        let usage_triple = usage.map(|(p, c)| (p, c, p + c));
+        log_request(
+            &self.pool,
+            &self.http,
+            &self.token_name,
+            &self.request_model,
+            &self.model,
+            &self.channel_name,
+            self.status,
+            usage_triple,
+        )
+        .await;
+    }
+}
+
+/// Wraps a byte stream and spawns a log task when the wrapper is dropped.
+/// Drop fires on three paths:
+///   1. upstream ended cleanly → Poll::Ready(None)
+///   2. axum's response body finished streaming to the client (success)
+///   3. the client disconnected mid-stream → upstream gets cancelled, the
+///      body_stream future is dropped
+/// All three are when we want to record the row, so Drop is the right hook.
+///
+/// Usage source at Drop time depends on which constructor was used:
+///   - `wrap()` — the passthrough unfold has been writing usage into the
+///     shared `usage` mutex as it scanned `data:` lines
+///   - `wrap_with_converter()` — the SseConverter tracks usage as a side
+///     effect of translating, so we read `converter.usage()` directly
+struct LogOnEnd<S> {
+    inner: S,
+    log: Option<StreamLog>,
+    usage: Arc<Mutex<Option<(i64, i64)>>>,
+    /// If set, overrides `usage` when Drop fires. Used for the converted
+    /// path so the converter's own usage counter is the source of truth.
+    converter_usage: Option<Arc<Mutex<Box<dyn SseConverter>>>>,
+}
+
+impl<S> LogOnEnd<S> {
+    fn wrap(inner: S, log: StreamLog, usage: Arc<Mutex<Option<(i64, i64)>>>) -> Self {
+        Self { inner, log: Some(log), usage, converter_usage: None }
+    }
+    fn wrap_with_converter(
+        inner: S,
+        log: StreamLog,
+        converter: Arc<Mutex<Box<dyn SseConverter>>>,
+    ) -> Self {
+        Self {
+            inner,
+            log: Some(log),
+            usage: Arc::new(Mutex::new(None)),
+            converter_usage: Some(converter),
         }
-    });
+    }
+}
+
+impl<S> futures_util::Stream for LogOnEnd<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    type Item = S::Item;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // SAFETY: `LogOnEnd` doesn't move `inner` out of `self`. The
+        // projection through `get_unchecked_mut` is sound because
+        // `inner` is structurally pinned (we never hand out &mut Self
+        // to anyone else). We re-pin with `new_unchecked` because
+        // the upstream byte stream (e.g. `stream::unfold` over
+        // `reqwest::Response`) may not be `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
+        inner.poll_next(cx)
+    }
+}
+
+impl<S> Drop for LogOnEnd<S> {
+    fn drop(&mut self) {
+        if let Some(log) = self.log.take() {
+            // Prefer the converter's tracked usage (converted path) over the
+            // shared mutex (passthrough path); the mutex holds whatever the
+            // passthrough SSE parser last wrote.
+            let usage = if let Some(conv) = self.converter_usage.as_ref() {
+                conv.lock().unwrap().usage()
+            } else {
+                self.usage.lock().unwrap().clone()
+            };
+            tokio::spawn(log.spawn_inline(usage));
+        }
+    }
+}
+
+/// Pull (prompt, completion) token counts out of one SSE `data:` payload.
+/// Accepts both the OpenAI shape ({prompt_tokens, completion_tokens}) and
+/// the Anthropic shape ({input_tokens, output_tokens}); returns the most
+/// recent non-zero pair seen. Returns None for payloads without a usage
+/// block — the caller is expected to overwrite earlier values.
+fn usage_from_sse_payload(payload: &str) -> Option<(i64, i64)> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let u = v.get("usage")?;
+    let prompt = u
+        .get("prompt_tokens")
+        .or_else(|| u.get("input_tokens"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let completion = u
+        .get("completion_tokens")
+        .or_else(|| u.get("output_tokens"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    if prompt == 0 && completion == 0 {
+        return None;
+    }
+    Some((prompt, completion))
+}
+
+/// Forward an upstream SSE byte stream to the client verbatim, but parse
+/// `data:` lines on the side so we can record token usage when the stream
+/// ends. Same drop-cancels-upstream property as the converted stream.
+fn passthrough_stream(
+    resp: reqwest::Response,
+    status: StatusCode,
+    content_type: Option<axum::http::HeaderValue>,
+    log: StreamLog,
+) -> Response {
+    let usage: Arc<Mutex<Option<(i64, i64)>>> = Arc::new(Mutex::new(None));
+    let usage_for_drop = Arc::clone(&usage);
+    let body_stream = stream::unfold(
+        (resp, Vec::<u8>::new(), Arc::clone(&usage)),
+        |mut st| async move {
+            let (resp, buf, usage_ref) = (&mut st.0, &mut st.1, &mut st.2);
+            match resp.chunk().await {
+                Ok(Some(bytes)) => {
+                    // Copy the bytes into buf for side-effect usage
+                    // extraction, then forward the original chunk to the
+                    // client untouched. Copying (not moving) lets us
+                    // hand `bytes` straight to axum while keeping the
+                    // parse buffer authoritative for line scanning.
+                    buf.extend_from_slice(&bytes);
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=pos).collect();
+                        let line_str = std::str::from_utf8(&line).unwrap_or("");
+                        let trimmed = line_str.trim_end_matches('\r');
+                        if let Some(payload) = trimmed.strip_prefix("data:") {
+                            if let Some(u) = usage_from_sse_payload(payload.trim()) {
+                                *usage_ref.lock().unwrap() = Some(u);
+                            }
+                        }
+                    }
+                    Some((Ok::<Bytes, reqwest::Error>(bytes), st))
+                }
+                Ok(None) => None,
+                Err(e) => Some((Err(e), st)),
+            }
+        },
+    );
     let mut response = Response::builder().status(status);
     if let Some(ct) = content_type {
         if let Some(h) = response.headers_mut() {
@@ -387,21 +553,34 @@ fn passthrough_stream(resp: reqwest::Response, status: StatusCode, content_type:
         }
     }
     response
-        .body(Body::from_stream(body_stream))
+        .body(Body::from_stream(LogOnEnd::wrap(
+            body_stream,
+            log,
+            usage_for_drop,
+        )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
 
 /// Convert an upstream SSE byte stream to the client's protocol, line by
 /// line, via an `SseConverter`. Same drop-cancels-upstream property as the
-/// passthrough stream.
-fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Response {
+/// passthrough stream. The converter is shared via `Arc<Mutex<>>` so the
+/// final token usage can be read out from `converter.usage()` when the
+/// stream ends — the converter already tracks usage as a side-effect of
+/// translating each chunk, so we don't need a second SSE parser here.
+fn converted_stream(
+    resp: reqwest::Response,
+    conv: Box<dyn SseConverter>,
+    log: StreamLog,
+) -> Response {
+    let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
     let mut response = Response::builder().status(StatusCode::OK);
     if let Some(h) = response.headers_mut() {
         h.insert(axum::http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
     }
-    let state = (resp, String::new(), conv, false);
+    let state = (resp, String::new(), Arc::clone(&conv), false);
     let body_stream = stream::unfold(state, |mut st| async move {
-        let (resp, buf, conv, done) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
+        let (resp, buf, conv_ref, done) =
+            (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
         loop {
             if *done {
                 return None;
@@ -413,9 +592,9 @@ fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Res
                     let payload = payload.trim();
                     let events = if payload == "[DONE]" {
                         *done = true;
-                        conv.finish()
+                        conv_ref.lock().unwrap().finish()
                     } else {
-                        conv.on_data(payload)
+                        conv_ref.lock().unwrap().on_data(payload)
                     };
                     if !events.is_empty() {
                         return Some((Ok::<Bytes, reqwest::Error>(Bytes::from(events.concat())), st));
@@ -434,7 +613,7 @@ fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Res
                 Ok(None) => {
                     // upstream ended; flush converter's remaining events once
                     *done = true;
-                    let events = conv.finish();
+                    let events = conv_ref.lock().unwrap().finish();
                     if events.is_empty() {
                         return None;
                     }
@@ -448,7 +627,11 @@ fn converted_stream(resp: reqwest::Response, conv: Box<dyn SseConverter>) -> Res
         }
     });
     response
-        .body(Body::from_stream(body_stream))
+        .body(Body::from_stream(LogOnEnd::wrap_with_converter(
+            body_stream,
+            log,
+            conv,
+        )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
 
@@ -476,7 +659,8 @@ async fn respond_from_upstream(
             Ok(b) => b,
             Err(e) => {
                 log_request(
-                    state,
+                    &state.pool,
+                    &state.http,
                     token_name,
                     request_model,
                     model,
@@ -494,7 +678,8 @@ async fn respond_from_upstream(
         };
         let usage = parse_usage(&bytes);
         log_request(
-            state,
+            &state.pool,
+            &state.http,
             token_name,
             request_model,
             model,
@@ -538,29 +723,30 @@ async fn respond_from_upstream(
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
     }
 
-    // Streaming: pass upstream through, log status only.
-    log_request(
-        state,
-        token_name,
-        request_model,
-        model,
-        channel_name,
-        status.as_u16() as i64,
-        None,
-    )
-    .await;
+    // Streaming: forward to the client. The stream wrapper spawns the
+    // log_request task when the body stream is dropped (i.e., when the
+    // upstream ends, the client finishes, or the client disconnects).
+    let log = StreamLog {
+        pool: state.pool.clone(),
+        http: state.http.clone(),
+        token_name: token_name.to_string(),
+        request_model: request_model.to_string(),
+        model: model.to_string(),
+        channel_name: channel_name.to_string(),
+        status: status.as_u16() as i64,
+    };
     match convert {
         ConvertMode::None => {
             let content_type = resp.headers().get("content-type").cloned();
-            passthrough_stream(resp, status, content_type)
+            passthrough_stream(resp, status, content_type, log)
         }
         ConvertMode::ToOpenAI => {
             let conv = convert::OpenAiToAnthropicStream::new(model);
-            converted_stream(resp, Box::new(conv))
+            converted_stream(resp, Box::new(conv), log)
         }
         ConvertMode::ToAnthropic => {
             let conv = convert::AnthropicToOpenAiStream::new(model);
-            converted_stream(resp, Box::new(conv))
+            converted_stream(resp, Box::new(conv), log)
         }
     }
 }
@@ -695,14 +881,14 @@ async fn relay(
                             }
                         }
                     }
-                    log_request(state, &token_name, &model, target_model, &cand.name, code as i64, None).await;
+                    log_request(&state.pool, &state.http, &token_name, &model, target_model, &cand.name, code as i64, None).await;
                     all_errors.push(format!("{} ({}) -> HTTP {}", cand.name, target_model, code));
                     if code == 429 {
                         retriable_429_count += 1;
                     }
                 }
                 Err(e) => {
-                    log_request(state, &token_name, &model, target_model, &cand.name, -1, None).await;
+                    log_request(&state.pool, &state.http, &token_name, &model, target_model, &cand.name, -1, None).await;
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, e));
                     transport_err_count += 1;
                 }
