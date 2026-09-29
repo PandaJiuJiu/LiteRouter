@@ -1,33 +1,33 @@
-简体中文 | [English](README.en.md)
+English | [简体中文](README.zh-CN.md)
 
 # LiteRouter
 
-一个轻量级的 LLM API 网关。将多个上游 LLM 服务（OpenAI / Claude / 各类中转站等）聚合为一个统一地址，对内签发独立的访问密钥，并提供模型路由、多渠道故障转移与用量统计能力。单个 Rust 二进制 + SQLite，无外部依赖，开箱即用。
+A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI / Claude / relay stations, etc.) behind a single unified endpoint, issues internal access keys, and provides model routing, multi-channel failover, and usage tracking. Single Rust binary + SQLite, no external dependencies, ready out of the box.
 
-## 功能特性
+## Features
 
-- **统一接入**：对内提供 `http://your-host:3000/v1` 一个地址，同时兼容两种协议：
-  - `POST /v1/chat/completions` — OpenAI 协议（`Authorization: Bearer sk-...`）
-  - `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`）
-  - 均支持流式（SSE）透传
-- **渠道管理**：上游渠道（OpenAI / Claude / 各类中转站）的密钥只保存在网关，不对外暴露；支持 OpenAI / Anthropic 双协议地址（同一个 key 双协议的渠道如火山方舟，两个地址都填即可）
-- **渠道路由**：按请求中的 `model` 自动路由到支持该模型的上游渠道；支持通配符 `*`
-- **协议转换**：客户端协议与渠道不一致时自动双向转换（Anthropic Messages ⇄ OpenAI ChatCompletions），含流式与工具调用。例如 OpenAI 协议的渠道可直接服务 Claude Code（Anthropic 协议客户端），无需任何配置
-- **模型路由（Mappings）**：把客户端请求中的模型名（如 `my-model`）映射到一列上游真实模型 ID，可一对多并调整顺序；请求按列表顺序依次转发，前面的目标失败或无可用渠道时自动回退到后面的
-- **多渠道故障转移**：上游出现传输错误或可重试状态码（408 / 429 / 5xx / 524）时自动切换到下一个候选渠道；不可重试的 4xx 原样返回给客户端
-- **内部令牌 + 配额**：为内部服务签发 `sk-` 开头的 key，支持按令牌的 RPM 限额与每日 token 用量限额（超限返回 429）
-- **用量统计与调用日志**：记录每次请求的渠道、模型、状态码与 prompt / completion / total tokens，后台提供用量看板
-- **客户端断连取消**：客户端断开连接时自动取消上游请求，不浪费上游配额
-- **免运维**：SQLite 存储，无外部依赖，数据库 schema 自动迁移
+- **Unified access**: one endpoint at `http://your-host:3000/v1`, compatible with both protocols:
+  - `POST /v1/chat/completions` — OpenAI protocol (`Authorization: Bearer sk-...`)
+  - `POST /v1/messages` — Anthropic Messages protocol (`x-api-key: sk-...`)
+  - Both support streaming (SSE) passthrough
+- **Channel management**: upstream channel keys (OpenAI / Claude / relay stations) are stored only in the gateway and never exposed; supports dual-protocol URLs (for channels serving both protocols with the same key, such as Volcengine Ark, just fill in both URLs)
+- **Channel routing**: routes requests to upstream channels that support the requested `model`; wildcard `*` supported
+- **Protocol conversion**: automatically converts bidirectionally when the client protocol doesn't match the channel's (Anthropic Messages ⇄ OpenAI ChatCompletions), including streaming and tool calls. For example, an OpenAI-protocol channel can directly serve Claude Code (an Anthropic-protocol client) with zero configuration
+- **Model routing (Mappings)**: maps the model name in client requests (e.g. `my-model`) to a list of real upstream model IDs, one-to-many with adjustable order; requests are forwarded in list order and automatically fall back to the next target when earlier ones fail or have no available channel
+- **Multi-channel failover**: on upstream transport errors or retryable status codes (408 / 429 / 5xx / 524), automatically switches to the next candidate channel; non-retryable 4xx errors are returned to the client as-is
+- **Internal tokens + quotas**: issue `sk-` keys for internal services, with per-token RPM limits and daily token-usage limits (429 on exceeding)
+- **Usage tracking & call logs**: records the channel, model, status code, and prompt / completion / total tokens of every request, with a usage dashboard in the admin UI
+- **Client-disconnect cancellation**: upstream requests are cancelled automatically when the client disconnects, saving upstream quota
+- **Zero maintenance**: SQLite storage, no external dependencies, database schema migrates automatically
 
-## 技术栈
+## Tech Stack
 
-- 后端：Rust（axum + sqlx/SQLite + reqwest）
-- 前端：Vue 3 + Vite + Element Plus
+- Backend: Rust (axum + sqlx/SQLite + reqwest)
+- Frontend: Vue 3 + Vite + Element Plus
 
-## 部署
+## Deployment
 
-使用 Docker Compose 一键部署：
+One-command deployment with Docker Compose:
 
 ```bash
 git clone https://github.com/qihangkong/LiteRouter.git
@@ -35,78 +35,78 @@ cd LiteRouter
 ADMIN_PASSWORD=your-password docker compose up -d --build
 ```
 
-启动后访问 `http://your-host:3000` 进入管理后台（默认密码 `admin123`，通过 `ADMIN_PASSWORD` 环境变量修改）。
+After startup, visit `http://your-host:3000` for the admin UI (default password `admin123`, change it via the `ADMIN_PASSWORD` environment variable).
 
-说明：
+Notes:
 
-- 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，无外部依赖
-- SQLite 数据持久化在 `./data` 目录
-- `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用；`ADMIN_PASSWORD` 未设置时使用默认值
-- 老版本 Docker 用 `docker-compose`（带连字符）代替 `docker compose`
+- The image is a three-stage build (frontend → backend → runtime), final stage based on `alpine:3.20`, no external dependencies
+- SQLite data is persisted in the `./data` directory
+- `docker-compose.yml` depends on the `Dockerfile` in the same directory; both work without modification. `ADMIN_PASSWORD` falls back to the default when unset
+- On older Docker versions, use `docker-compose` (with hyphen) instead of `docker compose`
 
-### 修改端口
+### Changing the port
 
-宿主端口由 `docker-compose.yml` 的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
+The host port is determined by the `ports` mapping in `docker-compose.yml`, overridable via the `PORT` environment variable (the container always listens on 3000):
 
 ```bash
-PORT=8080 docker compose up -d --build   # 用 http://your-host:8080 访问
+PORT=8080 docker compose up -d --build   # access at http://your-host:8080
 ```
 
-注意这里的 `PORT` 只影响**宿主侧**端口映射；容器内进程监听端口无需修改。改回默认只需去掉 `PORT=` 前缀，重新 `up -d` 即可。
+Note that `PORT` only affects the **host-side** port mapping; the in-container process port needs no change. To revert to the default, drop the `PORT=` prefix and run `up -d` again.
 
-Docker Hub 不可达的网络可通过 build arg 换源：
+If Docker Hub is unreachable, you can switch the registry mirror via build args:
 
 ```bash
 docker compose build --build-arg REGISTRY=docker.io/library
 ```
 
-### 环境变量
+### Environment variables
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | 监听端口 |
-| `ADMIN_PASSWORD` | `admin123` | 管理后台密码 |
-| `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径（compose 已指向持久卷 `/app/data/literouter.db`） |
+| `PORT` | `3000` | Listen port |
+| `ADMIN_PASSWORD` | `admin123` | Admin UI password |
+| `LITEROUTER_DB` | `literouter.db` | SQLite database path (compose points it at the persistent volume `/app/data/literouter.db`) |
 
-## 使用流程
+## Usage
 
-1. 登录后台 → **渠道管理** 添加上游渠道：
-   - **OpenAI URL**：兼容 OpenAI 协议的**完整地址**，含路径版本（如 `https://api.openai.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan/v3`）。网关在此基础上追加 `/chat/completions`、`/models`
-   - **Anthropic URL**（可选）：兼容 Anthropic 协议的**完整地址**（如 `https://api.anthropic.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan`）。网关追加 `/v1/messages`
-   - **模型**：可手填（逗号分隔），或点「自动获取模型」从上游 `/v1/models` 拉取；填 `*` 表示匹配任意模型
-   - **类型**：外部（参与路由）或内部（不参与路由，仅做密钥托管）
-2. **令牌管理** 创建内部 key（`sk-` 开头），可按需设置 RPM 限额与每日 token 限额
-3. （可选）**模型路由** 配置映射规则：客户端模型名 → 一列上游模型（按顺序转发、失败回退），对客户端完全透明
-4. 内部服务把 SDK 的 `base_url` 指向本网关，`api_key` 用内部 key：
+1. Log in to the admin UI → **Channels** to add upstream channels:
+   - **OpenAI URL**: the **full** address of an OpenAI-protocol-compatible endpoint, including the version path (e.g. `https://api.openai.com/v1`, or Volcengine Ark's `https://ark.cn-beijing.volces.com/api/plan/v3`). The gateway appends `/chat/completions` and `/models` to it
+   - **Anthropic URL** (optional): the **full** address of an Anthropic-protocol-compatible endpoint (e.g. `https://api.anthropic.com/v1`, or Volcengine Ark's `https://ark.cn-beijing.volces.com/api/plan`). The gateway appends `/v1/messages`
+   - **Models**: enter manually (comma-separated), or click "Fetch models" to pull from the upstream `/v1/models`; `*` matches any model
+   - **Type**: external (participates in routing) or internal (key custody only, excluded from routing)
+2. **Tokens** — create internal keys (`sk-` prefixed), with optional RPM limits and daily token limits
+3. (Optional) **Mappings** — configure routing rules: client model name → a list of upstream models (forwarded in order, with failover), fully transparent to clients
+4. Point your internal services' SDK `base_url` at this gateway, with an internal key as `api_key`:
 
 ```python
 from openai import OpenAI
 client = OpenAI(
     base_url="http://your-host:3000/v1",
-    api_key="sk-xxxx",  # 内部令牌
+    api_key="sk-xxxx",  # internal token
 )
 resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 ```
 
 ## API
 
-对外（需内部令牌）：
+Public (requires an internal token):
 
-| 端点 | 说明 |
+| Endpoint | Description |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI 协议，支持 `stream: true` |
-| `POST /v1/messages` | Anthropic Messages 协议，支持流式 |
-| `GET /v1/models` | 合并所有启用渠道的模型列表 |
+| `POST /v1/chat/completions` | OpenAI protocol, supports `stream: true` |
+| `POST /v1/messages` | Anthropic Messages protocol, supports streaming |
+| `GET /v1/models` | Merged model list of all enabled channels |
 
-管理后台（Bearer session）：
+Admin UI (Bearer session):
 
-| 端点 | 说明 |
+| Endpoint | Description |
 |---|---|
-| `POST /api/login` | 管理员登录 |
-| `GET/POST /api/channels`、`PUT/DELETE /api/channels/:id` | 渠道管理 |
-| `POST /api/channels/fetch-models` | 从上游拉取模型列表 |
-| `POST /api/channels/test-model` | 测试渠道可用性 |
-| `GET/POST /api/tokens`、`PUT/DELETE /api/tokens/:id` | 令牌管理 |
-| `GET/POST /api/mappings`、`PUT/DELETE /api/mappings/:id` | 模型路由管理 |
-| `GET /api/logs` | 调用日志 |
-| `GET /api/usage` | 用量统计 |
+| `POST /api/login` | Admin login |
+| `GET/POST /api/channels`, `PUT/DELETE /api/channels/:id` | Channel management |
+| `POST /api/channels/fetch-models` | Fetch model list from upstream |
+| `POST /api/channels/test-model` | Test channel availability |
+| `GET/POST /api/tokens`, `PUT/DELETE /api/tokens/:id` | Token management |
+| `GET/POST /api/mappings`, `PUT/DELETE /api/mappings/:id` | Model routing management |
+| `GET /api/logs` | Call logs |
+| `GET /api/usage` | Usage statistics |
