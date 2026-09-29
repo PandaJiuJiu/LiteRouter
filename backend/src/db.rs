@@ -17,7 +17,6 @@ pub async fn init_pool(path: &str) -> SqlitePool {
             api_key     TEXT NOT NULL,
             models      TEXT NOT NULL DEFAULT '',
             enabled     INTEGER NOT NULL DEFAULT 1,
-            kind        TEXT NOT NULL DEFAULT 'external',
             created_at  INTEGER NOT NULL
         );",
     )
@@ -30,13 +29,12 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     )
     .execute(&pool)
     .await;
-    // channel kind: 'external' channels serve relay traffic (all incoming
-    // requests are internal); 'internal' channels are excluded from routing
-    let _ = sqlx::query(
-        "ALTER TABLE channels ADD COLUMN kind TEXT NOT NULL DEFAULT 'external'",
-    )
-    .execute(&pool)
-    .await;
+    // migrate: drop the obsolete `kind` column. The 'internal' vs 'external'
+    // distinction was redundant with `enabled` and confusingly named, so we
+    // removed it. SQLite ≥3.35 supports DROP COLUMN.
+    let _ = sqlx::query("ALTER TABLE channels DROP COLUMN kind")
+        .execute(&pool)
+        .await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tokens (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,

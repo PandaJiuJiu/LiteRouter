@@ -74,7 +74,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
    - **OpenAI URL**：兼容 OpenAI 协议的**完整地址**，含路径版本（如 `https://api.openai.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan/v3`）。网关在此基础上追加 `/chat/completions`、`/models`
    - **Anthropic URL**（可选）：兼容 Anthropic 协议的**完整地址**（如 `https://api.anthropic.com/v1` 或火山方舟的 `https://ark.cn-beijing.volces.com/api/plan`）。网关追加 `/v1/messages`
    - **模型**：可手填（逗号分隔），或点「自动获取模型」从上游 `/v1/models` 拉取；填 `*` 表示匹配任意模型
-   - **类型**：外部（参与路由）或内部（不参与路由，仅做密钥托管）
+   - **启用**：关闭后保留凭证但渠道不参与路由（与删除等价，但可恢复）
 2. **令牌管理** 创建内部 key（`sk-` 开头），可按需设置 RPM 限额与每日 token 限额
 3. （可选）**模型路由** 配置映射规则：客户端模型名 → 一列上游模型（按顺序转发、失败回退），对客户端完全透明
 4. 内部服务把 SDK 的 `base_url` 指向本网关，`api_key` 用内部 key：

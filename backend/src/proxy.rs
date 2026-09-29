@@ -1,7 +1,7 @@
 //! OpenAI-compatible relay: auth with internal token, route model -> channel,
 //! forward request (streaming included) to the upstream channel. All incoming
-//! requests are internal and are routed to external channels only
-//! (channels.kind='internal' never serves relay traffic).
+//! requests are internal and are routed to enabled channels only (channels
+//! with `enabled=0` are excluded from routing).
 //!
 //! Failover: when a model is provided by more than one enabled channel, the
 //! relay tries them in order and falls over to the next candidate on transport
@@ -126,7 +126,7 @@ async fn candidate_channels(
     protocol: &str,
 ) -> Result<Vec<Candidate>, StatusCode> {
     let rows = sqlx::query(
-        "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1 AND kind='external'",
+        "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1",
     )
     .fetch_all(&state.pool)
     .await
@@ -194,7 +194,7 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
         if model == "*" && !channel.is_empty() {
             // wildcard: every model on the pinned channel, in its list order
             if let Ok(rows) = sqlx::query(
-                "SELECT models FROM channels WHERE name=? AND enabled=1 AND kind='external'",
+                "SELECT models FROM channels WHERE name=? AND enabled=1",
             )
             .bind(&channel)
             .fetch_all(&state.pool)
@@ -235,7 +235,7 @@ async fn pinned_channel(
     protocol: &str,
 ) -> Option<Candidate> {
     let row = sqlx::query(
-        "SELECT name, base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1 AND kind='external'",
+        "SELECT name, base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1",
     )
     .bind(name)
     .fetch_optional(&state.pool)
@@ -791,7 +791,7 @@ pub async fn list_models(
     }
     // only external channels serve relay traffic (see candidate_channels)
     let rows = match sqlx::query(
-        "SELECT models FROM channels WHERE enabled=1 AND kind='external'",
+        "SELECT models FROM channels WHERE enabled=1",
     )
         .fetch_all(&state.pool)
         .await

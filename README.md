@@ -74,7 +74,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
    - **OpenAI URL**: the **full** address of an OpenAI-protocol-compatible endpoint, including the version path (e.g. `https://api.openai.com/v1`, or Volcengine Ark's `https://ark.cn-beijing.volces.com/api/plan/v3`). The gateway appends `/chat/completions` and `/models` to it
    - **Anthropic URL** (optional): the **full** address of an Anthropic-protocol-compatible endpoint (e.g. `https://api.anthropic.com/v1`, or Volcengine Ark's `https://ark.cn-beijing.volces.com/api/plan`). The gateway appends `/v1/messages`
    - **Models**: enter manually (comma-separated), or click "Fetch models" to pull from the upstream `/v1/models`; `*` matches any model
-   - **Type**: external (participates in routing) or internal (key custody only, excluded from routing)
+   - **Enabled**: toggle off to keep the credentials stored but exclude the channel from routing (same effect as deleting it, but reversible)
 2. **Tokens** — create internal keys (`sk-` prefixed), with optional RPM limits and daily token limits
 3. (Optional) **Mappings** — configure routing rules: client model name → a list of upstream models (forwarded in order, with failover), fully transparent to clients
 4. Point your internal services' SDK `base_url` at this gateway, with an internal key as `api_key`:

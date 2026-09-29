@@ -17,13 +17,6 @@
           {{ row.models === '*' ? '全部模型（*）' : (row.models || '未配置（去"模型管理"页配置）') }}
         </template>
       </el-table-column>
-      <el-table-column label="类型" width="90">
-        <template #default="{ row }">
-          <el-tag :type="row.kind === 'internal' ? 'info' : 'primary'">
-            {{ row.kind === 'internal' ? '内部' : '外部' }}
-          </el-tag>
-        </template>
-      </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag :type="row.enabled ? 'success' : 'danger'">
@@ -60,12 +53,6 @@
         <el-form-item label="API Key">
           <el-input v-model="form.api_key" placeholder="上游渠道密钥" show-password />
         </el-form-item>
-        <el-form-item label="类型">
-          <el-radio-group v-model="form.kind">
-            <el-radio value="external">外部（参与路由）</el-radio>
-            <el-radio value="internal">内部（不参与路由）</el-radio>
-          </el-radio-group>
-        </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
@@ -88,7 +75,7 @@ const channels = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
-const form = ref({ name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true, kind: 'external' })
+const form = ref({ name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true })
 
 async function load() {
   loading.value = true
@@ -108,8 +95,8 @@ function manageModels(row) {
 function openDialog(row) {
   editing.value = row || null
   form.value = row
-    ? { name: row.name, base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled, kind: row.kind || 'external' }
-    : { name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true, kind: 'external' }
+    ? { name: row.name, base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled }
+    : { name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true }
   dialogVisible.value = true
 }
 
