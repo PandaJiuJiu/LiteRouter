@@ -179,7 +179,9 @@ onMounted(async () => {
   } catch (_) {
     // interceptor handles the redirect on 401
   }
-  if (isAdmin.value) loadDebugLogging()
+  if (isAdmin.value) {
+    loadDebugLogging()
+  }
   load()
 })
 </script>

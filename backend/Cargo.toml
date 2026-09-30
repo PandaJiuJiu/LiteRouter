@@ -22,3 +22,8 @@ hex = "0.4"
 
 [profile.release]
 opt-level = 2
+
+[dev-dependencies]
+# `test-util` enables tokio::time::pause/advance, used by breaker state-machine
+# tests to drive virtual time forward without sleeping.
+tokio = { version = "1", features = ["test-util"] }

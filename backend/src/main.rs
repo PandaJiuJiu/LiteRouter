@@ -1,4 +1,6 @@
 mod admin;
+mod breaker;
+mod breaker_probe;
 mod convert;
 mod auth;
 mod db;
@@ -23,7 +25,9 @@ async fn main() {
         _ => false,
     };
     proxy::set_debug_logging(debug_logging);
-    let state = Arc::new(AppState::new(pool, debug_logging));
+    let breaker_cfg = settings::load_breaker_config(&pool).await;
+    let breaker = Arc::new(breaker::Breaker::new(breaker_cfg));
+    let state = Arc::new(AppState::new(pool, debug_logging, breaker));
 
     // background: keep the `logs` table bounded — relay traffic is high
     // volume and every row is an INSERT, so without this the DB grows
@@ -42,6 +46,12 @@ async fn main() {
             }
         });
     }
+
+    // background: probe task — every `breaker_probe_interval_secs`, find
+    // every (channel, model) whose cooldown has elapsed and send a
+    // synthetic ping to the upstream. Recovery is owned by this loop and
+    // is independent of user traffic.
+    breaker_probe::spawn(state.clone());
 
     let app = Router::new()
         // relay endpoints (OpenAI compatible)
@@ -73,6 +83,12 @@ async fn main() {
         .route("/api/logs/:id", get(admin::get_log))
         .route("/api/usage", get(admin::usage))
         .route("/api/settings/debug-logging", get(settings::get_debug_logging).put(settings::set_debug_logging))
+        .route(
+            "/api/settings/breaker",
+            get(settings::get_breaker_config).put(settings::set_breaker_config),
+        )
+        .route("/api/breaker/snapshot", get(breaker::http_snapshot))
+        .route("/api/breaker/reset", post(breaker::http_reset))
         .route(
             "/api/mappings",
             get(admin::list_mappings).post(admin::create_mapping),

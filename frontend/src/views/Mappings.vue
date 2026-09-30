@@ -110,12 +110,58 @@
       </template>
     </el-dialog>
   </el-card>
+
+  <el-card v-if="isAdmin" class="breaker-card">
+    <el-collapse v-model="breakerExpanded">
+      <el-collapse-item name="breaker">
+        <template #title>
+          <div class="breaker-title">
+            <span>熔断器状态</span>
+            <span class="hint">
+              {{ openCount }} 个 (渠道, 模型) 熔断中 · {{ snapshot.length }} 监测中
+            </span>
+          </div>
+        </template>
+        <div class="breaker-actions">
+          <el-button size="small" @click="refreshBreaker">刷新</el-button>
+          <el-button size="small" type="danger" plain @click="onResetBreaker">一键复位</el-button>
+        </div>
+        <div class="hint breaker-desc">
+          熔断中的上游组合会被路由自动跳过，不会消耗请求配额也不会出现在 attempt 链里。
+          任意一次失败（5xx / 4xx / 408 / 429 / 网络错误）即熔断 {{ baseDelaySecs }}s，
+          到点由后台任务独立发探测验证恢复，恢复前不会主动重试用户请求。
+          后台任务每 {{ probeIntervalSecs }}s 检查一次所有到期组合。
+        </div>
+        <el-table
+          :data="snapshot"
+          v-loading="breakerLoading"
+          size="small"
+          empty-text="暂无熔断记录 — 所有上游组合目前都正常"
+        >
+          <el-table-column prop="channel" label="渠道" width="160" show-overflow-tooltip />
+          <el-table-column prop="target_model" label="模型" min-width="180" show-overflow-tooltip />
+          <el-table-column label="状态" width="80">
+            <template #default="{ row }">
+              <el-tag :type="stateTagType(row.state)" size="small">{{ stateLabel(row.state) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="下次探测" width="100">
+            <template #default="{ row }">
+              <span v-if="row.cooldown_remaining_secs">{{ row.cooldown_remaining_secs }}s</span>
+              <span v-else class="hint">—</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-collapse-item>
+    </el-collapse>
+  </el-card>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels } from '../api'
+import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, me, getBreakerConfig } from '../api'
+import { breaker, loadBreakerSnapshot, resetAllBreakers } from '../breaker'
 
 const mappings = ref([])
 const channelModels = ref([])
@@ -124,6 +170,43 @@ const saving = ref(false)
 const dialogVisible = ref(false)
 const editingId = ref(null)
 const form = ref({ alias: '', targets: [] })
+
+// Circuit-breaker snapshot — admin only. Surfaced here because the breaker
+// state is the per-(channel, model) health that *directly* determines which
+// routing entries get skipped on the next request; admins editing mappings
+// need to see it in the same view.
+const isAdmin = ref(false)
+// Default folded: most edits don't need the panel. Admin can expand it;
+// the open/closed state isn't persisted across reloads on purpose — the
+// snapshot itself is what's worth keeping an eye on, not the UI preference.
+const breakerExpanded = ref([])
+const breakerLoading = ref(false)
+// Thresholds shown in the panel description — read from the server config
+// so the docs in the UI match what's actually enforced.
+const baseDelaySecs = ref(30)
+const probeIntervalSecs = ref(30)
+const snapshot = computed(() => breaker.snapshot)
+const openCount = computed(
+  () => snapshot.value.filter((r) => r.state === 'open').length,
+)
+
+function stateLabel(s) {
+  return ({ closed: '正常', open: '熔断' })[s] || s
+}
+function stateTagType(s) {
+  return ({ closed: 'success', open: 'danger' })[s] || ''
+}
+async function refreshBreaker() {
+  breakerLoading.value = true
+  try {
+    await loadBreakerSnapshot()
+  } finally {
+    breakerLoading.value = false
+  }
+}
+async function onResetBreaker() {
+  await resetAllBreakers()
+}
 
 function newTarget() {
   return { channel: '', model: '' }
@@ -226,7 +309,24 @@ function resetForm() {
   form.value = { alias: '', targets: [] }
 }
 
-onMounted(load)
+onMounted(async () => {
+  try {
+    isAdmin.value = !!(await me()).is_admin
+  } catch (_) {
+    // interceptor handles the redirect on 401
+  }
+  await load()
+  if (isAdmin.value) {
+    try {
+      const cfg = await getBreakerConfig()
+      baseDelaySecs.value = cfg.base_delay_secs ?? 30
+      probeIntervalSecs.value = cfg.probe_interval_secs ?? 30
+    } catch (_) {
+      // fall back to the defaults already in the refs
+    }
+    refreshBreaker()
+  }
+})
 </script>
 
 <style scoped>
@@ -302,5 +402,31 @@ onMounted(load)
 }
 .add-target {
   margin-top: 4px;
+}
+/* Circuit breaker panel — sits below the mappings table because the
+   breaker state is the per-(channel, model) health that directly
+   determines which routing entries get skipped on the next request.
+   Admins editing a mapping need to see the live state right here. */
+.breaker-card {
+  margin-top: 16px;
+}
+.breaker-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.breaker-title {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+}
+.breaker-actions {
+  display: flex;
+  gap: 8px;
+}
+.breaker-desc {
+  margin-bottom: 12px;
+  line-height: 1.7;
 }
 </style>

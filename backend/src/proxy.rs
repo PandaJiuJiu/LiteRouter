@@ -3,13 +3,21 @@
 //! requests are internal and are routed to enabled channels only (channels
 //! with `enabled=0` are excluded from routing).
 //!
-//! Failover: when a model is provided by more than one enabled channel, the
-//! relay tries them in order and falls over to the next candidate on transport
-//! errors or retriable upstream statuses (5xx, 408, 429, 524). Non-retriable
-//! upstream statuses (4xx other than 408/429) are returned immediately so we
-//! don't burn quota on a misrouted / malformed request.
+//! Failover: every non-2xx response — transport errors, 5xx, **and 4xx
+//! including 404 model-not-found** — is treated as a fallback signal and
+//! the relay moves to the next candidate/target rather than returning the
+//! error to the client. This is the point of `model_mappings`: an upstream
+//! going away, a model being renamed, or a quota misconfiguration should
+//! not bring down the whole request when other targets are available.
+//!
+//! Across requests, the per-(channel, model) circuit breaker remembers
+//! which combinations are broken and short-circuits them, so a single
+//! broken upstream doesn't burn quota on every subsequent request. The
+//! breaker tracks 4xx (404/401/403) too — those represent stable
+//! (channel, model) incompatibilities, not transient health issues.
 
 use crate::admin;
+use crate::breaker::{self, Outcome};
 use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::state::AppState;
@@ -526,9 +534,11 @@ fn error_response(status: StatusCode, message: &str, retry_after: Option<&str>) 
     resp
 }
 
-/// Status codes that signal "this upstream is having a bad time, try the next
-/// channel". 4xx other than these are the client's fault — no point failing
-/// over to a second provider only to get the same 400.
+/// Status codes that count as breaker failures. The relay itself treats
+/// *every* non-2xx as a fallback signal now, so this function is only
+/// consulted to decide whether a non-2xx outcome should record a failure
+/// in the breaker; in practice every non-2xx does, so it's effectively a
+/// predicate over "this is non-2xx".
 fn is_retriable_status(code: u16) -> bool {
     code == 408 || code == 429 || code >= 500
 }
@@ -561,6 +571,96 @@ fn build_request(
             .header("Authorization", format!("Bearer {}", api_key))
     };
     req.header("Content-Type", "application/json")
+}
+
+/// Outcome of one upstream attempt, classified into three buckets so the
+/// caller can dispatch without re-checking status codes. The relay never
+/// returns non-2xx to the client — every `Http` / `Transport` outcome is
+/// a fallback signal.
+enum UpstreamOutcome {
+    /// 2xx — the upstream call succeeded; pass `resp` to
+    /// `respond_from_upstream` to build the client response.
+    Ok(reqwest::Response),
+    /// Non-2xx with a parsed HTTP status. `retry_after_secs` is the
+    /// upstream's `Retry-After` header parsed as integer seconds (only
+    /// the form defined by RFC 7231 §7.1.3 is supported; HTTP-date form
+    /// falls back to `None` because LLM providers don't use it).
+    Http {
+        status: u16,
+        retry_after_secs: Option<u64>,
+    },
+    /// Connection / DNS / TLS / timeout failure — no HTTP status received.
+    Transport(String),
+}
+
+/// Build and dispatch one upstream request, classify the outcome. The
+/// response body is **not** consumed here; for `Ok` the caller streams
+/// or reads it, for `Http` / `Transport` it is discarded because the
+/// next target gets a fresh attempt.
+async fn try_upstream(
+    state: &AppState,
+    cand: &Candidate,
+    upstream_protocol: &str,
+    body: Vec<u8>,
+    headers: &HeaderMap,
+) -> UpstreamOutcome {
+    let req = build_request(
+        state,
+        &cand.base_url,
+        &cand.api_key,
+        upstream_protocol,
+        headers,
+    )
+    .body(body);
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                UpstreamOutcome::Ok(resp)
+            } else {
+                let retry_after_secs = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                UpstreamOutcome::Http {
+                    status,
+                    retry_after_secs,
+                }
+            }
+        }
+        Err(e) => UpstreamOutcome::Transport(format!("transport: {e}")),
+    }
+}
+
+/// Feed a non-2xx HTTP status into the breaker. 429 increments the
+/// `retriable_429_count` so the final-status decision can choose 429 over
+/// 502 when every failure was a rate-limit. The breaker itself no longer
+/// cares about Retry-After or about distinguishing 4xx from 5xx — every
+/// failure is `Outcome::Failure` and trips at the same threshold.
+/// 400 / 422 are deliberately not recorded: those are request-body bugs
+/// (gateway-side or client-side) and tripping the breaker would hide
+/// routing errors from the admin instead of surfacing them in logs.
+async fn record_outcome_in_breaker(
+    state: &AppState,
+    breaker_key: &str,
+    code: u16,
+    _retry_after_secs: Option<u64>,
+    retriable_429_count: &mut usize,
+) {
+    match code {
+        429 => {
+            *retriable_429_count += 1;
+            state.breaker.record(breaker_key, Outcome::Failure).await;
+        }
+        c if is_retriable_status(c) => {
+            state.breaker.record(breaker_key, Outcome::Failure).await;
+        }
+        404 | 401 | 403 => {
+            state.breaker.record(breaker_key, Outcome::Failure).await;
+        }
+        _ => {} // 400 / 422 etc. — request-body bug, don't trip the breaker
+    }
 }
 
 /// Pass the upstream body through unchanged, preserving the
@@ -847,6 +947,10 @@ fn converted_stream(
 /// of this request. This function does not log — logging is the caller's job,
 /// because only the caller knows about the hops that failed before this one.
 ///
+/// **Only called on 2xx** — the main loop falls through to the next target
+/// on every non-2xx, so the streaming and conversion paths here can assume
+/// success.
+///
 /// Streaming requests pass through unchanged; non-streaming responses are
 /// buffered so we can extract usage. `convert` says which protocol
 /// translation this hop needs. `start` is when the relay started, so we can
@@ -1052,13 +1156,14 @@ async fn relay(
     // 504 if they were all transport errors, 502 otherwise. The first
     // upstream's `Retry-After` is captured so we can pass it through on 429.
     let mut all_errors: Vec<String> = Vec::new();
-    let mut retry_after: Option<String> = None;
+    let mut relay_retry_after: Option<String> = None;
     let mut attempted = 0usize;
     let mut retriable_429_count = 0usize;
     let mut transport_err_count = 0usize;
     // Every upstream attempt so far, in order. Recorded as child rows of the
-    // single `logs` row this request produces. A hop that ends the request
-    // (success or non-retriable error) is pushed by `respond_from_upstream`.
+    // single `logs` row this request produces. The winning attempt — the
+    // 2xx response that gets returned to the client — is pushed by
+    // `respond_from_upstream`; failed hops are pushed inline below.
     let mut attempts: Vec<Attempt> = Vec::new();
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
@@ -1104,87 +1209,102 @@ async fn relay(
                 }
             };
             let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
+            // Breaker gate: skip this (channel, model) without burning a
+            // network call while it's OPEN. Recorded as a hop so the log
+            // page shows the request tried it (admin still sees what was
+            // skipped) but `all_errors` is *not* updated — the failure is
+            // not a "real" upstream failure and shouldn't bias the
+            // final-status decision (block at 1652 area in old code).
+            let breaker_key = breaker::breaker_key(&cand.name, target_model);
+            if !state.breaker.allow(&breaker_key).await {
+                attempted += 1;
+                attempts.push(Attempt::new(
+                    target_model,
+                    cand,
+                    0,
+                    "circuit breaker open",
+                    relay_start.elapsed().as_millis() as i64,
+                    false,
+                ));
+                continue;
+            }
             attempted += 1;
-            let req = build_request(state, &cand.base_url, &cand.api_key, upstream_protocol, headers)
-                .body(target_body.clone());
-            match req.send().await {
-                Ok(resp) => {
-                    let code = resp.status().as_u16();
-                    let req_body = Bytes::from(target_body.clone());
-                    if resp.status().is_success() {
-                        return respond_from_upstream(
-                            state,
-                            &token_name,
-                            &model,
-                            target_model,
-                            cand,
-                            resp,
-                            is_streaming,
-                            protocol,
-                            is_streaming,
-                            relay_start,
-                            attempts,
-                            req_body,
-                            client_info.clone(),
-                        )
-                        .await
-                        .0;
-                    }
-                    if !is_retriable_status(code) {
-                        // non-retriable: surface upstream's response as-is
-                        return respond_from_upstream(
-                            state,
-                            &token_name,
-                            &model,
-                            target_model,
-                            cand,
-                            resp,
-                            is_streaming,
-                            protocol,
-                            is_streaming,
-                            relay_start,
-                            attempts,
-                            req_body,
-                            client_info.clone(),
-                        )
-                        .await
-                        .0;
-                    }
-                    // retriable: capture Retry-After (first one wins), record
-                    // the hop, try the next candidate
-                    if retry_after.is_none() {
-                        if let Some(v) = resp.headers().get(reqwest::header::RETRY_AFTER) {
-                            if let Ok(s) = v.to_str() {
-                                retry_after = Some(s.to_string());
-                            }
-                        }
-                    }
-                    let err_msg = format!("HTTP {}", code);
+            // `target_body` is consumed by `try_upstream`; keep a `Bytes`
+            // copy for the debug-log write that happens on the 2xx winner.
+            let req_body = Bytes::from(target_body.clone());
+            let outcome =
+                try_upstream(state, cand, upstream_protocol, target_body, headers).await;
+            match outcome {
+                UpstreamOutcome::Ok(resp) => {
+                    state.breaker.record(&breaker_key, Outcome::Success).await;
+                    return respond_from_upstream(
+                        state,
+                        &token_name,
+                        &model,
+                        target_model,
+                        cand,
+                        resp,
+                        is_streaming,
+                        protocol,
+                        is_streaming,
+                        relay_start,
+                        attempts,
+                        req_body,
+                        client_info.clone(),
+                    )
+                    .await
+                    .0;
+                }
+                UpstreamOutcome::Http {
+                    status: code,
+                    retry_after_secs,
+                } => {
+                    let elapsed = relay_start.elapsed().as_millis() as i64;
+                    let err_msg = format!("HTTP {code}");
                     attempts.push(Attempt::new(
                         target_model,
                         cand,
                         code as i64,
                         &err_msg,
-                        relay_start.elapsed().as_millis() as i64,
+                        elapsed,
                         false,
                     ));
-                    all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
-                    if code == 429 {
-                        retriable_429_count += 1;
+                    all_errors
+                        .push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
+                    // First non-empty Retry-After wins for the client
+                    // pass-through on the eventual 429 response.
+                    if relay_retry_after.is_none() {
+                        relay_retry_after =
+                            retry_after_secs.map(|s| s.to_string());
                     }
+                    record_outcome_in_breaker(
+                        state,
+                        &breaker_key,
+                        code,
+                        retry_after_secs,
+                        &mut retriable_429_count,
+                    )
+                    .await;
+                    // Fall through to the next candidate / next target.
                 }
-                Err(e) => {
-                    let err_msg = format!("transport: {}", e);
+                UpstreamOutcome::Transport(err_msg) => {
+                    let elapsed = relay_start.elapsed().as_millis() as i64;
                     attempts.push(Attempt::new(
                         target_model,
                         cand,
                         -1,
                         &err_msg,
-                        relay_start.elapsed().as_millis() as i64,
+                        elapsed,
                         false,
                     ));
-                    all_errors.push(format!("{} ({}): {}", cand.name, target_model, e));
+                    all_errors
+                        .push(format!("{} ({}): {}", cand.name, target_model, err_msg));
                     transport_err_count += 1;
+                    state
+                        .breaker
+                        .record(&breaker_key, Outcome::Failure)
+                        .await;
+                    // Fall through to the next candidate / next target.
                 }
             }
         }
@@ -1288,7 +1408,7 @@ async fn relay(
     error_response(
         final_status,
         &err,
-        retry_after.as_deref(),
+        relay_retry_after.as_deref(),
     )
 }
 

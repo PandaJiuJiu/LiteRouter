@@ -1,6 +1,7 @@
+use crate::breaker::{Breaker, BreakerConfig};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// One issued session. Carries enough info to authorize requests without
 /// hitting the DB on every check. In-memory only: restarts clear sessions,
@@ -21,10 +22,13 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     /// When true, request/response bodies are written to data/debug_logs/.
     pub debug_logging: bool,
+    /// Per-(channel, model) circuit breaker. In-memory; restarts clear it,
+    /// matching the session-stores-don't-survive-restart stance.
+    pub breaker: Arc<Breaker>,
 }
 
 impl AppState {
-    pub fn new(pool: SqlitePool, debug_logging: bool) -> Self {
+    pub fn new(pool: SqlitePool, debug_logging: bool, breaker: Arc<Breaker>) -> Self {
         Self {
             pool,
             http: reqwest::Client::builder()
@@ -33,6 +37,15 @@ impl AppState {
                 .expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
             debug_logging,
+            breaker,
         }
+    }
+
+    /// Convenience for tests / hot paths that don't have a Breaker handy.
+    /// Production startup always uses `new(...)`.
+    #[allow(dead_code)]
+    pub fn with_default_breaker(pool: SqlitePool, debug_logging: bool) -> Self {
+        let breaker = Arc::new(Breaker::new(BreakerConfig::default()));
+        Self::new(pool, debug_logging, breaker)
     }
 }

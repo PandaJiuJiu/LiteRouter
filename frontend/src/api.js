@@ -98,4 +98,14 @@ export const getDebugLogging = () => api.get('/settings/debug-logging').then((r)
 export const setDebugLogging = (enabled) =>
   api.put('/settings/debug-logging', { enabled }).then((r) => r.data.enabled)
 
+// ---------- circuit breaker ----------
+export const getBreakerConfig = () =>
+  api.get('/settings/breaker').then((r) => r.data)
+export const setBreakerConfig = (cfg) =>
+  api.put('/settings/breaker', cfg).then((r) => r.data)
+export const getBreakerSnapshot = () =>
+  api.get('/breaker/snapshot').then((r) => r.data.snapshot || [])
+export const resetBreaker = () =>
+  api.post('/breaker/reset').then((r) => r.data)
+
 export default api
