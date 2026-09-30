@@ -1,7 +1,7 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>系统用户：管理员可创建、修改、降级或删除账号</span>
+      <span>系统用户：管理员可创建、重置密码或删除账号</span>
       <el-button type="primary" @click="openCreate">新建用户</el-button>
     </div>
 
@@ -21,11 +21,6 @@
       <el-table-column label="操作">
         <template #default="{ row }">
           <el-button size="small" @click="openResetPwd(row)">重置密码</el-button>
-          <el-button size="small"
-            :disabled="!row.is_admin && users.filter((u) => u.is_admin).length <= 1"
-            @click="toggleAdmin(row)">
-            {{ row.is_admin ? '降为普通用户' : '提升为管理员' }}
-          </el-button>
           <el-popconfirm
             :title="row.is_admin && users.filter((u) => u.is_admin).length <= 1
               ? '至少保留一个管理员'
@@ -157,13 +152,6 @@ async function submitReset() {
   } finally {
     resetting.value = false
   }
-}
-
-async function toggleAdmin(row) {
-  const next = !row.is_admin
-  await updateUser(row.id, { is_admin: next })
-  ElMessage.success(next ? '已提升为管理员' : '已降为普通用户')
-  await load()
 }
 
 async function remove(row) {
