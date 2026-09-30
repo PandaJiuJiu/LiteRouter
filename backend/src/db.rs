@@ -87,16 +87,61 @@ pub fn verify_password(plain: &str, hash_hex: &str, salt_hex: &str) -> bool {
 }
 
 /// Delete log rows older than `retention_days` days. Returns the number of
-/// rows removed so the caller can log it. Called by the background sweeper
-/// in main.rs so the `logs` table doesn't grow unbounded under relay load.
+/// parent rows removed so the caller can log it. Called by the background
+/// sweeper in main.rs so the `logs` table doesn't grow unbounded under relay
+/// load.
+///
+/// `log_attempts` has no foreign key (SQLite doesn't enforce them here, and
+/// this schema uses soft string references throughout), so the children have
+/// to go explicitly — first, then the parents, or the `NOT EXISTS` check would
+/// match nothing and leak every child row.
 pub async fn cleanup_old_logs(
     pool: &SqlitePool,
     retention_days: i64,
 ) -> Result<u64, sqlx::Error> {
     let cutoff = now() - retention_days * 86400;
+
+    // Collect the IDs whose debug files need to be purged before we delete the
+    // rows. Errors here are non-fatal — the background sweeper should not fail
+    // the whole cleanup just because one directory couldn't be removed.
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM logs WHERE created_at < ?")
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM log_attempts WHERE log_id IN (SELECT id FROM logs WHERE created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?;
     let res = sqlx::query("DELETE FROM logs WHERE created_at < ?")
         .bind(cutoff)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
+
+    for id in ids {
+        let dir = format!("data/debug_logs/{id}");
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("debug_log cleanup: remove_dir {} failed: {}", dir, e);
+            }
+        }
+    }
+
     Ok(res.rows_affected())
+}
+
+/// Read one key from the settings table. Returns None if the key does not
+/// exist (migrations guarantee all known keys exist, but the initial read
+/// before any have been written is still safe).
+pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(v,)| v))
 }

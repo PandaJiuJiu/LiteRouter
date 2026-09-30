@@ -93,4 +93,9 @@ export const createMapping = (m) => api.post('/mappings', m)
 export const updateMapping = (id, m) => api.put(`/mappings/${id}`, m)
 export const deleteMapping = (id) => api.delete(`/mappings/${id}`)
 
+// ---------- settings ----------
+export const getDebugLogging = () => api.get('/settings/debug-logging').then((r) => r.data.enabled)
+export const setDebugLogging = (enabled) =>
+  api.put('/settings/debug-logging', { enabled }).then((r) => r.data.enabled)
+
 export default api

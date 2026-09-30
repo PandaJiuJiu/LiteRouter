@@ -268,6 +268,44 @@ async fn pinned_channel(
     })
 }
 
+/// Directory where debug request/response bodies are stored.
+/// `data/debug_logs/{log_id}/` — created on first write for each log_id.
+const DEBUG_LOG_DIR: &str = "data/debug_logs";
+
+/// Write the upstream request body and response body to disk when debug
+/// logging is enabled. Errors are silently ignored — debug logging is a
+/// diagnostic aid, never a reason to fail a request.
+/// Files: `data/debug_logs/{log_id}/req.json` and `resp.json`.
+async fn write_debug_log(log_id: i64, req_body: &[u8], resp_body: &[u8]) {
+    let dir = format!("{DEBUG_LOG_DIR}/{log_id}");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("debug_log: create_dir {} failed: {}", dir, e);
+        return;
+    }
+    async fn write(dir: &str, filename: &str, body: &[u8]) {
+        let path = format!("{dir}/{filename}");
+        if let Err(e) = tokio::fs::write(&path, body).await {
+            eprintln!("debug_log: write {} failed: {}", path, e);
+        }
+    }
+    write(&dir, "req.json", req_body).await;
+    write(&dir, "resp.json", resp_body).await;
+}
+
+/// Delete the debug log directory for a given log_id. Idempotent —
+/// directory may not exist. Called during cleanup so orphaned debug files
+/// are removed when the corresponding log row is purged.
+#[allow(dead_code)]
+pub async fn delete_debug_log(log_id: i64) {
+    let dir = format!("{DEBUG_LOG_DIR}/{log_id}");
+    if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+        // ENOENT is fine — already gone
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("debug_log: remove_dir {} failed: {}", dir, e);
+        }
+    }
+}
+
 /// Everything we know about one relayed request, collected as the request
 /// travels through the pipeline and written to `logs` once it settles.
 /// Deliberately excludes the prompt and the reply text — this is metadata
@@ -355,19 +393,20 @@ struct LogEntry {
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
+/// Returns the `logs.id` on success so the caller can name debug files.
 /// A no-op when there is no winner AND no attempts (nothing was tried).
-async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) {
+async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
     let Some(winner) = e.winner.as_ref().or_else(|| e.attempts.last()) else {
-        return;
+        return None;
     };
     let u = winner.usage_or_zero();
     let failed_count = e.attempts.iter().filter(|a| !a.ok).count() as i64;
 
     let mut tx = match pool.begin().await {
         Ok(t) => t,
-        Err(_) => return,
+        Err(_) => return None,
     };
-    let inserted = sqlx::query(
+    let inserted = match sqlx::query(
         "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&e.token_name)
@@ -390,11 +429,12 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) {
     .bind(u.reasoning)
     .bind(failed_count)
     .execute(&mut *tx)
-    .await;
-    let log_id = match inserted {
-        Ok(r) => r.last_insert_rowid(),
-        Err(_) => return,
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return None,
     };
+    let log_id = inserted.last_insert_rowid();
 
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
@@ -412,7 +452,10 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) {
         .execute(&mut *tx)
         .await;
     }
-    let _ = tx.commit().await;
+    if tx.commit().await.is_err() {
+        return None;
+    }
+    Some(log_id)
 }
 
 fn convert_label(mode: ConvertMode) -> &'static str {
@@ -502,17 +545,43 @@ fn build_request(
 struct StreamLog {
     pool: sqlx::SqlitePool,
     entry: LogEntry,
+    /// The upstream request body, written to disk when debug logging is on.
+    req_body: Bytes,
 }
 
 impl StreamLog {
-    /// Record the token count the stream ended up producing. Taken by
-    /// `mut self` because usage is only known once the body has been consumed.
-    async fn spawn_inline(mut self, usage: Option<convert::Usage>) {
+    /// Finalize the log row and (if `state.debug_logging`) write the request
+    /// and response bodies to disk. Usage and the accumulated response bytes are
+    /// supplied by the caller (Drop impl of LogOnEnd).
+    async fn spawn_inline(
+        mut self,
+        usage: Option<convert::Usage>,
+        resp_buf: Arc<Mutex<Vec<u8>>>,
+    ) {
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
         }
-        log_request(&self.pool, &self.entry).await;
+        let log_id = log_request(&self.pool, &self.entry).await;
+        if state_debug_logging() && log_id.is_some() {
+            let req = self.req_body.to_vec();
+            let resp = resp_buf.lock().unwrap().clone();
+            write_debug_log(log_id.unwrap(), &req, &resp).await;
+        }
     }
+}
+
+/// Whether debug logging is globally enabled. Stored in a static so we avoid a
+/// DB lookup on every request; updated atomically when an admin toggles it.
+static DEBUG_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the global debug_logging flag. Called at startup and whenever an admin
+/// toggles the switch.
+pub fn set_debug_logging(v: bool) {
+    DEBUG_LOGGING.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn state_debug_logging() -> bool {
+    DEBUG_LOGGING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Wraps a byte stream and spawns a log task when the wrapper is dropped.
@@ -535,22 +604,32 @@ struct LogOnEnd<S> {
     /// If set, overrides `usage` when Drop fires. Used for the converted
     /// path so the converter's own usage counter is the source of truth.
     converter_usage: Option<Arc<Mutex<Box<dyn SseConverter>>>>,
+    /// Full response body accumulated during streaming. Read at Drop and
+    /// forwarded to `StreamLog` for the debug log file.
+    resp_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl<S> LogOnEnd<S> {
-    fn wrap(inner: S, log: StreamLog, usage: Arc<Mutex<Option<convert::Usage>>>) -> Self {
-        Self { inner, log: Some(log), usage, converter_usage: None }
+    fn wrap(
+        inner: S,
+        log: StreamLog,
+        usage: Arc<Mutex<Option<convert::Usage>>>,
+        resp_buf: Arc<Mutex<Vec<u8>>>,
+    ) -> Self {
+        Self { inner, log: Some(log), usage, converter_usage: None, resp_buf }
     }
     fn wrap_with_converter(
         inner: S,
         log: StreamLog,
         converter: Arc<Mutex<Box<dyn SseConverter>>>,
+        resp_buf: Arc<Mutex<Vec<u8>>>,
     ) -> Self {
         Self {
             inner,
             log: Some(log),
             usage: Arc::new(Mutex::new(None)),
             converter_usage: Some(converter),
+            resp_buf,
         }
     }
 }
@@ -579,15 +658,15 @@ where
 impl<S> Drop for LogOnEnd<S> {
     fn drop(&mut self) {
         if let Some(log) = self.log.take() {
-            // Prefer the converter's tracked usage (converted path) over the
-            // shared mutex (passthrough path); the mutex holds whatever the
-            // passthrough SSE parser last wrote.
             let usage = if let Some(conv) = self.converter_usage.as_ref() {
                 conv.lock().unwrap().usage()
             } else {
                 self.usage.lock().unwrap().clone()
             };
-            tokio::spawn(log.spawn_inline(usage));
+            let resp_buf = self.resp_buf.clone();
+            tokio::spawn(async move {
+                log.spawn_inline(usage, resp_buf).await;
+            });
         }
     }
 }
@@ -607,6 +686,7 @@ fn passthrough_stream(
     status: StatusCode,
     content_type: Option<axum::http::HeaderValue>,
     log: StreamLog,
+    resp_buf: Arc<Mutex<Vec<u8>>>,
 ) -> Response {
     let usage: Arc<Mutex<Option<convert::Usage>>> = Arc::new(Mutex::new(None));
     let usage_for_drop = Arc::clone(&usage);
@@ -650,6 +730,7 @@ fn passthrough_stream(
             body_stream,
             log,
             usage_for_drop,
+            resp_buf,
         )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
@@ -724,6 +805,7 @@ fn converted_stream(
             body_stream,
             log,
             conv,
+            Arc::new(Mutex::new(Vec::new())),
         )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
@@ -751,6 +833,8 @@ async fn respond_from_upstream(
     streaming: bool,
     start: Instant,
     attempts: Vec<Attempt>,
+    // The body that was actually sent upstream (post-mappings rewrite).
+    req_body: Bytes,
 ) -> (Response, Attempt) {
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -776,7 +860,7 @@ async fn respond_from_upstream(
                     winner: Some(attempt.clone()),
                     attempts: push(attempts, attempt.clone()),
                 };
-                log_request(&state.pool, &entry).await;
+                let _ = log_request(&state.pool, &entry).await;
                 return (
                     error_response(
                         StatusCode::BAD_GATEWAY,
@@ -824,7 +908,10 @@ async fn respond_from_upstream(
             winner: Some(attempt.clone()),
             attempts: push(attempts, attempt.clone()),
         };
-        log_request(&state.pool, &entry).await;
+        let log_id = log_request(&state.pool, &entry).await;
+        if state.debug_logging {
+            let _ = write_debug_log(log_id.unwrap_or(0), &req_body, &out_bytes).await;
+        }
         let mut builder = Response::builder().status(status);
         if let Some(ct) = content_type {
             if let Some(h) = builder.headers_mut() {
@@ -841,6 +928,7 @@ async fn respond_from_upstream(
     // and writes it when the body stream is dropped (i.e., when the upstream
     // ends, the client finishes, or the client disconnects). It carries the
     // preceding failed hops so the detail page can show the whole chain.
+    let resp_buf = Arc::new(Mutex::new(Vec::new()));
     let log = StreamLog {
         pool: state.pool.clone(),
         entry: LogEntry {
@@ -851,11 +939,12 @@ async fn respond_from_upstream(
             winner: Some(attempt.clone()),
             attempts: push(attempts, attempt.clone()),
         },
+        req_body,
     };
     let resp = match cand.convert {
         ConvertMode::None => {
             let content_type = resp.headers().get("content-type").cloned();
-            passthrough_stream(resp, status, content_type, log)
+            passthrough_stream(resp, status, content_type, log, resp_buf)
         }
         ConvertMode::ToOpenAI => {
             let conv = convert::OpenAiToAnthropicStream::new(model);
@@ -976,10 +1065,11 @@ async fn relay(
             let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
             attempted += 1;
             let req = build_request(state, &cand.base_url, &cand.api_key, upstream_protocol, headers)
-                .body(target_body);
+                .body(target_body.clone());
             match req.send().await {
                 Ok(resp) => {
                     let code = resp.status().as_u16();
+                    let req_body = Bytes::from(target_body.clone());
                     if resp.status().is_success() {
                         return respond_from_upstream(
                             state,
@@ -993,6 +1083,7 @@ async fn relay(
                             is_streaming,
                             relay_start,
                             attempts,
+                            req_body,
                         )
                         .await
                         .0;
@@ -1011,6 +1102,7 @@ async fn relay(
                             is_streaming,
                             relay_start,
                             attempts,
+                            req_body,
                         )
                         .await
                         .0;
@@ -1098,7 +1190,7 @@ async fn relay(
             }),
             attempts: Vec::new(),
         };
-        log_request(&state.pool, &entry).await;
+        let _ = log_request(&state.pool, &entry).await;
         return error_response(StatusCode::NOT_FOUND, &err, None);
     }
     // Pick the most informative status code:

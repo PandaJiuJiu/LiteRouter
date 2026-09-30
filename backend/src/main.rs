@@ -3,6 +3,7 @@ mod convert;
 mod auth;
 mod db;
 mod proxy;
+mod settings;
 mod state;
 mod users;
 
@@ -17,7 +18,12 @@ async fn main() {
     let db_path =
         std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
     let pool = db::init_pool(&db_path).await;
-    let state = Arc::new(AppState::new(pool));
+    let debug_logging = match db::get_setting(&pool, "debug_logging").await {
+        Ok(Some(v)) => v == "1",
+        _ => false,
+    };
+    proxy::set_debug_logging(debug_logging);
+    let state = Arc::new(AppState::new(pool, debug_logging));
 
     // background: keep the `logs` table bounded — relay traffic is high
     // volume and every row is an INSERT, so without this the DB grows
@@ -66,6 +72,7 @@ async fn main() {
         .route("/api/logs", get(admin::list_logs))
         .route("/api/logs/:id", get(admin::get_log))
         .route("/api/usage", get(admin::usage))
+        .route("/api/settings/debug-logging", get(settings::get_debug_logging).put(settings::set_debug_logging))
         .route(
             "/api/mappings",
             get(admin::list_mappings).post(admin::create_mapping),

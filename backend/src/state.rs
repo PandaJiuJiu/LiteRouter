@@ -19,10 +19,12 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// session token -> metadata
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
+    /// When true, request/response bodies are written to data/debug_logs/.
+    pub debug_logging: bool,
 }
 
 impl AppState {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, debug_logging: bool) -> Self {
         Self {
             pool,
             http: reqwest::Client::builder()
@@ -30,6 +32,7 @@ impl AppState {
                 .build()
                 .expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
+            debug_logging,
         }
     }
 }

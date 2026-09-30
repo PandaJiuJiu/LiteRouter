@@ -14,6 +14,10 @@
         <div class="user-name" :title="username">
           {{ username }}<span v-if="isAdmin" class="admin-tag">admin</span>
         </div>
+        <div v-if="isAdmin" class="debug-toggle">
+          <span class="debug-label">调试日志</span>
+          <el-switch v-model="debugLogging" size="small" @change="toggleDebug" :loading="debugLoading" />
+        </div>
         <div class="user-actions">
           <el-button text size="small" @click="openPwd">改密</el-button>
           <el-button text size="small" type="danger" @click="doLogout">登出</el-button>
@@ -52,7 +56,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { changePassword, logout, me } from '../api'
+import { changePassword, logout, me, getDebugLogging, setDebugLogging } from '../api'
 
 const router = useRouter()
 const username = ref('')
@@ -61,6 +65,27 @@ const isAdmin = ref(false)
 const pwdVisible = ref(false)
 const pwdSaving = ref(false)
 const pwdForm = reactive({ old: '', new: '', confirm: '' })
+
+const debugLogging = ref(false)
+const debugLoading = ref(false)
+
+async function loadDebug() {
+  if (!isAdmin.value) return
+  try {
+    debugLogging.value = await getDebugLogging()
+  } catch (_) {}
+}
+
+async function toggleDebug(v) {
+  debugLoading.value = true
+  try {
+    await setDebugLogging(v)
+  } catch (_) {
+    debugLogging.value = !v // revert on error
+  } finally {
+    debugLoading.value = false
+  }
+}
 
 async function loadMe() {
   try {
@@ -107,7 +132,7 @@ async function doLogout() {
   router.push('/login')
 }
 
-onMounted(loadMe)
+onMounted(() => { loadMe(); loadDebug(); })
 </script>
 
 <style scoped>
@@ -147,5 +172,16 @@ onMounted(loadMe)
 .user-actions {
   display: flex;
   gap: 4px;
+}
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  padding: 4px 0;
+}
+.debug-label {
+  font-size: 12px;
+  color: #909399;
 }
 </style>
