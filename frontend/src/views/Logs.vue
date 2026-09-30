@@ -19,13 +19,20 @@
         </template>
       </el-table-column>
       <el-table-column prop="token_name" label="令牌" width="160" />
-      <el-table-column label="来源" width="150" show-overflow-tooltip>
+      <el-table-column label="来源" width="220">
         <template #default="{ row }">
-          <span v-if="row.client_ip || row.user_agent">
-            <span v-if="row.client_ip" class="ip">{{ row.client_ip }}</span>
-            <span v-if="row.client_ip && row.user_agent"> · </span>
-            <span v-if="row.user_agent" class="ua">{{ row.user_agent }}</span>
-          </span>
+          <el-tooltip
+            v-if="row.client_ip || row.user_agent"
+            placement="top"
+            :show-after="200"
+            :content="[row.client_ip, row.user_agent].filter(Boolean).join(' · ')"
+          >
+            <span>
+              <span v-if="row.client_ip" class="ip">{{ row.client_ip }}</span>
+              <span v-if="row.client_ip && row.user_agent"> · </span>
+              <span v-if="row.user_agent" class="ua">{{ shortUa(row.user_agent) }}</span>
+            </span>
+          </el-tooltip>
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
@@ -128,6 +135,19 @@ function fmt(n) {
   return Number(n || 0).toLocaleString()
 }
 
+// User-Agents are long and mostly redundant past the product token — the
+// parenthetical at the end of a browser UA is a spec, not a signal. 24 chars
+// covers the SDKs verbatim (claude-cli/2.1.284, OpenAI/Python 1.92.2,
+// curl/8.4.0, python-httpx/0.27.0) and cuts browsers down to "Mozilla/5.0
+// (Macintosh…", which is enough to tell a browser apart from an SDK. The
+// tooltip on the cell still shows the whole string.
+const UA_MAX = 24
+
+function shortUa(ua) {
+  if (!ua || ua.length <= UA_MAX) return ua
+  return ua.slice(0, UA_MAX - 1) + '…'
+}
+
 function open(row) {
   router.push(`/logs/${row.id}`)
 }
@@ -160,12 +180,6 @@ onMounted(load)
 .ua {
   font-size: 11px;
   color: #909399;
-  max-width: 80px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  display: inline-block;
-  vertical-align: middle;
 }
 .fail-badge {
   margin-left: 6px;
