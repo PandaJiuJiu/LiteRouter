@@ -51,15 +51,11 @@ fn bearer_session(headers: &HeaderMap) -> Result<String, StatusCode> {
 /// setup wizard, login form, or nothing. Also tells the SPA whether an
 /// existing session is still valid (avoids a second /api/me roundtrip on
 /// every page load).
-pub async fn setup_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    let user_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0);
+pub async fn setup_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
     let auth = check_auth(&state, &headers).ok();
     let username = match auth {
         Some(u) => sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = ?")
@@ -120,9 +116,7 @@ pub async fn setup(
         Err(ref e) if db::is_unique_violation(e) => {
             return Err((StatusCode::CONFLICT, json_err("用户名已存在")))
         }
-        Err(_) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, json_err("创建失败")))
-        }
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, json_err("创建失败"))),
     };
 
     let session = uuid::Uuid::new_v4().to_string();
@@ -190,10 +184,7 @@ pub async fn login(
 }
 
 /// POST /api/logout — invalidate the current session.
-pub async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> StatusCode {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> StatusCode {
     if let Ok(session) = bearer_session(&headers) {
         state.sessions.lock().unwrap().remove(&session);
     }

@@ -17,7 +17,13 @@ use sqlx::Row;
 use support::Harness;
 
 /// Create a regular (non-admin) user through the API.
-async fn create_user(h: &Harness, session: &str, username: &str, password: &str, admin: bool) -> (StatusCode, serde_json::Value) {
+async fn create_user(
+    h: &Harness,
+    session: &str,
+    username: &str,
+    password: &str,
+    admin: bool,
+) -> (StatusCode, serde_json::Value) {
     support::call_json(
         &h.router,
         "POST",
@@ -39,11 +45,21 @@ async fn listing_users_requires_an_admin_session() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     let (status, _) = support::call_json(&h.router, "GET", "/api/users", None, Some(&bob)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "regular users must not enumerate accounts");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "regular users must not enumerate accounts"
+    );
 
-    let (status, body) = support::call_json(&h.router, "GET", "/api/users", None, Some(&admin)).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/api/users", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK);
-    let names: Vec<&str> = body["users"].as_array().unwrap().iter().map(|u| u["username"].as_str().unwrap()).collect();
+    let names: Vec<&str> = body["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["username"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["admin", "bob"]);
 }
 
@@ -73,8 +89,14 @@ async fn creating_a_user_validates_username_and_password() {
 async fn a_duplicate_username_is_a_conflict() {
     let h = Harness::with_admin().await;
     let admin = support::login(&h.router, "admin").await;
-    assert_eq!(create_user(&h, &admin, "bob", "longenough", false).await.0, StatusCode::OK);
-    assert_eq!(create_user(&h, &admin, "bob", "longenough", false).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        create_user(&h, &admin, "bob", "longenough", false).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        create_user(&h, &admin, "bob", "longenough", false).await.0,
+        StatusCode::CONFLICT
+    );
 }
 
 #[tokio::test]
@@ -100,10 +122,18 @@ async fn a_created_user_can_immediately_log_in() {
 async fn usernames_are_trimmed_so_whitespace_variants_still_collide() {
     let h = Harness::with_admin().await;
     let admin = support::login(&h.router, "admin").await;
-    assert_eq!(create_user(&h, &admin, "bob", "longenough", false).await.0, StatusCode::OK);
+    assert_eq!(
+        create_user(&h, &admin, "bob", "longenough", false).await.0,
+        StatusCode::OK
+    );
     // "  bob  " trims to "bob", which is taken. Without the trim this would
     // create a second account that looks identical in the UI.
-    assert_eq!(create_user(&h, &admin, "  bob  ", "longenough", false).await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        create_user(&h, &admin, "  bob  ", "longenough", false)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
 }
 
 #[tokio::test]
@@ -187,7 +217,14 @@ async fn an_admin_cannot_delete_their_own_account() {
         .await
         .unwrap();
 
-    let (status, _) = support::call_json(&h.router, "DELETE", &format!("/api/users/{id}"), None, Some(&admin)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "DELETE",
+        &format!("/api/users/{id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -198,7 +235,14 @@ async fn a_non_admin_can_be_deleted_by_an_admin() {
     let (_, created) = create_user(&h, &admin, "bob", "longenough", false).await;
     let id = created["id"].as_i64().unwrap();
 
-    let (status, _) = support::call_json(&h.router, "DELETE", &format!("/api/users/{id}"), None, Some(&admin)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "DELETE",
+        &format!("/api/users/{id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
         .bind(id)
@@ -216,11 +260,21 @@ async fn deleting_a_user_orphans_their_tokens_instead_of_cascading() {
     let admin = support::login(&h.router, "admin").await;
     let bob_id = support::insert_user(h.pool(), "bob", false).await;
     let tok = support::insert_token(h.pool(), "bob-token", bob_id).await;
-    let (status, _) = support::call_json(&h.router, "DELETE", &format!("/api/users/{bob_id}"), None, Some(&admin)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "DELETE",
+        &format!("/api/users/{bob_id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
-    let row = sqlx::query("SELECT user_id FROM tokens WHERE id=?").bind(tok.id)
-        .fetch_one(h.pool()).await.unwrap();
+    let row = sqlx::query("SELECT user_id FROM tokens WHERE id=?")
+        .bind(tok.id)
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let owner: Option<i64> = row.get("user_id");
     assert_eq!(owner, None, "token should be orphaned, not deleted");
 }
@@ -231,7 +285,9 @@ async fn an_admin_can_reset_another_users_password() {
     let admin = support::login(&h.router, "admin").await;
     support::insert_user(h.pool(), "bob", false).await;
     let bob_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username='bob'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     let (status, _) = support::call_json(
         &h.router,
@@ -271,7 +327,9 @@ async fn a_too_short_reset_password_is_rejected() {
     let admin = support::login(&h.router, "admin").await;
     support::insert_user(h.pool(), "bob", false).await;
     let bob_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username='bob'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     let (status, _) = support::call_json(
         &h.router,
@@ -292,7 +350,9 @@ async fn an_empty_reset_password_leaves_the_old_one_in_place() {
     let admin = support::login(&h.router, "admin").await;
     support::insert_user(h.pool(), "bob", false).await;
     let bob_id = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username='bob'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     support::call_json(
         &h.router,
@@ -328,7 +388,8 @@ async fn updating_a_nonexistent_user_is_a_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (status, _) = support::call_json(&h.router, "DELETE", "/api/users/9999", None, Some(&admin)).await;
+    let (status, _) =
+        support::call_json(&h.router, "DELETE", "/api/users/9999", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -342,7 +403,8 @@ async fn a_session_stops_working_after_logout() {
     let (status, _) = support::call_json(&h.router, "GET", "/api/me", None, Some(&session)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, _) = support::call_json(&h.router, "POST", "/api/logout", None, Some(&session)).await;
+    let (status, _) =
+        support::call_json(&h.router, "POST", "/api/logout", None, Some(&session)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, _) = support::call_json(&h.router, "GET", "/api/me", None, Some(&session)).await;

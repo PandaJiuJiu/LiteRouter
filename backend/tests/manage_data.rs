@@ -50,14 +50,28 @@ async fn a_regular_user_only_lists_their_own_tokens() {
     let (admin, bob) = two_users(&h).await;
     let admin_id = support::insert_user(h.pool(), "admin2", true).await;
     let _ = admin_id;
-    support::insert_token(h.pool(), "other-token", support::insert_user(h.pool(), "carol", false).await).await;
+    support::insert_token(
+        h.pool(),
+        "other-token",
+        support::insert_user(h.pool(), "carol", false).await,
+    )
+    .await;
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/tokens", None, Some(&bob)).await;
-    let names: Vec<&str> = body["tokens"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = body["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["bob-token"]);
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/tokens", None, Some(&admin)).await;
-    assert_eq!(body["tokens"].as_array().unwrap().len(), 2, "admin sees every token");
+    assert_eq!(
+        body["tokens"].as_array().unwrap().len(),
+        2,
+        "admin sees every token"
+    );
 }
 
 #[tokio::test]
@@ -98,7 +112,9 @@ async fn a_non_admin_cannot_mint_a_token_for_someone_else() {
     let h = Harness::with_admin().await;
     let (_, bob) = two_users(&h).await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     let (status, _) = support::call_json(
         &h.router,
@@ -116,7 +132,9 @@ async fn an_admin_can_assign_a_token_to_another_user() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
     let bob_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='bob'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     let (status, body) = support::call_json(
         &h.router,
@@ -159,7 +177,9 @@ async fn a_user_cannot_toggle_or_delete_someone_elses_token() {
 
     let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE id=?")
         .bind(victim.id)
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(still_there, 1);
 }
 
@@ -168,14 +188,8 @@ async fn managing_a_nonexistent_token_is_a_404_not_a_403() {
     // 403 would confirm the id exists; 404 reveals nothing.
     let h = Harness::with_admin().await;
     let (_, bob) = two_users(&h).await;
-    let (status, _) = support::call_json(
-        &h.router,
-        "DELETE",
-        "/api/tokens/424242",
-        None,
-        Some(&bob),
-    )
-    .await;
+    let (status, _) =
+        support::call_json(&h.router, "DELETE", "/api/tokens/424242", None, Some(&bob)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -184,13 +198,17 @@ async fn a_disabled_token_stops_working_on_the_relay() {
     let h = Harness::with_admin().await;
     let (_, bob) = two_users(&h).await;
     let key: String = sqlx::query_scalar("SELECT key FROM tokens WHERE name='bob-token'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
 
     let (status, _) = support::call_json(&h.router, "GET", "/v1/models", None, Some(&key)).await;
     assert_eq!(status, StatusCode::OK, "enabled token works");
 
     let id: i64 = sqlx::query_scalar("SELECT id FROM tokens WHERE name='bob-token'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     support::call_json(
         &h.router,
         "PUT",
@@ -207,7 +225,8 @@ async fn a_disabled_token_stops_working_on_the_relay() {
 #[tokio::test]
 async fn an_unknown_token_is_rejected() {
     let h = Harness::with_admin().await;
-    let (status, _) = support::call_json(&h.router, "GET", "/v1/models", None, Some("sk-nope")).await;
+    let (status, _) =
+        support::call_json(&h.router, "GET", "/v1/models", None, Some("sk-nope")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -231,9 +250,17 @@ async fn a_regular_user_sees_only_logs_for_their_own_tokens() {
     insert_log(h.pool(), "carol-token", now, 20).await;
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&bob)).await;
-    let names: Vec<&str> = body["logs"].as_array().unwrap().iter().map(|l| l["token_name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = body["logs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["token_name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["bob-token"]);
-    assert_eq!(body["total"], 1, "the total must not leak the other user's rows");
+    assert_eq!(
+        body["total"], 1,
+        "the total must not leak the other user's rows"
+    );
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
     assert_eq!(body["total"], 2);
@@ -261,11 +288,16 @@ async fn orphaned_tokens_stay_visible_to_admins_only() {
     let h = Harness::with_admin().await;
     let (admin, bob) = two_users(&h).await;
     sqlx::query("UPDATE tokens SET user_id=NULL WHERE name='bob-token'")
-        .execute(h.pool()).await.unwrap();
+        .execute(h.pool())
+        .await
+        .unwrap();
     insert_log(h.pool(), "bob-token", literouter::db::now(), 5).await;
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&bob)).await;
-    assert_eq!(body["total"], 0, "a NULL-owned token is not visible to a regular user");
+    assert_eq!(
+        body["total"], 0,
+        "a NULL-owned token is not visible to a regular user"
+    );
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
     assert_eq!(body["total"], 1);
@@ -284,7 +316,8 @@ async fn the_log_list_window_excludes_rows_older_than_the_range() {
     assert_eq!(body["total"], 1);
 
     // range=0 means "no time filter".
-    let (_, body) = support::call_json(&h.router, "GET", "/api/logs?range=0", None, Some(&admin)).await;
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/api/logs?range=0", None, Some(&admin)).await;
     assert_eq!(body["total"], 2);
 }
 
@@ -300,8 +333,18 @@ async fn the_pager_total_matches_the_rows_in_the_selected_window() {
     }
     insert_log(h.pool(), "bob-token", now - 30 * 86400, 1).await;
 
-    let (_, body) = support::call_json(&h.router, "GET", "/api/logs?page=1&size=2", None, Some(&admin)).await;
-    assert_eq!(body["total"], 3, "total is the count in-window, not in-table");
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/logs?page=1&size=2",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(
+        body["total"], 3,
+        "total is the count in-window, not in-table"
+    );
     assert_eq!(body["logs"].as_array().unwrap().len(), 2);
 }
 
@@ -311,7 +354,9 @@ async fn the_log_list_falls_back_to_model_when_upstream_model_is_empty() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
     sqlx::query("UPDATE logs SET upstream_model=''")
-        .execute(h.pool()).await.unwrap();
+        .execute(h.pool())
+        .await
+        .unwrap();
     insert_log(h.pool(), "bob-token", literouter::db::now(), 1).await;
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
@@ -334,13 +379,22 @@ async fn failed_attempts_are_joined_in_without_inflating_the_total() {
         .bind(format!("ch{seq}"))
         .bind(if ok == 1 { 200 } else { 500 })
         .bind(ok)
-        .execute(h.pool()).await.unwrap();
+        .execute(h.pool())
+        .await
+        .unwrap();
     }
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
-    assert_eq!(body["total"], 1, "three attempts is still one client request");
+    assert_eq!(
+        body["total"], 1,
+        "three attempts is still one client request"
+    );
     let row = &body["logs"][0];
-    assert_eq!(row["failed_attempts"].as_array().unwrap().len(), 2, "only ok=0 hops are listed");
+    assert_eq!(
+        row["failed_attempts"].as_array().unwrap().len(),
+        2,
+        "only ok=0 hops are listed"
+    );
 }
 
 #[tokio::test]
@@ -355,7 +409,9 @@ async fn breaker_skipped_hops_are_not_counted_as_failures() {
          VALUES (?,0,'ch',0,'circuit breaker open',0,1)",
     )
     .bind(log_id)
-    .execute(h.pool()).await.unwrap();
+    .execute(h.pool())
+    .await
+    .unwrap();
 
     let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
     assert_eq!(body["logs"][0]["failed_attempts"], json!([]));
@@ -370,14 +426,35 @@ async fn log_detail_is_scoped_the_same_way_as_the_list() {
     let own = insert_log(h.pool(), "bob-token", literouter::db::now(), 1).await;
     let other = insert_log(h.pool(), "carol-token", literouter::db::now(), 1).await;
 
-    let (status, _) = support::call_json(&h.router, "GET", &format!("/api/logs/{own}"), None, Some(&bob)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{own}"),
+        None,
+        Some(&bob),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // 404, not 403 — a 403 would confirm the row exists.
-    let (status, _) = support::call_json(&h.router, "GET", &format!("/api/logs/{other}"), None, Some(&bob)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{other}"),
+        None,
+        Some(&bob),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (status, _) = support::call_json(&h.router, "GET", &format!("/api/logs/{other}"), None, Some(&admin)).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{other}"),
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -387,7 +464,14 @@ async fn log_detail_omits_prompt_and_response_bodies() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
     let log_id = insert_log(h.pool(), "bob-token", literouter::db::now(), 1).await;
-    let (_, body) = support::call_json(&h.router, "GET", &format!("/api/logs/{log_id}"), None, Some(&admin)).await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{log_id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
     let rendered = body.to_string();
     assert!(!rendered.contains("\"prompt_body\""), "{rendered}");
     assert!(!rendered.contains("messages"), "{rendered}");
@@ -443,7 +527,14 @@ async fn the_usage_range_is_clamped_to_a_sane_window() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
     for q in ["range=0", "range=-5", "range=100000"] {
-        let (_, body) = support::call_json(&h.router, "GET", &format!("/api/usage?{q}"), None, Some(&admin)).await;
+        let (_, body) = support::call_json(
+            &h.router,
+            "GET",
+            &format!("/api/usage?{q}"),
+            None,
+            Some(&admin),
+        )
+        .await;
         let days = body["range_days"].as_i64().unwrap();
         assert!((1..=90).contains(&days), "{q} -> {days}");
     }
@@ -461,12 +552,12 @@ async fn log_retention_deletes_attempts_before_their_parent_rows() {
     let stale = insert_log(h.pool(), "bob-token", old, 1).await;
     let fresh = insert_log(h.pool(), "bob-token", literouter::db::now(), 1).await;
     for (log_id, seq) in [(stale, 0), (stale, 1), (fresh, 0)] {
-        sqlx::query(
-            "INSERT INTO log_attempts (log_id, seq, channel_name, ok) VALUES (?,?,'ch',0)",
-        )
-        .bind(log_id)
-        .bind(seq)
-        .execute(h.pool()).await.unwrap();
+        sqlx::query("INSERT INTO log_attempts (log_id, seq, channel_name, ok) VALUES (?,?,'ch',0)")
+            .bind(log_id)
+            .bind(seq)
+            .execute(h.pool())
+            .await
+            .unwrap();
     }
 
     let removed = literouter::db::cleanup_old_logs(h.pool(), 7).await.unwrap();
@@ -475,11 +566,16 @@ async fn log_retention_deletes_attempts_before_their_parent_rows() {
     let orphans: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM log_attempts WHERE log_id NOT IN (SELECT id FROM logs)",
     )
-    .fetch_one(h.pool()).await.unwrap();
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
     assert_eq!(orphans, 0, "stale attempt rows must not be orphaned");
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM log_attempts WHERE log_id=?")
-            .bind(fresh).fetch_one(h.pool()).await.unwrap(),
+            .bind(fresh)
+            .fetch_one(h.pool())
+            .await
+            .unwrap(),
         1,
         "recent rows are untouched",
     );
@@ -488,7 +584,10 @@ async fn log_retention_deletes_attempts_before_their_parent_rows() {
 #[tokio::test]
 async fn log_retention_with_nothing_to_remove_is_a_no_op() {
     let h = Harness::with_admin().await;
-    assert_eq!(literouter::db::cleanup_old_logs(h.pool(), 7).await.unwrap(), 0);
+    assert_eq!(
+        literouter::db::cleanup_old_logs(h.pool(), 7).await.unwrap(),
+        0
+    );
 }
 
 // ===================== settings =====================
@@ -508,7 +607,8 @@ async fn the_ui_language_persists_and_is_readable() {
     assert_eq!(status, StatusCode::OK);
 
     // Readable without a session, because the router needs it before login.
-    let (status, body) = support::call_json(&h.router, "GET", "/api/settings/language", None, None).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/api/settings/language", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["language"], "en-US");
 
@@ -529,7 +629,8 @@ async fn an_unsupported_language_falls_back_to_chinese() {
             Some(&admin),
         )
         .await;
-        let (_, body) = support::call_json(&h.router, "GET", "/api/settings/language", None, None).await;
+        let (_, body) =
+            support::call_json(&h.router, "GET", "/api/settings/language", None, None).await;
         assert_eq!(body["language"], "zh-CN", "input {bad:?}");
     }
 }
@@ -537,7 +638,12 @@ async fn an_unsupported_language_falls_back_to_chinese() {
 #[tokio::test]
 async fn a_missing_setting_reads_as_none() {
     let h = Harness::new().await;
-    assert_eq!(literouter::db::get_setting(h.pool(), "no_such_key").await.unwrap(), None);
+    assert_eq!(
+        literouter::db::get_setting(h.pool(), "no_such_key")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -554,7 +660,14 @@ async fn the_breaker_config_round_trips_through_the_settings_table() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (_, body) = support::call_json(&h.router, "GET", "/api/settings/breaker", None, Some(&admin)).await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/settings/breaker",
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(body["enabled"], false);
     assert_eq!(body["base_delay_secs"], 45);
 
@@ -572,9 +685,11 @@ async fn the_breaker_snapshot_endpoint_is_admin_only() {
     // here so a future change to 403 is a deliberate, visible one.
     let h = Harness::with_admin().await;
     let (_, bob) = two_users(&h).await;
-    let (status, _) = support::call_json(&h.router, "GET", "/api/breaker/snapshot", None, Some(&bob)).await;
+    let (status, _) =
+        support::call_json(&h.router, "GET", "/api/breaker/snapshot", None, Some(&bob)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = support::call_json(&h.router, "POST", "/api/breaker/reset", None, Some(&bob)).await;
+    let (status, _) =
+        support::call_json(&h.router, "POST", "/api/breaker/reset", None, Some(&bob)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -585,16 +700,33 @@ async fn a_breaker_reset_clears_every_recorded_key() {
     // Only *open* keys appear in the snapshot; a Success clears the entry
     // outright, so a key has to be tripped to be visible.
     h.breaker
-        .record(&literouter::breaker::breaker_key("ch", "gpt-4o"), literouter::breaker::Outcome::Failure)
+        .record(
+            &literouter::breaker::breaker_key("ch", "gpt-4o"),
+            literouter::breaker::Outcome::Failure,
+        )
         .await;
-    let (_, body) = support::call_json(&h.router, "GET", "/api/breaker/snapshot", None, Some(&admin)).await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/breaker/snapshot",
+        None,
+        Some(&admin),
+    )
+    .await;
     let snap = body["snapshot"].as_array().unwrap();
     assert_eq!(snap.len(), 1);
     assert_eq!(snap[0]["channel"], "ch");
     assert_eq!(snap[0]["target_model"], "gpt-4o");
 
     support::call_json(&h.router, "POST", "/api/breaker/reset", None, Some(&admin)).await;
-    let (_, body) = support::call_json(&h.router, "GET", "/api/breaker/snapshot", None, Some(&admin)).await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/breaker/snapshot",
+        None,
+        Some(&admin),
+    )
+    .await;
     assert_eq!(body["snapshot"], json!([]));
 }
 
@@ -615,12 +747,14 @@ async fn the_channel_list_is_admin_only_because_it_carries_the_upstream_key() {
 
     let (status, _) = support::call_json(&h.router, "GET", "/api/channels", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, body) = support::call_json(&h.router, "GET", "/api/channels", None, Some(&bob)).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/api/channels", None, Some(&bob)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(!body.to_string().contains("sk-upstream-secret"));
 
     // The admin path does return the key, which is what the edit form binds to.
-    let (status, body) = support::call_json(&h.router, "GET", "/api/channels", None, Some(&admin)).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/api/channels", None, Some(&admin)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["channels"][0]["api_key"], "sk-upstream-secret");
 }

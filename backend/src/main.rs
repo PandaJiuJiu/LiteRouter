@@ -2,8 +2,7 @@ use literouter::{breaker_probe, build_router, build_state, db};
 
 #[tokio::main]
 async fn main() {
-    let db_path =
-        std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
+    let db_path = std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
     let pool = db::init_pool(&db_path).await;
     let state = build_state(pool).await;
 
@@ -54,7 +53,9 @@ async fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
     println!("literouter listening on http://{}", addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind failed");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("bind failed");
     // `into_make_service_with_connect_info` is what puts the peer address in
     // scope for handlers that take `ConnectInfo<SocketAddr>` — without it
     // axum rejects the extractor and the relay can't record a client IP when

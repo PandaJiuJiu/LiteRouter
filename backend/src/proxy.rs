@@ -23,8 +23,8 @@ use crate::db::now;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
-use axum::http::{HeaderMap, StatusCode};
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -51,10 +51,7 @@ where
     S: Send + Sync,
 {
     type Rejection = std::convert::Infallible;
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(OptionalConnectInfo(
             parts
                 .extensions
@@ -85,12 +82,13 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
 ///   (UNAUTHORIZED, "invalid or disabled token") — bad/disabled key
 ///   (TOO_MANY_REQUESTS, msg) — rpm or daily-token limit exceeded
 async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, &'static str)> {
-    let row = sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit FROM tokens WHERE key=?")
-        .bind(key)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid or disabled token"))?;
+    let row =
+        sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit FROM tokens WHERE key=?")
+            .bind(key)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
+            .ok_or((StatusCode::UNAUTHORIZED, "invalid or disabled token"))?;
     if row.get::<i64, _>("enabled") != 1 {
         return Err((StatusCode::UNAUTHORIZED, "invalid or disabled token"));
     }
@@ -101,19 +99,15 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
     // rpm check: count requests in last 60s
     if rpm_limit > 0 {
         let since = now() - 60;
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM logs WHERE token_name=? AND created_at >= ?",
-        )
-        .bind(&name)
-        .bind(since)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE token_name=? AND created_at >= ?")
+                .bind(&name)
+                .bind(since)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
         if count >= rpm_limit {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded (rpm)",
-            ));
+            return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded (rpm)"));
         }
     }
 
@@ -129,10 +123,7 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
         if used >= daily_limit {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "daily token quota exceeded",
-            ));
+            return Err((StatusCode::TOO_MANY_REQUESTS, "daily token quota exceeded"));
         }
     }
 
@@ -218,13 +209,12 @@ async fn candidate_channels(
 /// level rewrite — `a → b → c` is treated as `a → b`. A `model == "*"` entry
 /// pinned to a channel expands to every model that channel advertises.
 async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT targets, target_model FROM model_mappings WHERE alias=?",
-    )
-    .bind(alias)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT targets, target_model FROM model_mappings WHERE alias=?")
+            .bind(alias)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
     let base = match row {
         Some((targets, fallback)) => admin::parse_targets(&targets, &fallback),
         None => Vec::new(),
@@ -233,12 +223,10 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
     for (channel, model) in base {
         if model == "*" && !channel.is_empty() {
             // wildcard: every model on the pinned channel, in its list order
-            if let Ok(rows) = sqlx::query(
-                "SELECT models FROM channels WHERE name=? AND enabled=1",
-            )
-            .bind(&channel)
-            .fetch_all(&state.pool)
-            .await
+            if let Ok(rows) = sqlx::query("SELECT models FROM channels WHERE name=? AND enabled=1")
+                .bind(&channel)
+                .fetch_all(&state.pool)
+                .await
             {
                 let models: Vec<String> = rows
                     .iter()
@@ -269,11 +257,7 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
 /// A target pinned to a named channel: the URL/key/conversion to reach it on
 /// `protocol`, or None when the channel doesn't exist / is disabled / serves
 /// neither protocol.
-async fn pinned_channel(
-    state: &AppState,
-    name: &str,
-    protocol: &str,
-) -> Option<Candidate> {
+async fn pinned_channel(state: &AppState, name: &str, protocol: &str) -> Option<Candidate> {
     let row = sqlx::query(
         "SELECT name, base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1",
     )
@@ -481,9 +465,7 @@ struct LogEntry {
 /// Returns the `logs.id` on success so the caller can name debug files.
 /// A no-op when there is no winner AND no attempts (nothing was tried).
 async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
-    let Some(winner) = e.winner.as_ref().or_else(|| e.attempts.last()) else {
-        return None;
-    };
+    let winner = e.winner.as_ref().or_else(|| e.attempts.last())?;
     let u = winner.usage_or_zero();
     // Skipped hops are breaker decisions, not upstream failures — don't pollute
     // the visible failure count with "we deliberately didn't try this".
@@ -725,19 +707,17 @@ impl StreamLog {
     /// Finalize the log row and (if `state.debug_logging`) write the request
     /// and response bodies to disk. Usage and the accumulated response bytes are
     /// supplied by the caller (Drop impl of LogOnEnd).
-    async fn spawn_inline(
-        mut self,
-        usage: Option<convert::Usage>,
-        resp_buf: Arc<Mutex<Vec<u8>>>,
-    ) {
+    async fn spawn_inline(mut self, usage: Option<convert::Usage>, resp_buf: Arc<Mutex<Vec<u8>>>) {
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
         }
         let log_id = log_request(&self.pool, &self.entry).await;
-        if state_debug_logging() && log_id.is_some() {
-            let req = self.req_body.to_vec();
-            let resp = resp_buf.lock().unwrap().clone();
-            write_debug_log(log_id.unwrap(), &req, &resp).await;
+        if state_debug_logging() {
+            if let Some(id) = log_id {
+                let req = self.req_body.to_vec();
+                let resp = resp_buf.lock().unwrap().clone();
+                write_debug_log(id, &req, &resp).await;
+            }
         }
     }
 }
@@ -762,6 +742,7 @@ fn state_debug_logging() -> bool {
 ///   2. axum's response body finished streaming to the client (success)
 ///   3. the client disconnected mid-stream → upstream gets cancelled, the
 ///      body_stream future is dropped
+///
 /// All three are when we want to record the row, so Drop is the right hook.
 ///
 /// Usage source at Drop time depends on which constructor was used:
@@ -788,7 +769,13 @@ impl<S> LogOnEnd<S> {
         usage: Arc<Mutex<Option<convert::Usage>>>,
         resp_buf: Arc<Mutex<Vec<u8>>>,
     ) -> Self {
-        Self { inner, log: Some(log), usage, converter_usage: None, resp_buf }
+        Self {
+            inner,
+            log: Some(log),
+            usage,
+            converter_usage: None,
+            resp_buf,
+        }
     }
     fn wrap_with_converter(
         inner: S,
@@ -833,7 +820,7 @@ impl<S> Drop for LogOnEnd<S> {
             let usage = if let Some(conv) = self.converter_usage.as_ref() {
                 conv.lock().unwrap().usage()
             } else {
-                self.usage.lock().unwrap().clone()
+                *self.usage.lock().unwrap()
             };
             let resp_buf = self.resp_buf.clone();
             tokio::spawn(async move {
@@ -921,12 +908,14 @@ fn converted_stream(
     let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
     let mut response = Response::builder().status(StatusCode::OK);
     if let Some(h) = response.headers_mut() {
-        h.insert(axum::http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
     }
     let state = (resp, String::new(), Arc::clone(&conv), false);
     let body_stream = stream::unfold(state, |mut st| async move {
-        let (resp, buf, conv_ref, done) =
-            (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
+        let (resp, buf, conv_ref, done) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
         loop {
             if *done {
                 return None;
@@ -943,7 +932,10 @@ fn converted_stream(
                         conv_ref.lock().unwrap().on_data(payload)
                     };
                     if !events.is_empty() {
-                        return Some((Ok::<Bytes, reqwest::Error>(Bytes::from(events.concat())), st));
+                        return Some((
+                            Ok::<Bytes, reqwest::Error>(Bytes::from(events.concat())),
+                            st,
+                        ));
                     }
                     if *done {
                         return None; // finish() produced nothing
@@ -1013,8 +1005,7 @@ async fn respond_from_upstream(
     req_body: Bytes,
     client_info: ClientInfo,
 ) -> (Response, Attempt) {
-    let status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Latency up to "we got the upstream's response headers". For streams
     // this is the TTFB, which is what people usually want; for buffered
     // responses this is the whole round-trip.
@@ -1057,9 +1048,7 @@ async fn respond_from_upstream(
                 Ok(v) => {
                     let converted = if status.is_success() {
                         match cand.convert {
-                            ConvertMode::ToOpenAI => {
-                                convert::openai_resp_to_anthropic(&v, model)
-                            }
+                            ConvertMode::ToOpenAI => convert::openai_resp_to_anthropic(&v, model),
                             ConvertMode::ToAnthropic => {
                                 convert::anthropic_resp_to_openai(&v, model)
                             }
@@ -1224,7 +1213,10 @@ async fn relay(
             }
         };
         if candidates.is_empty() {
-            all_errors.push(format!("no enabled channel provides model `{}`", target_model));
+            all_errors.push(format!(
+                "no enabled channel provides model `{}`",
+                target_model
+            ));
             continue;
         }
         for cand in &candidates {
@@ -1241,9 +1233,7 @@ async fn relay(
                     b["model"] = json!(target_model);
                     b
                 }
-                ConvertMode::ToOpenAI => {
-                    convert::anthropic_req_to_openai(&req_json, target_model)
-                }
+                ConvertMode::ToOpenAI => convert::anthropic_req_to_openai(&req_json, target_model),
                 ConvertMode::ToAnthropic => {
                     convert::openai_req_to_anthropic(&req_json, target_model)
                 }
@@ -1275,8 +1265,7 @@ async fn relay(
             // `target_body` is consumed by `try_upstream`; keep a `Bytes`
             // copy for the debug-log write that happens on the 2xx winner.
             let req_body = Bytes::from(target_body.clone());
-            let outcome =
-                try_upstream(state, cand, upstream_protocol, target_body, headers).await;
+            let outcome = try_upstream(state, cand, upstream_protocol, target_body, headers).await;
             match outcome {
                 UpstreamOutcome::Ok(resp) => {
                     state.breaker.record(&breaker_key, Outcome::Success).await;
@@ -1312,13 +1301,11 @@ async fn relay(
                         elapsed,
                         false,
                     ));
-                    all_errors
-                        .push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
+                    all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
                     // First non-empty Retry-After wins for the client
                     // pass-through on the eventual 429 response.
                     if relay_retry_after.is_none() {
-                        relay_retry_after =
-                            retry_after_secs.map(|s| s.to_string());
+                        relay_retry_after = retry_after_secs.map(|s| s.to_string());
                     }
                     record_outcome_in_breaker(
                         state,
@@ -1340,13 +1327,9 @@ async fn relay(
                         elapsed,
                         false,
                     ));
-                    all_errors
-                        .push(format!("{} ({}): {}", cand.name, target_model, err_msg));
+                    all_errors.push(format!("{} ({}): {}", cand.name, target_model, err_msg));
                     transport_err_count += 1;
-                    state
-                        .breaker
-                        .record(&breaker_key, Outcome::Failure)
-                        .await;
+                    state.breaker.record(&breaker_key, Outcome::Failure).await;
                     // Fall through to the next candidate / next target.
                 }
             }
@@ -1382,10 +1365,7 @@ async fn relay(
             protocol: protocol.to_string(),
             streaming: is_streaming,
             winner: Some(Attempt {
-                upstream_model: targets
-                    .first()
-                    .map(|(_, m)| m.clone())
-                    .unwrap_or_default(),
+                upstream_model: targets.first().map(|(_, m)| m.clone()).unwrap_or_default(),
                 channel_name: String::new(),
                 status: StatusCode::NOT_FOUND.as_u16() as i64,
                 error: err.clone(),
@@ -1450,11 +1430,7 @@ async fn relay(
         user_agent: client_info.user_agent.clone(),
     };
     log_request(&state.pool, &entry).await;
-    error_response(
-        final_status,
-        &err,
-        relay_retry_after.as_deref(),
-    )
+    error_response(final_status, &err, relay_retry_after.as_deref())
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible relay.
@@ -1478,10 +1454,7 @@ pub async fn anthropic_messages(
 }
 
 /// GET /v1/models — list union of all enabled channel models.
-pub async fn list_models(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let key = match extract_token(&headers) {
         Some(k) => k,
         None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", None),
@@ -1490,9 +1463,7 @@ pub async fn list_models(
         return error_response(s, msg, None);
     }
     // only external channels serve relay traffic (see candidate_channels)
-    let rows = match sqlx::query(
-        "SELECT models FROM channels WHERE enabled=1",
-    )
+    let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
         .fetch_all(&state.pool)
         .await
     {
@@ -1622,10 +1593,7 @@ mod tests {
 
     #[test]
     fn the_direct_peer_is_used_when_there_is_no_proxy_header() {
-        let info = extract_client_info(
-            &headers(&[]),
-            Some("192.0.2.5:1234".parse().unwrap()),
-        );
+        let info = extract_client_info(&headers(&[]), Some("192.0.2.5:1234".parse().unwrap()));
         assert_eq!(info.ip, "192.0.2.5");
     }
 
@@ -1657,10 +1625,7 @@ mod tests {
 
     #[test]
     fn the_user_agent_is_captured_verbatim() {
-        let info = extract_client_info(
-            &headers(&[("user-agent", "claude-cli/1.2.3")]),
-            None,
-        );
+        let info = extract_client_info(&headers(&[("user-agent", "claude-cli/1.2.3")]), None);
         assert_eq!(info.user_agent, "claude-cli/1.2.3");
     }
 

@@ -87,7 +87,13 @@ pub async fn store_language(pool: &sqlx::SqlitePool, lang: &str) {
 /// Read the configured UI language. Defaults to Chinese if the row is missing
 /// or unreadable — never fail a request over a cosmetic setting.
 pub async fn current_language(pool: &sqlx::SqlitePool) -> String {
-    normalize_language(db::get_setting(pool, "ui_language").await.ok().flatten().as_deref())
+    normalize_language(
+        db::get_setting(pool, "ui_language")
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
 }
 
 /// GET /api/settings/language — public. The login and setup pages need to
@@ -108,12 +114,8 @@ pub async fn set_language(
     headers: HeaderMap,
     Json(req): Json<SetLanguageReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let _user = auth::check_auth(&state, &headers).map_err(|_| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "未登录" })),
-        )
-    })?;
+    let _user = auth::check_auth(&state, &headers)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, Json(json!({ "error": "未登录" }))))?;
 
     if !LANGUAGES.contains(&req.language.as_str()) {
         return Err((

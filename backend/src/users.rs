@@ -134,18 +134,14 @@ pub async fn update_user(
     if let Some(flag) = req.is_admin {
         // Demoting an admin: make sure at least one admin stays.
         if target_is_admin != 0 && !flag {
-            let remaining: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?",
-            )
-            .bind(id)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or(0);
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?")
+                    .bind(id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap_or(0);
             if remaining == 0 {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    json_err("至少保留一个管理员"),
-                ));
+                return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
             }
         }
         is_admin = flag as i64;
@@ -215,18 +211,14 @@ pub async fn delete_user(
     let target_is_admin: i64 = target.get("is_admin");
 
     if target_is_admin != 0 {
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?",
-        )
-        .bind(id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap_or(0);
         if remaining == 0 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                json_err("至少保留一个管理员"),
-            ));
+            return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
         }
     }
 

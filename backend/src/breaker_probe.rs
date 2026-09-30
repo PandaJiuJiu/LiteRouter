@@ -126,7 +126,11 @@ async fn sweep_once(
                 .breaker
                 .record(
                     &breaker::breaker_key(&channel_name, m),
-                    if success { Outcome::Success } else { Outcome::Failure },
+                    if success {
+                        Outcome::Success
+                    } else {
+                        Outcome::Failure
+                    },
                 )
                 .await;
             log_probe(&channel_name, m, &result);
@@ -143,10 +147,7 @@ async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeRes
         // Two-protocol channel: prefer OpenAI for probing (cheaper for most
         // providers) but fall back to Anthropic if OpenAI URL is missing.
         if !ch.base_url.is_empty() {
-            let url = format!(
-                "{}/chat/completions",
-                ch.base_url.trim_end_matches('/')
-            );
+            let url = format!("{}/chat/completions", ch.base_url.trim_end_matches('/'));
             let h = vec![(
                 "Authorization".to_string(),
                 format!("Bearer {}", ch.api_key),
@@ -164,10 +165,7 @@ async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeRes
             (url, h)
         }
     } else if !ch.base_url.is_empty() {
-        let url = format!(
-            "{}/chat/completions",
-            ch.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", ch.base_url.trim_end_matches('/'));
         let h = vec![(
             "Authorization".to_string(),
             format!("Bearer {}", ch.api_key),
@@ -211,18 +209,18 @@ fn log_probe(channel: &str, model: &str, result: &ProbeResult) {
     // One info line per probe. Sample:
     //   breaker probe channel=openrouter model=gpt-4 result=success latency=...ms
     match result {
-        ProbeResult::Success => println!(
-            "breaker probe channel={channel} model={model} result=success"
-        ),
-        ProbeResult::Http { status } => println!(
-            "breaker probe channel={channel} model={model} result=failure status={status}"
-        ),
+        ProbeResult::Success => {
+            println!("breaker probe channel={channel} model={model} result=success")
+        }
+        ProbeResult::Http { status } => {
+            println!("breaker probe channel={channel} model={model} result=failure status={status}")
+        }
         ProbeResult::Transport(e) => println!(
             "breaker probe channel={channel} model={model} result=failure error=transport:{e}"
         ),
-        ProbeResult::Error(e) => println!(
-            "breaker probe channel={channel} model={model} result=failure error={e}"
-        ),
+        ProbeResult::Error(e) => {
+            println!("breaker probe channel={channel} model={model} result=failure error={e}")
+        }
     }
 }
 
@@ -293,10 +291,7 @@ async fn resolve_models(
 /// Fetch the live model list from the channel via `GET /v1/models`. Returns
 /// an empty Vec on any failure — the probe task prefers "skip" over
 /// "abort" so a flaky `/models` endpoint doesn't break recovery.
-async fn fetch_models_from_upstream(
-    state: &AppState,
-    ch: &ProbeChannel,
-) -> Option<Vec<String>> {
+async fn fetch_models_from_upstream(state: &AppState, ch: &ProbeChannel) -> Option<Vec<String>> {
     let url = if !ch.base_url.is_empty() {
         format!("{}/models", ch.base_url.trim_end_matches('/'))
     } else if !ch.base_url_anthropic.is_empty() {

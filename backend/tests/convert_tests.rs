@@ -21,7 +21,10 @@ fn system_string_becomes_a_system_message() {
         &v(r#"{"system":"be brief","messages":[{"role":"user","content":"hi"}]}"#),
         "gpt-4o",
     );
-    assert_eq!(out["messages"][0], json!({"role":"system","content":"be brief"}));
+    assert_eq!(
+        out["messages"][0],
+        json!({"role":"system","content":"be brief"})
+    );
     assert_eq!(out["messages"][1]["role"], "user");
     assert_eq!(out["model"], "gpt-4o");
 }
@@ -29,8 +32,10 @@ fn system_string_becomes_a_system_message() {
 #[test]
 fn system_block_array_is_joined_with_newlines() {
     let out = anthropic_req_to_openai(
-        &v(r#"{"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],
-             "messages":[]}"#),
+        &v(
+            r#"{"system":[{"type":"text","text":"a"},{"type":"text","text":"b"}],
+             "messages":[]}"#,
+        ),
         "m",
     );
     assert_eq!(out["messages"][0]["content"], "a\nb");
@@ -54,10 +59,7 @@ fn max_tokens_defaults_to_4096_when_absent() {
 
 #[test]
 fn stop_sequences_becomes_stop() {
-    let out = anthropic_req_to_openai(
-        &v(r#"{"stop_sequences":["X","Y"],"messages":[]}"#),
-        "m",
-    );
+    let out = anthropic_req_to_openai(&v(r#"{"stop_sequences":["X","Y"],"messages":[]}"#), "m");
     assert_eq!(out["stop"], json!(["X", "Y"]));
     let out = anthropic_req_to_openai(&v(r#"{"messages":[]}"#), "m");
     assert!(out.get("stop").is_none());
@@ -133,7 +135,10 @@ fn tool_use_becomes_assistant_tool_calls() {
     assert_eq!(msg["tool_calls"][0]["type"], "function");
     assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_weather");
     // Anthropic's `input` is an object; OpenAI's `arguments` is a JSON *string*.
-    assert_eq!(msg["tool_calls"][0]["function"]["arguments"], r#"{"city":"Paris"}"#);
+    assert_eq!(
+        msg["tool_calls"][0]["function"]["arguments"],
+        r#"{"city":"Paris"}"#
+    );
 }
 
 #[test]
@@ -182,7 +187,9 @@ fn missing_tool_use_id_becomes_null_not_a_missing_key() {
 #[test]
 fn tools_are_wrapped_as_openai_functions() {
     let out = anthropic_req_to_openai(
-        &v(r#"{"messages":[],"tools":[{"name":"f","description":"d","input_schema":{"type":"object"}}]}"#),
+        &v(
+            r#"{"messages":[],"tools":[{"name":"f","description":"d","input_schema":{"type":"object"}}]}"#,
+        ),
         "m",
     );
     assert_eq!(out["tools"][0]["type"], "function");
@@ -193,7 +200,10 @@ fn tools_are_wrapped_as_openai_functions() {
 #[test]
 fn tool_without_input_schema_gets_an_object_schema() {
     let out = anthropic_req_to_openai(&v(r#"{"messages":[],"tools":[{"name":"f"}]}"#), "m");
-    assert_eq!(out["tools"][0]["function"]["parameters"], json!({"type":"object"}));
+    assert_eq!(
+        out["tools"][0]["function"]["parameters"],
+        json!({"type":"object"})
+    );
 }
 
 #[test]
@@ -218,7 +228,10 @@ fn anthropic_tool_choice_named_tool_maps_to_openai_named_function() {
         &v(r#"{"messages":[],"tools":[{"name":"f"}],"tool_choice":{"type":"tool","name":"f"}}"#),
         "m",
     );
-    assert_eq!(out["tool_choice"], json!({"type":"function","function":{"name":"f"}}));
+    assert_eq!(
+        out["tool_choice"],
+        json!({"type":"function","function":{"name":"f"}})
+    );
 }
 
 #[test]
@@ -238,7 +251,9 @@ fn missing_messages_field_keeps_the_system_message_only() {
 #[test]
 fn system_message_is_lifted_out_of_the_message_list() {
     let out = openai_req_to_anthropic(
-        &v(r#"{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#),
+        &v(
+            r#"{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#,
+        ),
         "claude",
     );
     assert_eq!(out["system"], "be brief");
@@ -261,9 +276,11 @@ fn first_system_message_wins_and_later_ones_are_dropped() {
 #[test]
 fn assistant_tool_calls_become_tool_use_blocks() {
     let out = openai_req_to_anthropic(
-        &v(r#"{"messages":[{"role":"assistant","content":null,"tool_calls":[
+        &v(
+            r#"{"messages":[{"role":"assistant","content":null,"tool_calls":[
              {"id":"call_1","type":"function",
-              "function":{"name":"f","arguments":"{\"a\":1}"}}]}]}"#),
+              "function":{"name":"f","arguments":"{\"a\":1}"}}]}]}"#,
+        ),
         "claude",
     );
     let block = &out["messages"][0]["content"][0];
@@ -345,7 +362,9 @@ fn openai_function_tools_become_anthropic_tools() {
 #[test]
 fn tool_entries_without_a_function_key_are_filtered_out() {
     let out = openai_req_to_anthropic(
-        &v(r#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}},{"type":"other"}]}"#),
+        &v(
+            r#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}},{"type":"other"}]}"#,
+        ),
         "claude",
     );
     assert_eq!(out["tools"].as_array().unwrap().len(), 1);
@@ -466,8 +485,10 @@ fn anthropic_response_becomes_an_openai_completion() {
 #[test]
 fn anthropic_tool_use_becomes_openai_tool_calls() {
     let out = anthropic_resp_to_openai(
-        &v(r#"{"id":"msg_1","content":[{"type":"tool_use","id":"t1","name":"f","input":{"a":1}}],
-             "stop_reason":"tool_use"}"#),
+        &v(
+            r#"{"id":"msg_1","content":[{"type":"tool_use","id":"t1","name":"f","input":{"a":1}}],
+             "stop_reason":"tool_use"}"#,
+        ),
         "m",
     );
     let msg = &out["choices"][0]["message"];
@@ -480,8 +501,10 @@ fn anthropic_tool_use_becomes_openai_tool_calls() {
 #[test]
 fn a_tool_call_only_response_reports_null_content_not_empty_string() {
     let out = anthropic_resp_to_openai(
-        &v(r#"{"id":"msg_1","content":[{"type":"tool_use","id":"t","name":"f","input":{}}],
-             "stop_reason":"tool_use"}"#),
+        &v(
+            r#"{"id":"msg_1","content":[{"type":"tool_use","id":"t","name":"f","input":{}}],
+             "stop_reason":"tool_use"}"#,
+        ),
         "m",
     );
     assert_eq!(out["choices"][0]["message"]["content"], Value::Null);
@@ -498,7 +521,10 @@ fn anthropic_stop_reason_mapping_is_total() {
     ];
     for (anthropic, openai) in cases {
         let out = anthropic_resp_to_openai(&json!({"content": [], "stop_reason": anthropic}), "m");
-        assert_eq!(out["choices"][0]["finish_reason"], openai, "stop_reason {anthropic}");
+        assert_eq!(
+            out["choices"][0]["finish_reason"], openai,
+            "stop_reason {anthropic}"
+        );
     }
 }
 
@@ -514,7 +540,9 @@ fn anthropic_response_without_content_or_usage_does_not_panic() {
 
 #[test]
 fn openai_error_becomes_an_anthropic_error() {
-    let out = openai_err_to_anthropic(&v(r#"{"error":{"type":"invalid_request_error","message":"bad"}}"#));
+    let out = openai_err_to_anthropic(&v(
+        r#"{"error":{"type":"invalid_request_error","message":"bad"}}"#,
+    ));
     assert_eq!(out["type"], "error");
     assert_eq!(out["error"]["type"], "invalid_request_error");
     assert_eq!(out["error"]["message"], "bad");
@@ -522,7 +550,9 @@ fn openai_error_becomes_an_anthropic_error() {
 
 #[test]
 fn anthropic_error_becomes_an_openai_error_with_a_code() {
-    let out = anthropic_err_to_openai(&v(r#"{"error":{"type":"overloaded_error","message":"busy"}}"#));
+    let out = anthropic_err_to_openai(&v(
+        r#"{"error":{"type":"overloaded_error","message":"busy"}}"#,
+    ));
     assert_eq!(out["error"]["message"], "busy");
     assert_eq!(out["error"]["type"], "overloaded_error");
     // OpenAI SDKs read `code`, so it must mirror the type.
@@ -543,7 +573,8 @@ fn malformed_error_bodies_fall_back_to_defaults() {
 
 #[test]
 fn usage_parses_the_openai_spelling() {
-    let u = parse_usage_obj(&json!({"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}));
+    let u =
+        parse_usage_obj(&json!({"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}));
     assert_eq!((u.prompt, u.completion, u.total), (10, 4, 14));
 }
 
@@ -563,16 +594,15 @@ fn a_missing_total_is_recomputed_from_the_parts() {
 fn an_upstream_total_below_the_parts_is_never_trusted() {
     // A provider reporting total < prompt+completion would under-bill if taken
     // at face value, so the sum wins.
-    let u = parse_usage_obj(&json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 2}));
+    let u =
+        parse_usage_obj(&json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 2}));
     assert_eq!(u.total, 10);
 }
 
 #[test]
 fn reasoning_tokens_are_read_from_the_nested_details_object() {
-    let u = parse_usage_obj(
-        &json!({"prompt_tokens": 10, "completion_tokens": 8,
-                "completion_tokens_details": {"reasoning_tokens": 6}}),
-    );
+    let u = parse_usage_obj(&json!({"prompt_tokens": 10, "completion_tokens": 8,
+                "completion_tokens_details": {"reasoning_tokens": 6}}));
     assert_eq!(u.reasoning, 6);
     // reasoning is a subset of completion, not an addition to it.
     assert_eq!(u.completion, 8);
@@ -581,10 +611,8 @@ fn reasoning_tokens_are_read_from_the_nested_details_object() {
 
 #[test]
 fn anthropic_cache_counters_are_picked_up() {
-    let u = parse_usage_obj(
-        &json!({"input_tokens": 100, "output_tokens": 10,
-                "cache_read_input_tokens": 40, "cache_creation_input_tokens": 15}),
-    );
+    let u = parse_usage_obj(&json!({"input_tokens": 100, "output_tokens": 10,
+                "cache_read_input_tokens": 40, "cache_creation_input_tokens": 15}));
     assert_eq!(u.cache_read, 40);
     assert_eq!(u.cache_creation, 15);
 }
@@ -599,22 +627,26 @@ fn absent_usage_fields_read_zero_instead_of_panicking() {
 
 #[test]
 fn sse_usage_is_read_from_the_openai_shape() {
-    let u = usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
+    let u =
+        usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
     assert_eq!((u.prompt, u.completion), (5, 2));
 }
 
 #[test]
 fn sse_usage_is_read_from_message_start() {
     // Anthropic nests the input counts under `message.usage`.
-    let u = usage_from_sse_payload(r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#)
-        .unwrap();
+    let u = usage_from_sse_payload(
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+    )
+    .unwrap();
     assert_eq!(u.prompt, 9);
 }
 
 #[test]
 fn sse_usage_is_read_from_message_delta() {
     // ...and reports the final output count at the top level.
-    let u = usage_from_sse_payload(r#"{"type":"message_delta","usage":{"output_tokens":7}}"#).unwrap();
+    let u =
+        usage_from_sse_payload(r#"{"type":"message_delta","usage":{"output_tokens":7}}"#).unwrap();
     assert_eq!(u.completion, 7);
 }
 
@@ -628,5 +660,7 @@ fn sse_payload_without_usage_yields_none() {
 fn an_all_zero_usage_block_yields_none() {
     // Otherwise `usage()` would report Some(Usage::default()) and the log row
     // would claim a measured-but-zero spend.
-    assert!(usage_from_sse_payload(r#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none());
+    assert!(
+        usage_from_sse_payload(r#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none()
+    );
 }

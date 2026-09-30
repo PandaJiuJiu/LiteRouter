@@ -10,7 +10,11 @@ use literouter::settings::normalize_language;
 #[test]
 fn a_freshly_hashed_password_verifies() {
     let (hash, salt) = db::hash_password("correct horse battery staple");
-    assert!(db::verify_password("correct horse battery staple", &hash, &salt));
+    assert!(db::verify_password(
+        "correct horse battery staple",
+        &hash,
+        &salt
+    ));
 }
 
 #[test]

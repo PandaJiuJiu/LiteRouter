@@ -72,12 +72,10 @@ pub async fn list_channel_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     require_admin(&state, &headers)?;
-    let rows = sqlx::query(
-        "SELECT name, models FROM channels WHERE enabled=1 ORDER BY id ASC",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = sqlx::query("SELECT name, models FROM channels WHERE enabled=1 ORDER BY id ASC")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let channels: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -316,11 +314,7 @@ pub async fn fetch_models(
             } else {
                 format!("获取模型列表失败（{}）", last_err)
             };
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": msg })),
-            )
-                .into_response()
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": msg }))).into_response();
         }
     };
     let body: Value = match resp.json().await {
@@ -330,7 +324,7 @@ pub async fn fetch_models(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": "上游返回的不是有效 JSON" })),
             )
-            .into_response()
+                .into_response()
         }
     };
     let models: Vec<String> = body
@@ -372,7 +366,8 @@ pub async fn test_model(
     // OpenAI-compatible attempt
     if !openai_base.is_empty() {
         let url = format!("{}/chat/completions", openai_base);
-        let r = state.http
+        let r = state
+            .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", req.api_key))
             .json(&minimal_body);
@@ -391,7 +386,8 @@ pub async fn test_model(
     // Anthropic-compatible attempt
     if !anthropic_base.is_empty() {
         let url = format!("{}/v1/messages", anthropic_base);
-        let r = state.http
+        let r = state
+            .http
             .post(&url)
             .header("x-api-key", &req.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -464,7 +460,11 @@ pub struct TokenUpdateReq {
 
 /// Verify the caller is allowed to manage this token. Admins can manage any;
 /// regular users only their own.
-async fn authorize_token(state: &AppState, user: AuthUser, token_id: i64) -> Result<i64, StatusCode> {
+async fn authorize_token(
+    state: &AppState,
+    user: AuthUser,
+    token_id: i64,
+) -> Result<i64, StatusCode> {
     let owner: Option<i64> = sqlx::query_scalar("SELECT user_id FROM tokens WHERE id = ?")
         .bind(token_id)
         .fetch_optional(&state.pool)
@@ -549,7 +549,10 @@ pub async fn create_token(
     .fetch_one(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let owner = row.try_get::<Option<String>, _>("owner_name").ok().flatten();
+    let owner = row
+        .try_get::<Option<String>, _>("owner_name")
+        .ok()
+        .flatten();
     Ok(Json(row_token(&row, true, owner.as_deref())))
 }
 
@@ -561,16 +564,14 @@ pub async fn toggle_token(
 ) -> Result<Json<Value>, StatusCode> {
     let user = check_auth(&state, &headers)?;
     authorize_token(&state, user, id).await?;
-    sqlx::query(
-        "UPDATE tokens SET enabled=?, rpm_limit=?, daily_token_limit=? WHERE id=?",
-    )
-    .bind(req.enabled as i64)
-    .bind(req.rpm_limit.max(0))
-    .bind(req.daily_token_limit.max(0))
-    .bind(id)
-    .execute(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("UPDATE tokens SET enabled=?, rpm_limit=?, daily_token_limit=? WHERE id=?")
+        .bind(req.enabled as i64)
+        .bind(req.rpm_limit.max(0))
+        .bind(req.daily_token_limit.max(0))
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -617,7 +618,9 @@ pub enum TargetEntry {
 impl TargetEntry {
     fn normalize(entry: TargetEntry, out: &mut Vec<(String, String)>) {
         let (channel, model) = match entry {
-            TargetEntry::Obj { channel, model } => (channel.trim().to_string(), model.trim().to_string()),
+            TargetEntry::Obj { channel, model } => {
+                (channel.trim().to_string(), model.trim().to_string())
+            }
             TargetEntry::Str(s) => (String::new(), s.trim().to_string()),
         };
         // a wildcard needs a channel to expand against
@@ -634,8 +637,7 @@ impl TargetEntry {
 /// pairs; fall back to the legacy single `target_model` column when the row
 /// predates the migration. An empty channel means "any channel".
 pub fn parse_targets(targets: &str, fallback: &str) -> Vec<(String, String)> {
-    let entries: Vec<TargetEntry> =
-        serde_json::from_str(targets).unwrap_or_default();
+    let entries: Vec<TargetEntry> = serde_json::from_str(targets).unwrap_or_default();
     let mut out: Vec<(String, String)> = Vec::new();
     for e in entries {
         TargetEntry::normalize(e, &mut out);
@@ -734,15 +736,14 @@ pub async fn update_mapping(
     if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let res = sqlx::query(
-        "UPDATE model_mappings SET alias=?, target_model=?, targets=? WHERE id=?",
-    )
-    .bind(req.alias.trim())
-    .bind(targets[0].1.clone())
-    .bind(encode_targets(&targets))
-    .bind(id)
-    .execute(&state.pool)
-    .await;
+    let res =
+        sqlx::query("UPDATE model_mappings SET alias=?, target_model=?, targets=? WHERE id=?")
+            .bind(req.alias.trim())
+            .bind(targets[0].1.clone())
+            .bind(encode_targets(&targets))
+            .bind(id)
+            .execute(&state.pool)
+            .await;
     match res {
         Ok(_) => Ok(Json(json!({ "ok": true }))),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
@@ -818,8 +819,7 @@ pub async fn list_logs(
         if allowed.is_empty() {
             where_parts.push("1=0".to_string());
         } else {
-            let ph = std::iter::repeat("?")
-                .take(allowed.len())
+            let ph = std::iter::repeat_n("?", allowed.len())
                 .collect::<Vec<_>>()
                 .join(",");
             where_parts.push(format!("token_name IN ({ph})"));
@@ -877,7 +877,9 @@ pub async fn list_logs(
     let mut failed_by_log: std::collections::HashMap<i64, Vec<Value>> =
         std::collections::HashMap::new();
     if !ids.is_empty() {
-        let ph = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let ph = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT log_id, upstream_model, channel_name, status_code, error \
              FROM log_attempts WHERE ok=0 AND skipped=0 AND log_id IN ({ph}) ORDER BY seq ASC"
@@ -1043,7 +1045,7 @@ pub async fn usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let user = check_auth(&state, &headers)?;
-    let days = q.range.max(1).min(90);
+    let days = q.range.clamp(1, 90);
     let since = crate::db::now() - days * 86400;
     let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
 
@@ -1053,8 +1055,7 @@ pub async fn usage(
         if allowed.is_empty() {
             return " WHERE 1=0".to_string();
         }
-        let ph = std::iter::repeat("?")
-            .take(allowed.len())
+        let ph = std::iter::repeat_n("?", allowed.len())
             .collect::<Vec<_>>()
             .join(",");
         format!(" WHERE token_name IN ({})", ph)
@@ -1064,11 +1065,7 @@ pub async fn usage(
     } else {
         restrict_clause(&allowed)
     };
-    let user_binds = if user.is_admin {
-        Vec::new()
-    } else {
-        allowed
-    };
+    let user_binds = if user.is_admin { Vec::new() } else { allowed };
 
     // by_day (GROUP BY day bucket)
     //
@@ -1113,19 +1110,34 @@ pub async fn usage(
     };
     let sql = group_sql("token_name");
     let mut q = sqlx::query(&sql);
-    for n in &user_binds { q = q.bind(n); }
+    for n in &user_binds {
+        q = q.bind(n);
+    }
     q = q.bind(since);
-    let token_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token_rows = q
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let sql = group_sql("model");
     let mut q = sqlx::query(&sql);
-    for n in &user_binds { q = q.bind(n); }
+    for n in &user_binds {
+        q = q.bind(n);
+    }
     q = q.bind(since);
-    let model_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let model_rows = q
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let sql = group_sql("channel_name");
     let mut q = sqlx::query(&sql);
-    for n in &user_binds { q = q.bind(n); }
+    for n in &user_binds {
+        q = q.bind(n);
+    }
     q = q.bind(since);
-    let channel_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let channel_rows = q
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // totals
     let totals_sql = format!(

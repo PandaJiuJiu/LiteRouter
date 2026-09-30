@@ -176,14 +176,11 @@ impl Breaker {
             }
             Outcome::Failure => {
                 let backoff = match guard.entry(key.to_owned()) {
-                    Entry::Occupied(o) => o
-                        .get()
-                        .current_backoff
-                        .saturating_mul(2)
-                        .min(cfg.max_delay),
+                    Entry::Occupied(o) => {
+                        o.get().current_backoff.saturating_mul(2).min(cfg.max_delay)
+                    }
                     Entry::Vacant(v) => {
-                        let deadline =
-                            now.checked_add(cfg.base_delay).unwrap_or(now);
+                        let deadline = now.checked_add(cfg.base_delay).unwrap_or(now);
                         v.insert(BreakerState::open(cfg.base_delay, deadline));
                         cfg.base_delay
                     }
@@ -192,8 +189,7 @@ impl Breaker {
                 if backoff != entry.current_backoff {
                     entry.current_backoff = backoff;
                 }
-                entry.deadline =
-                    now.checked_add(entry.current_backoff).unwrap_or(now);
+                entry.deadline = now.checked_add(entry.current_backoff).unwrap_or(now);
             }
         }
     }
@@ -372,7 +368,13 @@ mod tests {
         let key = breaker_key("ch", "model");
 
         async fn backoff(b: &Breaker, key: &str) -> u64 {
-            b.inner.read().await.get(key).unwrap().current_backoff.as_secs()
+            b.inner
+                .read()
+                .await
+                .get(key)
+                .unwrap()
+                .current_backoff
+                .as_secs()
         }
 
         b.record(&key, Outcome::Failure).await;
@@ -499,7 +501,15 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..6 {
             b.record(&key, Outcome::Failure).await;
-            seen.push(b.inner.read().await.get(&key).unwrap().current_backoff.as_secs());
+            seen.push(
+                b.inner
+                    .read()
+                    .await
+                    .get(&key)
+                    .unwrap()
+                    .current_backoff
+                    .as_secs(),
+            );
         }
         assert_eq!(seen, vec![1, 2, 4, 5, 5, 5]);
     }
@@ -514,7 +524,10 @@ mod tests {
         let mut next = cfg();
         next.base_delay = Duration::from_secs(30);
         b.replace_config(next).await;
-        assert_eq!(b.config_snapshot().await.base_delay, Duration::from_secs(30));
+        assert_eq!(
+            b.config_snapshot().await.base_delay,
+            Duration::from_secs(30)
+        );
         // An already-open key keeps doubling from where its own ladder left
         // off — the new base applies to the *first* failure of a fresh entry,
         // not retroactively to a key that is already up the ladder.
@@ -544,7 +557,10 @@ mod tests {
         let mut next = cfg();
         next.enabled = false;
         b.replace_config(next).await;
-        assert!(b.allow(&key).await, "turning the breaker off must unblock traffic");
+        assert!(
+            b.allow(&key).await,
+            "turning the breaker off must unblock traffic"
+        );
     }
 
     #[tokio::test]
@@ -555,7 +571,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let mut due = b.expired_keys(Instant::now()).await;
         due.sort();
-        assert_eq!(due, vec![("ch1".into(), "m1".into()), ("ch2".into(), "m2".into())]);
+        assert_eq!(
+            due,
+            vec![("ch1".into(), "m1".into()), ("ch2".into(), "m2".into())]
+        );
     }
 
     #[tokio::test]
@@ -582,7 +601,10 @@ mod tests {
         let key = breaker_key("ch", "m");
         b.record(&key, Outcome::Failure).await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(!b.allow(&key).await, "cooldown alone must not restore traffic");
+        assert!(
+            !b.allow(&key).await,
+            "cooldown alone must not restore traffic"
+        );
         b.record(&key, Outcome::Success).await; // the probe
         assert!(b.allow(&key).await);
     }
@@ -599,9 +621,15 @@ mod tests {
         let first = b.snapshot().await[0].cooldown_remaining_secs;
         // Truncated to whole seconds, so a few microseconds of elapsed time
         // can already have knocked it down by one.
-        assert!((29..=30).contains(&first), "unexpected initial cooldown: {first}");
+        assert!(
+            (29..=30).contains(&first),
+            "unexpected initial cooldown: {first}"
+        );
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let second = b.snapshot().await[0].cooldown_remaining_secs;
-        assert!(second < first, "expected the countdown to advance: {first} -> {second}");
+        assert!(
+            second < first,
+            "expected the countdown to advance: {first} -> {second}"
+        );
     }
 }

@@ -66,28 +66,30 @@ fn anthropic_messages_to_openai(messages: &Value, out: &mut Vec<Value>) {
                         }
                         "image" => {
                             let source = b.get("source");
-                            let url = match source.and_then(|s| s.get("type")).and_then(|t| t.as_str())
-                            {
-                                Some("base64") => {
-                                    let media = source
-                                        .and_then(|s| s.get("media_type"))
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("image/png");
-                                    let data = source
-                                        .and_then(|s| s.get("data"))
-                                        .and_then(|d| d.as_str())
-                                        .unwrap_or("");
-                                    format!("data:{};base64,{}", media, data)
-                                }
-                                Some("url") => source
-                                    .and_then(|s| s.get("url"))
-                                    .and_then(|u| u.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                _ => continue,
-                            };
+                            let url =
+                                match source.and_then(|s| s.get("type")).and_then(|t| t.as_str()) {
+                                    Some("base64") => {
+                                        let media = source
+                                            .and_then(|s| s.get("media_type"))
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("image/png");
+                                        let data = source
+                                            .and_then(|s| s.get("data"))
+                                            .and_then(|d| d.as_str())
+                                            .unwrap_or("");
+                                        format!("data:{};base64,{}", media, data)
+                                    }
+                                    Some("url") => source
+                                        .and_then(|s| s.get("url"))
+                                        .and_then(|u| u.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    _ => continue,
+                                };
                             if !url.is_empty() {
-                                parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                                parts.push(
+                                    json!({ "type": "image_url", "image_url": { "url": url } }),
+                                );
                             }
                         }
                         "tool_use" => {
@@ -264,7 +266,9 @@ fn openai_messages_to_anthropic(messages: &Value, out: &mut Vec<Value>, system: 
                     *system = m
                         .get("content")
                         .map(|c| {
-                            c.as_str().map(|s| s.to_string()).unwrap_or_else(|| c.to_string())
+                            c.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| c.to_string())
                         })
                         .unwrap_or_default();
                 }
@@ -315,12 +319,19 @@ fn openai_messages_to_anthropic(messages: &Value, out: &mut Vec<Value>, system: 
 pub fn openai_req_to_anthropic(req: &Value, model: &str) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     let mut system = String::new();
-    openai_messages_to_anthropic(req.get("messages").unwrap_or(&Value::Null), &mut messages, &mut system);
+    openai_messages_to_anthropic(
+        req.get("messages").unwrap_or(&Value::Null),
+        &mut messages,
+        &mut system,
+    );
     let mut out = json!({ "model": model, "messages": messages });
     if !system.is_empty() {
         out["system"] = Value::String(system);
     }
-    out["max_tokens"] = req.get("max_tokens").cloned().unwrap_or_else(|| json!(4096));
+    out["max_tokens"] = req
+        .get("max_tokens")
+        .cloned()
+        .unwrap_or_else(|| json!(4096));
     if let Some(v) = req.get("temperature") {
         out["temperature"] = v.clone();
     }
@@ -410,7 +421,10 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
             content.push(json!({ "type": "text", "text": text }));
         }
     }
-    if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|c| c.as_array()) {
+    if let Some(calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|c| c.as_array())
+    {
         for c in calls {
             let input: Value = c
                 .get("function")
@@ -450,7 +464,12 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
 pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    for b in body.get("content").and_then(|c| c.as_array()).into_iter().flatten() {
+    for b in body
+        .get("content")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+    {
         match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text" => text.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or("")),
             "tool_use" => {
@@ -474,7 +493,7 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
     let message = if tool_calls.is_empty() {
         json!({ "role": "assistant", "content": text })
     } else {
-        json!({ "role": "assistant", "content": text.is_empty().then_some(Value::Null).unwrap_or(Value::String(text)), "tool_calls": tool_calls })
+        json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }, "tool_calls": tool_calls })
     };
     let input = body
         .get("usage")
@@ -609,7 +628,9 @@ pub trait SseConverter: Send {
     /// Final token breakdown the converter captured from upstream chunks.
     /// None means no usage was reported in the stream — the log row will
     /// record 0 tokens in that case.
-    fn usage(&self) -> Option<Usage> { None }
+    fn usage(&self) -> Option<Usage> {
+        None
+    }
 }
 
 fn sse_event(name: &str, data: &Value) -> String {
@@ -695,12 +716,12 @@ impl SseConverter for OpenAiToAnthropicStream {
         };
         let delta = choice.get("delta");
         // tool call fragments
-        if let Some(calls) = delta.and_then(|d| d.get("tool_calls")).and_then(|c| c.as_array()) {
+        if let Some(calls) = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|c| c.as_array())
+        {
             for call in calls {
-                let idx = call
-                    .get("index")
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if self.tools.len() <= idx {
                     self.tools.resize(idx + 1, None);
                 }
@@ -833,7 +854,10 @@ impl SseConverter for OpenAiToAnthropicStream {
                 "usage": { "input_tokens": self.usage.prompt, "output_tokens": self.usage.completion }
             }),
         ));
-        out.push(sse_event("message_stop", &json!({ "type": "message_stop" })));
+        out.push(sse_event(
+            "message_stop",
+            &json!({ "type": "message_stop" }),
+        ));
         out
     }
 
@@ -965,7 +989,11 @@ impl SseConverter for AnthropicToOpenAiStream {
                 }
             }
             "message_delta" => {
-                if let Some(r) = v.get("delta").and_then(|d| d.get("stop_reason")).and_then(|r| r.as_str()) {
+                if let Some(r) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|r| r.as_str())
+                {
                     self.finish_reason = Some(r.to_string());
                 }
                 if let Some(u) = v.get("usage") {

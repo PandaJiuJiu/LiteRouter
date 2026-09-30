@@ -9,7 +9,8 @@ use serde_json::json;
 #[tokio::test]
 async fn empty_database_needs_setup() {
     let h = support::Harness::new().await;
-    let (status, body) = support::call_json(&h.router, "GET", "/api/setup-status", None, None).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/api/setup-status", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["needsSetup"], true);
     assert_eq!(body["authenticated"], false);

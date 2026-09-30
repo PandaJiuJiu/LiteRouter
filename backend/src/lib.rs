@@ -58,7 +58,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/password", post(auth::change_password))
         // admin endpoints
         .route("/api/models", get(admin::list_channel_models))
-        .route("/api/channels", get(admin::list_channels).post(admin::create_channel))
+        .route(
+            "/api/channels",
+            get(admin::list_channels).post(admin::create_channel),
+        )
         .route("/api/channels/fetch-models", post(admin::fetch_models))
         .route("/api/channels/test-model", post(admin::test_model))
         .route(
@@ -69,7 +72,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/channels/:id/models",
             post(admin::update_channel_models),
         )
-        .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
+        .route(
+            "/api/tokens",
+            get(admin::list_tokens).post(admin::create_token),
+        )
         .route(
             "/api/tokens/:id",
             axum::routing::put(admin::toggle_token).delete(admin::delete_token),
@@ -97,11 +103,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/mappings/:id",
-            axum::routing::put(admin::update_mapping)
-                .delete(admin::delete_mapping),
+            axum::routing::put(admin::update_mapping).delete(admin::delete_mapping),
         )
         // user management
-        .route("/api/users", get(users::list_users).post(users::create_user))
+        .route(
+            "/api/users",
+            get(users::list_users).post(users::create_user),
+        )
         .route(
             "/api/users/:id",
             axum::routing::put(users::update_user).delete(users::delete_user),

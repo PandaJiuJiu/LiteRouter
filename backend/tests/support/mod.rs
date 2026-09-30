@@ -85,15 +85,17 @@ pub struct TokenRow {
 /// Create an `sk-` token owned by `user_id`.
 pub async fn insert_token(pool: &SqlitePool, name: &str, user_id: i64) -> TokenRow {
     let key = format!("sk-test-{name}-{}", db::now());
-    let id = sqlx::query("INSERT INTO tokens (name, key, enabled, created_at, user_id) VALUES (?,?,1,?,?)")
-        .bind(name)
-        .bind(&key)
-        .bind(db::now())
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("insert token")
-        .last_insert_rowid();
+    let id = sqlx::query(
+        "INSERT INTO tokens (name, key, enabled, created_at, user_id) VALUES (?,?,1,?,?)",
+    )
+    .bind(name)
+    .bind(&key)
+    .bind(db::now())
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("insert token")
+    .last_insert_rowid();
     TokenRow { id, key, user_id }
 }
 
@@ -127,7 +129,10 @@ pub async fn insert_channel(
     .await
     .expect("insert channel")
     .last_insert_rowid();
-    ChannelRow { id: id, name: name.to_string() }
+    ChannelRow {
+        id,
+        name: name.to_string(),
+    }
 }
 
 /// Route `alias` to a single `{channel: "", model}` target — i.e. "any
@@ -138,15 +143,17 @@ pub async fn insert_mapping_any(pool: &SqlitePool, alias: &str, model: &str) -> 
 
 /// Route `alias` to an explicit ordered target list.
 pub async fn insert_mapping_targets(pool: &SqlitePool, alias: &str, targets: &Value) -> i64 {
-    sqlx::query("INSERT INTO model_mappings (alias, target_model, targets, created_at) VALUES (?,?,?,?)")
-        .bind(alias)
-        .bind("")
-        .bind(targets.to_string())
-        .bind(db::now())
-        .execute(pool)
-        .await
-        .expect("insert mapping")
-        .last_insert_rowid()
+    sqlx::query(
+        "INSERT INTO model_mappings (alias, target_model, targets, created_at) VALUES (?,?,?,?)",
+    )
+    .bind(alias)
+    .bind("")
+    .bind(targets.to_string())
+    .bind(db::now())
+    .execute(pool)
+    .await
+    .expect("insert mapping")
+    .last_insert_rowid()
 }
 
 /// Mount the full API over a database, exactly as `main` would. The
@@ -170,14 +177,22 @@ impl Harness {
     pub async fn new() -> Self {
         let db = TestDb::new().await;
         let (router, breaker) = mount(db.pool.clone()).await;
-        Self { db, router, breaker }
+        Self {
+            db,
+            router,
+            breaker,
+        }
     }
 
     /// A harness that already has an `admin` user.
     pub async fn with_admin() -> Self {
         let db = TestDb::with_admin().await;
         let (router, breaker) = mount(db.pool.clone()).await;
-        Self { db, router, breaker }
+        Self {
+            db,
+            router,
+            breaker,
+        }
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -197,7 +212,10 @@ pub async fn call(
     if let Some(v) = body {
         b = Body::from(serde_json::to_vec(&v).unwrap());
     }
-    let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
     if let Some(t) = bearer {
         req = req.header("authorization", format!("Bearer {t}"));
     }

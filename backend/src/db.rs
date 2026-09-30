@@ -28,12 +28,11 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     // Adopt legacy orphan tokens into the first admin so they're manageable
     // in the UI. No-op on a fresh DB (no tokens yet) and on a fully-migrated
     // DB (no NULL user_id left); only matters for the multi-account cut-over.
-    let first_admin: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap_or(None);
+    let first_admin: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None);
     if let Some(admin_id) = first_admin {
         let _ = sqlx::query("UPDATE tokens SET user_id = ? WHERE user_id IS NULL")
             .bind(admin_id)
@@ -115,10 +114,7 @@ pub fn verify_password(plain: &str, hash_hex: &str, salt_hex: &str) -> bool {
 /// this schema uses soft string references throughout), so the children have
 /// to go explicitly — first, then the parents, or the `NOT EXISTS` check would
 /// match nothing and leak every child row.
-pub async fn cleanup_old_logs(
-    pool: &SqlitePool,
-    retention_days: i64,
-) -> Result<u64, sqlx::Error> {
+pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<u64, sqlx::Error> {
     let cutoff = now() - retention_days * 86400;
 
     // Collect the IDs whose debug files need to be purged before we delete the

@@ -25,15 +25,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn upstream_ok(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-up",
-                "model": "upstream-model",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
-                             "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-up",
+            "model": "upstream-model",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })))
         .mount(server)
         .await;
 }
@@ -55,7 +53,9 @@ async fn upstream_status(server: &MockServer, status: u16) {
 async fn relay_ready(base_url: &str, models: &str) -> (Harness, String) {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", base_url, "", models, true).await;
     (h, token.key)
@@ -66,7 +66,14 @@ async fn chat(h: &Harness, key: &str, model: &str, extra: Value) -> (StatusCode,
     for (k, v) in extra.as_object().unwrap() {
         body[k] = v.clone();
     }
-    support::call_json(&h.router, "POST", "/v1/chat/completions", Some(body), Some(key)).await
+    support::call_json(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(body),
+        Some(key),
+    )
+    .await
 }
 
 // ===================== token auth =====================
@@ -91,7 +98,9 @@ async fn a_request_without_a_model_is_rejected_before_any_upstream_call() {
 async fn a_malformed_body_is_a_400_not_a_500() {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     let resp = support::call(
         &h.router,
@@ -108,17 +117,26 @@ async fn a_malformed_body_is_a_400_not_a_500() {
 async fn an_exhausted_daily_quota_is_rejected_with_429() {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     sqlx::query("UPDATE tokens SET daily_token_limit=? WHERE id=?")
-        .bind(10).bind(token.id).execute(h.pool()).await.unwrap();
+        .bind(10)
+        .bind(token.id)
+        .execute(h.pool())
+        .await
+        .unwrap();
     // Pre-seed usage that already exceeds today's allowance.
     let day = literouter::db::now() / 86400 * 86400;
     sqlx::query(
         "INSERT INTO logs (token_name, model, channel_name, status_code, created_at, total_tokens)
          VALUES ('relay','m','ch',200,?,20)",
     )
-    .bind(day + 3600).execute(h.pool()).await.unwrap();
+    .bind(day + 3600)
+    .execute(h.pool())
+    .await
+    .unwrap();
 
     let (status, _) = chat(&h, &token.key, "gpt-4o", json!({})).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -145,7 +163,12 @@ async fn the_channel_key_is_sent_upstream_and_the_client_token_is_not() {
     chat(&h, &key, "gpt-4o", json!({})).await;
 
     let reqs = server.received_requests().await.unwrap();
-    let auth = reqs[0].headers.get("authorization").unwrap().to_str().unwrap();
+    let auth = reqs[0]
+        .headers
+        .get("authorization")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert_eq!(auth, "Bearer sk-upstream-secret");
     // The downstream `sk-` credential must not travel past the gateway.
     assert!(!auth.contains(&key), "client token leaked upstream");
@@ -175,7 +198,8 @@ async fn the_upstream_body_reaches_the_client_unchanged() {
             "id": "x", "vendor_specific_field": {"deep": [1, 2, 3]},
             "choices": [{"message": {"role": "assistant", "content": "ok"}}]
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
 
     let (_, body) = chat(&h, &key, "gpt-4o", json!({})).await;
@@ -188,7 +212,9 @@ async fn a_disabled_channel_is_never_routed_to() {
     upstream_ok(&server).await;
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", false).await;
 
@@ -203,19 +229,26 @@ async fn a_model_that_no_channel_serves_is_a_404_that_still_gets_a_log_row() {
     // to answer, so a routing failure is a loggable client request.
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", "http://127.0.0.1:1", "", "gpt-4o", true).await;
 
     let (status, body) = chat(&h, &token.key, "unknown-model", json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
-        body["error"]["message"].as_str().unwrap().contains("unknown-model"),
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown-model"),
         "{body}"
     );
 
     let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE token_name='relay'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(logs, 1);
 }
 
@@ -236,7 +269,9 @@ async fn a_model_listed_only_in_disabled_models_is_not_routed() {
     upstream_ok(&server).await;
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     sqlx::query(
         "INSERT INTO channels (name, base_url, api_key, models, disabled_models, enabled, created_at)
@@ -255,7 +290,9 @@ async fn a_model_listed_only_in_disabled_models_is_not_routed() {
 async fn two_channels(a: &str, b: &str) -> (Harness, String) {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "first", a, "", "gpt-4o", true).await;
     support::insert_channel(h.pool(), "second", b, "", "gpt-4o", true).await;
@@ -314,11 +351,20 @@ async fn the_log_row_records_every_attempt_in_order() {
     let (h, key) = two_channels(&a.uri(), &b.uri()).await;
     chat(&h, &key, "gpt-4o", json!({})).await;
 
-    let rows = sqlx::query("SELECT log_id, seq, channel_name, status_code, ok FROM log_attempts ORDER BY seq")
-        .fetch_all(h.pool()).await.unwrap();
+    let rows = sqlx::query(
+        "SELECT log_id, seq, channel_name, status_code, ok FROM log_attempts ORDER BY seq",
+    )
+    .fetch_all(h.pool())
+    .await
+    .unwrap();
     assert_eq!(rows.len(), 2, "one client request, two upstream hops");
-    let log_ids: std::collections::HashSet<i64> = rows.iter().map(|r| r.get::<i64, _>("log_id")).collect();
-    assert_eq!(log_ids.len(), 1, "both hops belong to the same client request");
+    let log_ids: std::collections::HashSet<i64> =
+        rows.iter().map(|r| r.get::<i64, _>("log_id")).collect();
+    assert_eq!(
+        log_ids.len(),
+        1,
+        "both hops belong to the same client request"
+    );
     assert_eq!(rows[0].get::<String, _>("channel_name"), "first");
     assert_eq!(rows[0].get::<i64, _>("status_code"), 500);
     assert_eq!(rows[0].get::<i64, _>("ok"), 0);
@@ -336,7 +382,9 @@ async fn the_parent_log_row_takes_the_winning_attempts_channel_and_tokens() {
     chat(&h, &key, "gpt-4o", json!({})).await;
 
     let row = sqlx::query("SELECT channel_name, status_code, total_tokens, failed_count FROM logs")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("channel_name"), "second");
     assert_eq!(row.get::<i64, _>("status_code"), 200);
     assert_eq!(row.get::<i64, _>("total_tokens"), 10);
@@ -412,7 +460,9 @@ async fn a_pin_to_a_missing_channel_does_not_fall_back_to_any_channel() {
 async fn all_fail(base: &str) -> (Harness, String) {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "first", base, "", "gpt-4o", true).await;
     support::insert_channel(h.pool(), "second", base, "", "gpt-4o", true).await;
@@ -498,7 +548,9 @@ async fn an_all_failed_request_still_writes_a_log_row() {
     // The parent row must not name the last failed channel as if it had served
     // the request — an empty channel renders as "—" in the list.
     let row = sqlx::query("SELECT channel_name, status_code FROM logs")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("channel_name"), "");
     assert_eq!(row.get::<i64, _>("status_code"), 502);
 }
@@ -512,12 +564,19 @@ async fn an_open_breaker_skips_the_upstream_without_sending_a_request() {
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
 
     let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
-    h.breaker.record(&bkey, literouter::breaker::Outcome::Failure).await;
+    h.breaker
+        .record(&bkey, literouter::breaker::Outcome::Failure)
+        .await;
 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "the only candidate was skipped");
     assert_eq!(
-        a.received_requests().await.unwrap().len(), 0,
+        status,
+        StatusCode::BAD_GATEWAY,
+        "the only candidate was skipped"
+    );
+    assert_eq!(
+        a.received_requests().await.unwrap().len(),
+        0,
         "an open breaker must not burn upstream quota"
     );
 }
@@ -531,12 +590,17 @@ async fn a_skipped_hop_is_recorded_as_skipped_not_as_a_failure() {
     upstream_ok(&a).await;
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
     h.breaker
-        .record(&literouter::breaker::breaker_key("ch", "gpt-4o"), literouter::breaker::Outcome::Failure)
+        .record(
+            &literouter::breaker::breaker_key("ch", "gpt-4o"),
+            literouter::breaker::Outcome::Failure,
+        )
         .await;
     chat(&h, &key, "gpt-4o", json!({})).await;
 
     let row = sqlx::query("SELECT ok, skipped, error FROM log_attempts")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(row.get::<i64, _>("ok"), 0);
     assert_eq!(row.get::<i64, _>("skipped"), 1);
     assert_eq!(row.get::<String, _>("error"), "circuit breaker open");
@@ -548,14 +612,18 @@ async fn a_success_clears_the_breaker_for_that_channel_and_model() {
     upstream_ok(&a).await;
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
     let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
-    h.breaker.record(&bkey, literouter::breaker::Outcome::Failure).await;
+    h.breaker
+        .record(&bkey, literouter::breaker::Outcome::Failure)
+        .await;
     assert!(!h.breaker.allow(&bkey).await);
 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
     // With the breaker open the request is skipped, so drive one success
     // directly and check the key is gone.
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    h.breaker.record(&bkey, literouter::breaker::Outcome::Success).await;
+    h.breaker
+        .record(&bkey, literouter::breaker::Outcome::Success)
+        .await;
     assert!(h.breaker.allow(&bkey).await);
     assert_eq!(h.breaker.snapshot().await.len(), 0);
 }
@@ -571,7 +639,10 @@ async fn a_client_400_does_not_trip_the_breaker() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
     let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
-    assert!(h.breaker.allow(&bkey).await, "400 must not open the breaker");
+    assert!(
+        h.breaker.allow(&bkey).await,
+        "400 must not open the breaker"
+    );
 }
 
 #[tokio::test]
@@ -580,7 +651,11 @@ async fn an_upstream_500_does_trip_the_breaker() {
     upstream_status(&a, 500).await;
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
     chat(&h, &key, "gpt-4o", json!({})).await;
-    assert!(!h.breaker.allow(&literouter::breaker::breaker_key("ch", "gpt-4o")).await);
+    assert!(
+        !h.breaker
+            .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
+            .await
+    );
 }
 
 // ===================== protocol conversion =====================
@@ -596,7 +671,8 @@ async fn an_anthropic_client_on_an_openai_only_channel_is_converted_upstream() {
                          "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 2}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
 
     let (status, body) = support::call_json(
@@ -633,10 +709,13 @@ async fn an_openai_client_on_an_anthropic_only_channel_is_converted_upstream() {
             "content": [{"type": "text", "text": "hello"}],
             "usage": {"input_tokens": 4, "output_tokens": 2}
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     // Only the anthropic base_url is filled in.
     support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
@@ -660,15 +739,21 @@ async fn a_converted_hop_is_labelled_in_the_log_row() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl-1", "choices": [{"message": {"content": "x"}}]
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
     chat(&h, &token.key, "claude-x", json!({})).await;
 
-    let row = sqlx::query("SELECT convert, protocol FROM logs").fetch_one(h.pool()).await.unwrap();
+    let row = sqlx::query("SELECT convert, protocol FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("protocol"), "openai");
     assert_eq!(row.get::<String, _>("convert"), "to_anthropic");
 }
@@ -681,10 +766,13 @@ async fn the_anthropic_version_header_is_forwarded_to_the_upstream() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "msg_1", "content": [], "stop_reason": "end_turn"
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
 
@@ -697,7 +785,10 @@ async fn the_anthropic_version_header_is_forwarded_to_the_upstream() {
     )
     .await;
     let reqs = server.received_requests().await.unwrap();
-    assert_eq!(reqs[0].headers.get("anthropic-version").unwrap(), "2023-06-01");
+    assert_eq!(
+        reqs[0].headers.get("anthropic-version").unwrap(),
+        "2023-06-01"
+    );
 }
 
 // ===================== client info =====================
@@ -719,7 +810,10 @@ async fn the_client_ip_and_user_agent_are_recorded_on_the_log_row() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let row = sqlx::query("SELECT client_ip FROM logs").fetch_one(h.pool()).await.unwrap();
+    let row = sqlx::query("SELECT client_ip FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("client_ip"), "203.0.113.7");
 }
 
@@ -729,29 +823,48 @@ async fn the_client_ip_and_user_agent_are_recorded_on_the_log_row() {
 async fn the_model_list_is_the_union_of_enabled_channels() {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "a", "http://x", "", "gpt-4o, gpt-4o-mini", true).await;
     support::insert_channel(h.pool(), "b", "http://x", "", "gpt-4o,claude-x", true).await;
     support::insert_channel(h.pool(), "off", "http://x", "", "hidden-model", false).await;
 
-    let (status, body) = support::call_json(&h.router, "GET", "/v1/models", None, Some(&token.key)).await;
+    let (status, body) =
+        support::call_json(&h.router, "GET", "/v1/models", None, Some(&token.key)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "list");
-    let ids: Vec<&str> = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["gpt-4o", "gpt-4o-mini", "claude-x"], "deduped and in channel order");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["gpt-4o", "gpt-4o-mini", "claude-x"],
+        "deduped and in channel order"
+    );
 }
 
 #[tokio::test]
 async fn a_wildcard_channel_contributes_no_enumerable_models() {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
-        .fetch_one(h.pool()).await.unwrap();
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "a", "http://x", "", "*", true).await;
 
-    let (_, body) = support::call_json(&h.router, "GET", "/v1/models", None, Some(&token.key)).await;
-    assert_eq!(body["data"], json!([]), "a wildcard advertises nothing concrete");
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/v1/models", None, Some(&token.key)).await;
+    assert_eq!(
+        body["data"],
+        json!([]),
+        "a wildcard advertises nothing concrete"
+    );
 }
 
 #[tokio::test]
@@ -759,12 +872,8 @@ async fn a_wildcard_alias_expands_to_the_pinned_channels_model_list() {
     let a = MockServer::start().await;
     upstream_ok(&a).await;
     let (h, key) = relay_ready(&a.uri(), "gpt-4o,gpt-4o-mini").await;
-    support::insert_mapping_targets(
-        h.pool(),
-        "any",
-        &json!([{"channel": "ch", "model": "*"}]),
-    )
-    .await;
+    support::insert_mapping_targets(h.pool(), "any", &json!([{"channel": "ch", "model": "*"}]))
+        .await;
 
     // The client asks for the alias; the wildcard target expands to whatever
     // the pinned channel actually serves.
@@ -796,7 +905,8 @@ async fn a_streaming_request_relays_the_upstream_sse_verbatim() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse),
         )
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
 
     let resp = support::call(
@@ -832,7 +942,8 @@ async fn a_stream_conversion_succeeds_in_translating_the_event_shapes() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse),
         )
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
 
     let resp = support::call(
@@ -848,7 +959,10 @@ async fn a_stream_conversion_succeeds_in_translating_the_event_shapes() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("event: message_start"), "{text}");
     assert!(text.contains("event: message_stop"), "{text}");
-    assert!(!text.contains("chat.completion.chunk"), "leaked OpenAI frames: {text}");
+    assert!(
+        !text.contains("chat.completion.chunk"),
+        "leaked OpenAI frames: {text}"
+    );
 }
 
 /// Poll for the log row a streaming request writes when its body is dropped.
@@ -856,9 +970,10 @@ async fn a_stream_conversion_succeeds_in_translating_the_event_shapes() {
 /// after the body is exhausted rather than synchronously with the response.
 async fn await_log_row(pool: &sqlx::SqlitePool) -> sqlx::sqlite::SqliteRow {
     for _ in 0..100 {
-        if let Ok(row) = sqlx::query("SELECT stream, total_tokens FROM logs ORDER BY id DESC LIMIT 1")
-            .fetch_one(pool)
-            .await
+        if let Ok(row) =
+            sqlx::query("SELECT stream, total_tokens FROM logs ORDER BY id DESC LIMIT 1")
+                .fetch_one(pool)
+                .await
         {
             return row;
         }
@@ -881,7 +996,8 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse),
         )
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
 
     let resp = support::call(
