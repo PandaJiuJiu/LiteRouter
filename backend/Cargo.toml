@@ -3,6 +3,14 @@ name = "literouter"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "literouter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "literouter"
+path = "src/main.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -27,3 +35,10 @@ opt-level = 2
 # `test-util` enables tokio::time::pause/advance, used by breaker state-machine
 # tests to drive virtual time forward without sleeping.
 tokio = { version = "1", features = ["test-util"] }
+# `oneshot` lets integration tests drive the router in-process instead of
+# binding a port.
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+wiremock = "0.6"
+tempfile = "3"
+serde_json = "1"

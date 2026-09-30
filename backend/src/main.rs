@@ -1,33 +1,11 @@
-mod admin;
-mod breaker;
-mod breaker_probe;
-mod convert;
-mod auth;
-mod db;
-mod proxy;
-mod settings;
-mod state;
-mod users;
-
-use axum::routing::{get, post};
-use axum::Router;
-use state::AppState;
-use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use literouter::{breaker_probe, build_router, build_state, db};
 
 #[tokio::main]
 async fn main() {
     let db_path =
         std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
     let pool = db::init_pool(&db_path).await;
-    let debug_logging = match db::get_setting(&pool, "debug_logging").await {
-        Ok(Some(v)) => v == "1",
-        _ => false,
-    };
-    proxy::set_debug_logging(debug_logging);
-    let breaker_cfg = settings::load_breaker_config(&pool).await;
-    let breaker = Arc::new(breaker::Breaker::new(breaker_cfg));
-    let state = Arc::new(AppState::new(pool, debug_logging, breaker));
+    let state = build_state(pool).await;
 
     // background: keep the `logs` table bounded — relay traffic is high
     // volume and every row is an INSERT, so without this the DB grows
@@ -53,67 +31,7 @@ async fn main() {
     // is independent of user traffic.
     breaker_probe::spawn(state.clone());
 
-    let app = Router::new()
-        // relay endpoints (OpenAI compatible)
-        .route("/v1/chat/completions", post(proxy::chat_completions))
-        .route("/v1/messages", post(proxy::anthropic_messages))
-        .route("/v1/models", get(proxy::list_models))
-        // auth / setup
-        .route("/api/setup-status", get(auth::setup_status))
-        .route("/api/setup", post(auth::setup))
-        .route("/api/login", post(auth::login))
-        .route("/api/logout", post(auth::logout))
-        .route("/api/me", get(auth::me))
-        .route("/api/password", post(auth::change_password))
-        // admin endpoints
-        .route("/api/models", get(admin::list_channel_models))
-        .route("/api/channels", get(admin::list_channels).post(admin::create_channel))
-        .route("/api/channels/fetch-models", post(admin::fetch_models))
-        .route("/api/channels/test-model", post(admin::test_model))
-        .route(
-            "/api/channels/:id",
-            axum::routing::put(admin::update_channel).delete(admin::delete_channel),
-        )
-        .route(
-            "/api/channels/:id/models",
-            post(admin::update_channel_models),
-        )
-        .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
-        .route(
-            "/api/tokens/:id",
-            axum::routing::put(admin::toggle_token).delete(admin::delete_token),
-        )
-        .route("/api/logs", get(admin::list_logs))
-        .route("/api/logs/:id", get(admin::get_log))
-        .route("/api/usage", get(admin::usage))
-        .route("/api/settings/debug-logging", get(settings::get_debug_logging).put(settings::set_debug_logging))
-        .route(
-            "/api/settings/language",
-            get(settings::get_language).put(settings::set_language),
-        )
-        .route(
-            "/api/settings/breaker",
-            get(settings::get_breaker_config).put(settings::set_breaker_config),
-        )
-        .route("/api/breaker/snapshot", get(breaker::http_snapshot))
-        .route("/api/breaker/reset", post(breaker::http_reset))
-        .route(
-            "/api/mappings",
-            get(admin::list_mappings).post(admin::create_mapping),
-        )
-        .route(
-            "/api/mappings/:id",
-            axum::routing::put(admin::update_mapping)
-                .delete(admin::delete_mapping),
-        )
-        // user management
-        .route("/api/users", get(users::list_users).post(users::create_user))
-        .route(
-            "/api/users/:id",
-            axum::routing::put(users::update_user).delete(users::delete_user),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state.clone());
+    let app = build_router(state);
 
     // serve built frontend if a dist directory exists
     // (docker layout: /app/dist; local dev layout: ../frontend/dist)

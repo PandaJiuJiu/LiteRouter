@@ -22,8 +22,9 @@ use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -32,6 +33,36 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Peer address, or `None` when the server wasn't built with
+/// `into_make_service_with_connect_info`.
+///
+/// `axum::extract::ConnectInfo` itself rejects the request outright when the
+/// extension is absent, which makes the relay untestable in-process. This
+/// mirrors its lookup but degrades to `None`: in production the extension is
+/// always present, so behavior is unchanged, and a request from a
+/// reverse-proxied setup without `X-Forwarded-For` degrades to "no client IP"
+/// instead of a 500.
+pub struct OptionalConnectInfo(pub Option<std::net::SocketAddr>);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(OptionalConnectInfo(
+            parts
+                .extensions
+                .get::<ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     // OpenAI clients: "Authorization: Bearer sk-..."
@@ -1430,20 +1461,20 @@ async fn relay(
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OptionalConnectInfo(addr): OptionalConnectInfo,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "openai", Some(addr)).await
+    relay(&state, &headers, body, "openai", addr).await
 }
 
 /// POST /v1/messages — Anthropic Messages API relay.
 pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    OptionalConnectInfo(addr): OptionalConnectInfo,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "anthropic", Some(addr)).await
+    relay(&state, &headers, body, "anthropic", addr).await
 }
 
 /// GET /v1/models — list union of all enabled channel models.
