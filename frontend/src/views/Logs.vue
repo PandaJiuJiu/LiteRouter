@@ -18,7 +18,7 @@
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column label="令牌" width="160" />
+      <el-table-column prop="token_name" label="令牌" width="160" />
       <el-table-column label="来源" width="150" show-overflow-tooltip>
         <template #default="{ row }">
           <span v-if="row.client_ip || row.user_agent">
