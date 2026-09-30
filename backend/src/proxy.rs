@@ -658,7 +658,6 @@ async fn try_upstream(
 
 /// Feed a non-2xx HTTP status into the breaker. 429 increments the
 /// `retriable_429_count` so the final-status decision can choose 429 over
-/// `retriable_429_count` so the final-status decision can choose 429 over
 /// 502 when every failure was a rate-limit. The breaker itself no longer
 /// cares about Retry-After — every failure is `Outcome::Failure` and
 /// trips at the same threshold.

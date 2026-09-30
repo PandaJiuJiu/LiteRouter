@@ -52,6 +52,7 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │   │   └── 0012_users.sql
 │   └── src/
 │       ├── main.rs              # axum router wiring, /v1/* + /api/* + startup
+│       ├── lib.rs               # library root: build_state() + build_router() (see Testing)
 │       ├── db.rs                # init_pool() + PBKDF2 password hash helpers
 │       ├── auth.rs              # session middleware, setup/login/logout/me/password
 │       ├── users.rs             # /api/users CRUD (admin only)
@@ -110,7 +111,7 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 
 ## Database migrations
 
-`backend/migrations/` is the single source of truth. 12 files represent the actual schema history (0001 includes `kind` for legacy fidelity; 0003 drops it). sqlx embeds them at compile time, so:
+`backend/migrations/` is the single source of truth. 26 files represent the actual schema history (0001 includes `kind` for legacy fidelity; 0003 drops it; 0020–0022 reworked the circuit breaker). sqlx embeds them at compile time, so:
 
 1. **Adding a migration**: create `00NN_short_name.sql`, run `./run.sh stop && ./run.sh start`. The dev DB picks it up automatically.
 2. **Editing an existing migration**: **do not**, unless you also bump every downstream file. The migration history is immutable — write a new one.
@@ -152,8 +153,33 @@ For production, sqlx's `migrate` runs on container start, same way.
 - **Sessions vs tokens**: a *session* is an admin-UI login (in-memory, short-lived, lost on restart). A *token* (`sk-…`) is what downstream SDKs use to call `/v1/*` — these are persistent and quota-tracked.
 - **Two-protocol channels**: a channel can serve both OpenAI and Anthropic with the same key (e.g. Volcengine Ark). Fill in both URLs; the proxy picks the right one based on client protocol.
 - **Wildcard models**: `models = "*"` matches any client model name. Useful during provider migration.
-- **Mappings**: client model → ordered list of upstream models. The proxy walks the list, falling back on transport errors or retryable status (408/429/5xx/524). Non-retryable 4xx is returned to the client.
+- **Mappings**: client model → ordered list of upstream models. The proxy walks the list and falls back on **any** non-2xx or transport error — a 400/422 still moves on to the next candidate rather than being returned immediately. What differs by status is only whether the failure is fed to the circuit breaker (400/422 are exempt) and the *synthesized* final status when every candidate fails: all-429 → 429 + `Retry-After`, all transport errors → 504, any mix → 502.
 - **Client disconnect**: axum's `Body::stream` + a cancellation token aborts the upstream reqwest call when the downstream disconnects. Don't waste upstream quota.
+- **Breaker backoff is exponential**, despite what `migrations/0022_breaker_linear_backoff.sql` says in its comment (that comment describes 30 → 60 → 90; the code and its unit tests implement doubling, 30 → 60 → 120 → …, capped at `breaker_max_delay_secs`). The migration file stays as-is — history is immutable — so treat `breaker.rs` as the source of truth and the migration name/comment as historical.
+
+---
+
+## Testing
+
+`backend/tests/` holds 8 integration suites (~236 tests) plus unit tests inside `src/`. They all run in-process:
+
+- `src/lib.rs` exposes `build_state(pool)` and `build_router(state)`. `src/main.rs` is a thin shell that calls them — **all routing lives in the lib** so tests can mount the real `Router` via `tower::ServiceExt::oneshot`. Never move route definitions back into `main.rs`.
+- `tests/support/mod.rs` is the shared fixture module (not a test target itself): `TestDb` gives each test its own SQLite file in a tempdir, `Harness` bundles db + router + breaker, `call`/`call_json`/`login` wrap the oneshot plumbing.
+  - **One SQLite file per test, deliberately.** A shared in-memory pool flakes with `database is locked` because SQLite serializes writers per-database and `cargo test` runs suites in parallel threads.
+  - `shared_hash()` computes the PBKDF2 hash **once per test binary** via `OnceLock`. Production `PBKDF2_ITERATIONS` stays at 100k — do not add a test-only env override to weaken the work factor.
+- Relay contract tests use `wiremock` as a real upstream server; the rest drive the router directly.
+- `proxy.rs` handlers use `OptionalConnectInfo`, which yields `None` when axum didn't install the extension. That keeps `oneshot` working in tests without changing production behavior (the extension is always present there).
+
+Run everything:
+
+```bash
+cd backend && cargo test --all-targets   # unit + integration
+cd frontend && npm test                  # locale key parity (see below)
+```
+
+**Frontend has no unit-test runner.** `npm test` runs `scripts/check-i18n.mjs`, a zero-dependency Node script that fails when en-US and zh-CN key sets drift, when a zh-CN value is empty, or when both locales carry the identical string. vue-i18n falls back silently on a missing key, so nothing else would catch it. Component/router-guard tests would need vitest + @vue/test-utils + jsdom, which are **not installed** — don't assume `npm test` covers component behavior.
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` as **blocking**; the tree is clean as of 715035b, so keep it that way rather than adding `#[allow]`s.
 
 ---
 
@@ -185,6 +211,6 @@ For production, sqlx's `migrate` runs on container start, same way.
 - **Don't put schema in `db.rs`.** It's all in `backend/migrations/*.sql`. The `init_pool` function only opens the pool and runs `migrate!`. If you find yourself writing `CREATE TABLE` inside `db.rs`, stop and write a migration.
 - **Don't add `ADMIN_PASSWORD` back.** It was removed; the wizard is the only way to bootstrap.
 - **Don't add `reqwest::Client` per request** in `proxy.rs`. There's one shared client in `AppState` for connection pooling — instantiating per request leaks DNS resolvers and burns sockets.
-- **Don't expose `api_key` from `/api/channels` to non-admins.** The current admin.rs redacts it; if you add a new code path returning channel rows, redact there too.
+- **Don't expose `api_key` from `/api/channels` to non-admins.** Note that `row_channel` in `admin.rs` returns `api_key` **in full** — the protection is the endpoint's `require_admin(...)` gate, not redaction. That's deliberate: the edit form prefills the field, so redacting would make it impossible to save a channel without retyping the key. If you add a new code path that returns channel rows, put it behind `require_admin` too.
 - **Frontend dev URL is `localhost:5173`, not `:3000`.** The proxy is the entire point.
 - **Don't use `:` or `;` in usernames** — they go into route paths and SQL params; the setup endpoint validates.
