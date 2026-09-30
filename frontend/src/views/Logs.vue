@@ -18,7 +18,17 @@
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column prop="token_name" label="令牌" width="160" />
+      <el-table-column label="令牌" width="160" />
+      <el-table-column label="来源" width="150" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span v-if="row.client_ip || row.user_agent">
+            <span v-if="row.client_ip" class="ip">{{ row.client_ip }}</span>
+            <span v-if="row.client_ip && row.user_agent"> · </span>
+            <span v-if="row.user_agent" class="ua">{{ row.user_agent }}</span>
+          </span>
+          <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="request_model" label="请求模型" min-width="180" show-overflow-tooltip />
       <el-table-column label="转发模型" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
@@ -142,6 +152,20 @@ onMounted(load)
 .hint {
   color: #909399;
   font-size: 12px;
+}
+.ip {
+  font-size: 12px;
+  color: #303133;
+}
+.ua {
+  font-size: 11px;
+  color: #909399;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
 }
 .fail-badge {
   margin-left: 6px;

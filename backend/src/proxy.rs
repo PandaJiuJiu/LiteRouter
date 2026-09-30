@@ -373,6 +373,34 @@ impl Attempt {
     }
 }
 
+/// Client IP and User-Agent, extracted once at request entry and threaded
+/// through to every LogEntry so the log page can show the call source.
+#[derive(Clone)]
+struct ClientInfo {
+    ip: String,
+    user_agent: String,
+}
+
+/// Pull the first meaningful IP from X-Forwarded-For (reverse-proxy setup)
+/// or fall back to a direct connection hint. Silently ignores malformed
+/// headers so a bad XFF never breaks relay.
+fn extract_client_info(headers: &HeaderMap) -> ClientInfo {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    ClientInfo { ip, user_agent }
+}
+
 /// The result of a client request, in the shape the `logs` row needs. Written
 /// exactly once per request — by the streaming path from `Drop`, by the
 /// buffered path inline.
@@ -390,6 +418,8 @@ struct LogEntry {
     /// one transaction so the list can never show a row whose children are
     /// missing.
     attempts: Vec<Attempt>,
+    client_ip: String,
+    user_agent: String,
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
@@ -407,7 +437,7 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
         Err(_) => return None,
     };
     let inserted = match sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&e.token_name)
     .bind(&winner.upstream_model)
@@ -428,6 +458,8 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
     .bind(u.cache_creation)
     .bind(u.reasoning)
     .bind(failed_count)
+    .bind(&e.client_ip)
+    .bind(&e.user_agent)
     .execute(&mut *tx)
     .await
     {
@@ -835,6 +867,7 @@ async fn respond_from_upstream(
     attempts: Vec<Attempt>,
     // The body that was actually sent upstream (post-mappings rewrite).
     req_body: Bytes,
+    client_info: ClientInfo,
 ) -> (Response, Attempt) {
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -859,6 +892,8 @@ async fn respond_from_upstream(
                     streaming,
                     winner: Some(attempt.clone()),
                     attempts: push(attempts, attempt.clone()),
+                    client_ip: client_info.ip.clone(),
+                    user_agent: client_info.user_agent.clone(),
                 };
                 let _ = log_request(&state.pool, &entry).await;
                 return (
@@ -907,6 +942,8 @@ async fn respond_from_upstream(
             streaming,
             winner: Some(attempt.clone()),
             attempts: push(attempts, attempt.clone()),
+            client_ip: client_info.ip.clone(),
+            user_agent: client_info.user_agent.clone(),
         };
         let log_id = log_request(&state.pool, &entry).await;
         if state.debug_logging {
@@ -938,6 +975,8 @@ async fn respond_from_upstream(
             streaming,
             winner: Some(attempt.clone()),
             attempts: push(attempts, attempt.clone()),
+            client_ip: client_info.ip.clone(),
+            user_agent: client_info.user_agent.clone(),
         },
         req_body,
     };
@@ -981,6 +1020,7 @@ async fn relay(
         Ok(n) => n,
         Err((s, msg)) => return error_response(s, msg, None),
     };
+    let client_info = extract_client_info(headers);
 
     // 2. parse body to find model + streaming flag
     let req_json: Value = match serde_json::from_slice(&body) {
@@ -1084,6 +1124,7 @@ async fn relay(
                             relay_start,
                             attempts,
                             req_body,
+                            client_info.clone(),
                         )
                         .await
                         .0;
@@ -1103,6 +1144,7 @@ async fn relay(
                             relay_start,
                             attempts,
                             req_body,
+                            client_info.clone(),
                         )
                         .await
                         .0;
@@ -1189,6 +1231,8 @@ async fn relay(
                 usage: None,
             }),
             attempts: Vec::new(),
+            client_ip: client_info.ip.clone(),
+            user_agent: client_info.user_agent.clone(),
         };
         let _ = log_request(&state.pool, &entry).await;
         return error_response(StatusCode::NOT_FOUND, &err, None);
@@ -1236,6 +1280,8 @@ async fn relay(
         streaming: is_streaming,
         winner: Some(all_failed),
         attempts,
+        client_ip: client_info.ip.clone(),
+        user_agent: client_info.user_agent.clone(),
     };
     log_request(&state.pool, &entry).await;
     error_response(

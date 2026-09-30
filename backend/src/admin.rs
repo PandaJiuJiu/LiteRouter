@@ -893,6 +893,8 @@ pub async fn list_logs(
                 "failed_count": failed_count,
                 "failed_attempts": failed_by_log.get(&id).cloned().unwrap_or_default(),
                 "created_at": r.get::<i64, _>("created_at"),
+                "client_ip": r.get::<String, _>("client_ip"),
+                "user_agent": r.get::<String, _>("user_agent"),
             })
         })
         .collect();
@@ -984,6 +986,8 @@ pub async fn get_log(
             "failed_count": row.try_get("failed_count").unwrap_or(0),
             "attempts": attempts,
             "created_at": row.get::<i64, _>("created_at"),
+            "client_ip": row.get::<String, _>("client_ip"),
+            "user_agent": row.get::<String, _>("user_agent"),
         }
     })))
 }
