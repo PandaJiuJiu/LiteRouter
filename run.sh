@@ -5,8 +5,7 @@
 #   ./run.sh status         查看运行状态
 #   ./run.sh logs [be|fe]   查看后端/前端日志（默认全部）
 # port 默认 3000；前端 dev server 固定 5173，/api 与 /v1 自动代理到后端。
-# 可选环境变量：ADMIN_PASSWORD（可选；不设置则走网页初始化向导）、
-#               LITEROUTER_DB（数据库路径，默认 dev.db）。
+# 可选环境变量：LITEROUTER_DB（数据库路径，默认 dev.db）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

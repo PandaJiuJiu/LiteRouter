@@ -53,15 +53,6 @@ docker compose up -d --build
 - **调用日志** 与 **用量统计** 按用户自动过滤，管理员可见全部
 - 至少保留一个管理员账号，防止锁死
 
-### 通过环境变量预设初始管理员（可选）
-
-如果不想走网页初始化向导，可以设置 `ADMIN_PASSWORD`，首次启动时会自动创建一个名为 `admin` 的管理员账号；后续修改密码请直接在网页上操作。
-
-```bash
-ADMIN_PASSWORD=your-password docker compose up -d --build
-# 然后用 admin / your-password 登录
-```
-
 ### 修改端口
 
 宿主端口由 `docker-compose.yml` 的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
@@ -83,7 +74,6 @@ docker compose build --build-arg REGISTRY=docker.io/library
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PORT` | `3000` | 监听端口 |
-| `ADMIN_PASSWORD` | （空） | 可选：首次启动时自动创建 `admin` 账号并使用该密码；不设置则走网页初始化向导 |
 | `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径（compose 已指向持久卷 `/app/data/literouter.db`） |
 
 ## 使用流程

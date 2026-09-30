@@ -53,15 +53,6 @@ Notes:
 - **Logs** and **usage** are auto-scoped per user; admins see everything
 - At least one admin must always remain to prevent lockout
 
-### Pre-seeding the first admin via env (optional)
-
-If you'd rather skip the web wizard on first boot, set `ADMIN_PASSWORD`; the server will create a `admin` account with that password on startup. Change it later from the UI.
-
-```bash
-ADMIN_PASSWORD=your-password docker compose up -d --build
-# then log in with admin / your-password
-```
-
 ### Changing the port
 
 The host port is determined by the `ports` mapping in `docker-compose.yml`, overridable via the `PORT` environment variable (the container always listens on 3000):
@@ -83,7 +74,6 @@ docker compose build --build-arg REGISTRY=docker.io/library
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `3000` | Listen port |
-| `ADMIN_PASSWORD` | (empty) | Optional: on first boot, create an `admin` account with this password. Unset = walk through the web setup wizard |
 | `LITEROUTER_DB` | `literouter.db` | SQLite database path (compose points it at the persistent volume `/app/data/literouter.db`) |
 
 ## Usage

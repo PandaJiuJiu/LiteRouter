@@ -4,11 +4,7 @@ services:
     container_name: literouter
     ports:
       - "${PORT:-3000}:3000"
-    # ADMIN_PASSWORD is optional: if set, the first boot auto-creates an
-    # `admin` account with that password. Leave unset to walk through the
-    # web setup wizard on first visit instead.
     environment:
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - LITEROUTER_DB=/app/data/literouter.db
     volumes:
       - ./data:/app/data
