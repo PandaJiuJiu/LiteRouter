@@ -13,8 +13,21 @@ RUN npm run build
 # ---------- stage 2: build backend ----------
 FROM ${REGISTRY}/rust:1-alpine AS backend
 WORKDIR /build
+# Cargo registry mirror — crates.io direct fetch is unreliable in some CN networks.
+# rsproxy is a widely-used Chinese mirror that supports both git and sparse protocols.
+RUN mkdir -p /usr/local/cargo \
+    && { \
+       echo '[source.crates-io]'; \
+       echo 'replace-with = "rsproxy"'; \
+       echo '[source.rsproxy]'; \
+       echo 'registry = "sparse+https://rsproxy.cn/index/"'; \
+       echo '[registries.rsproxy]'; \
+       echo 'index = "sparse+https://rsproxy.cn/index/"'; \
+       } > /usr/local/cargo/config.toml
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 COPY backend/Cargo.toml backend/Cargo.lock* ./
 COPY backend/src ./src
+COPY backend/migrations ./migrations
 RUN cargo build --release
 # re-copy and rebuild is cheap thanks to docker layer cache of the deps above
 
