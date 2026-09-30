@@ -3,3 +3,6 @@ frontend/dist
 backend/target
 **/*.db
 one-api/
+.run/
+.git/
+CLAUDE.md
