@@ -81,23 +81,34 @@
         </template>
       </el-table-column>
     </el-table>
-    <el-pagination
-      style="margin-top: 12px; justify-content: flex-end"
-      layout="total, sizes, prev, pager, next"
-      :total="total"
-      :page-size="size"
-      :current-page="page"
-      :page-sizes="[20, 50, 100, 200]"
-      @current-change="(p) => { page = p; load() }"
-      @size-change="(s) => { size = s; page = 1; load() }"
-    />
+    <div class="pager-row">
+      <div v-if="isAdmin" class="debug-cell">
+        <span class="debug-label">调试日志</span>
+        <el-switch
+          :model-value="debugLogging.enabled"
+          size="small"
+          :loading="debugLogging.loading"
+          @change="onDebugToggle"
+        />
+      </div>
+      <el-pagination
+        layout="total, sizes, prev, pager, next"
+        :total="total"
+        :page-size="size"
+        :current-page="page"
+        :page-sizes="[20, 50, 100, 200]"
+        @current-change="(p) => { page = p; load() }"
+        @size-change="(s) => { size = s; page = 1; load() }"
+      />
+    </div>
   </el-card>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { listLogs } from '../api'
+import { listLogs, me } from '../api'
+import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
 
 const router = useRouter()
 const logs = ref([])
@@ -107,6 +118,16 @@ const page = ref(1)
 const size = ref(20)
 // Window in hours; 0 = all time. Default 1h to match the backend default.
 const range = ref(1)
+// The debug switch is admin-only server-side; regular users don't see it.
+const isAdmin = ref(false)
+
+async function onDebugToggle(v) {
+  try {
+    await toggleDebugLogging(v)
+  } catch (_) {
+    // Reverted in the shared state; the interceptor surfaces the 403.
+  }
+}
 
 // Switching the window invalidates the current page number — page 4 of the
 // old window is meaningless in the new one.
@@ -152,7 +173,15 @@ function open(row) {
   router.push(`/logs/${row.id}`)
 }
 
-onMounted(load)
+onMounted(async () => {
+  try {
+    isAdmin.value = !!(await me()).is_admin
+  } catch (_) {
+    // interceptor handles the redirect on 401
+  }
+  if (isAdmin.value) loadDebugLogging()
+  load()
+})
 </script>
 
 <style scoped>
@@ -205,6 +234,27 @@ onMounted(load)
 }
 .num {
   font-variant-numeric: tabular-nums;
+}
+/* Switch sits immediately before el-pagination's own "Total N" slot — the
+   pagination component renders its summary inline, so the two share a row.
+   `space-between` pins the debug toggle to the left edge and pushes the
+   pagination to the right. */
+.pager-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.debug-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.debug-label {
+  font-size: 12px;
+  color: #909399;
 }
 :deep(.el-table__row) {
   cursor: pointer;

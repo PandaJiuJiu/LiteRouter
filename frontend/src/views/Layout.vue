@@ -1,8 +1,11 @@
 <template>
   <el-container style="height: 100vh">
-    <el-aside width="200px" style="border-right: 1px solid #e4e7ed">
+    <el-aside
+      width="200px"
+      style="border-right: 1px solid #e4e7ed; display: flex; flex-direction: column"
+    >
       <div class="logo"><img src="/logo-wordmark.svg" alt="LiteRouter" /></div>
-      <el-menu :default-active="$route.path" router>
+      <el-menu :default-active="$route.path" router class="menu">
         <el-menu-item v-if="isAdmin" index="/channels">渠道管理</el-menu-item>
         <el-menu-item index="/tokens">令牌管理</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/mappings">模型路由</el-menu-item>
@@ -10,82 +13,44 @@
         <el-menu-item index="/logs">调用日志</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/users">用户管理</el-menu-item>
       </el-menu>
-      <div class="user-box">
-        <div class="user-name" :title="username">
-          {{ username }}<span v-if="isAdmin" class="admin-tag">admin</span>
-        </div>
-        <div v-if="isAdmin" class="debug-toggle">
-          <span class="debug-label">调试日志</span>
-          <el-switch v-model="debugLogging" size="small" @change="toggleDebug" :loading="debugLoading" />
-        </div>
-        <div class="user-actions">
-          <el-button text size="small" @click="openPwd">改密</el-button>
-          <el-button text size="small" type="danger" @click="doLogout">登出</el-button>
-        </div>
+      <div class="user-wrap">
+        <el-dropdown trigger="click" placement="top-end" @command="onUserCommand">
+          <div class="user-box" :title="username">
+            <el-avatar :size="28" class="avatar">{{ initial }}</el-avatar>
+            <span class="user-name">{{ username }}</span>
+            <el-icon class="chev"><ArrowRight /></el-icon>
+          </div>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item disabled>
+                <span class="dd-user">{{ username }}</span>
+                <el-tag v-if="isAdmin" size="small" type="success" effect="plain">admin</el-tag>
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" divided>
+                <el-icon><SwitchButton /></el-icon>退出登录
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </el-aside>
     <el-main style="background: #f5f7fa">
       <router-view />
     </el-main>
-
-    <!-- 修改自己密码 -->
-    <el-dialog v-model="pwdVisible" title="修改密码" width="420px">
-      <el-form :model="pwdForm" label-width="100px">
-        <el-form-item label="当前密码">
-          <el-input v-model="pwdForm.old" type="password" show-password
-            autocomplete="current-password" />
-        </el-form-item>
-        <el-form-item label="新密码">
-          <el-input v-model="pwdForm.new" type="password" show-password
-            placeholder="至少 8 位" autocomplete="new-password" />
-        </el-form-item>
-        <el-form-item label="确认新密码">
-          <el-input v-model="pwdForm.confirm" type="password" show-password
-            autocomplete="new-password" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="pwdVisible = false">取消</el-button>
-        <el-button type="primary" :loading="pwdSaving" @click="submitPwd">保存</el-button>
-      </template>
-    </el-dialog>
   </el-container>
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { changePassword, logout, me, getDebugLogging, setDebugLogging } from '../api'
+import { ArrowRight, SwitchButton } from '@element-plus/icons-vue'
+import { logout, me } from '../api'
 
 const router = useRouter()
 const username = ref('')
 const isAdmin = ref(false)
 
-const pwdVisible = ref(false)
-const pwdSaving = ref(false)
-const pwdForm = reactive({ old: '', new: '', confirm: '' })
-
-const debugLogging = ref(false)
-const debugLoading = ref(false)
-
-async function loadDebug() {
-  if (!isAdmin.value) return
-  try {
-    debugLogging.value = await getDebugLogging()
-  } catch (_) {}
-}
-
-async function toggleDebug(v) {
-  debugLoading.value = true
-  try {
-    await setDebugLogging(v)
-  } catch (_) {
-    debugLogging.value = !v // revert on error
-  } finally {
-    debugLoading.value = false
-  }
-}
+const initial = computed(() => (username.value || '?').charAt(0).toUpperCase())
 
 async function loadMe() {
   try {
@@ -97,34 +62,8 @@ async function loadMe() {
   }
 }
 
-function openPwd() {
-  pwdForm.old = ''
-  pwdForm.new = ''
-  pwdForm.confirm = ''
-  pwdVisible.value = true
-}
-
-async function submitPwd() {
-  if (!pwdForm.old) {
-    ElMessage.warning('请输入当前密码')
-    return
-  }
-  if (pwdForm.new.length < 8) {
-    ElMessage.warning('新密码至少 8 位')
-    return
-  }
-  if (pwdForm.new !== pwdForm.confirm) {
-    ElMessage.warning('两次新密码不一致')
-    return
-  }
-  pwdSaving.value = true
-  try {
-    await changePassword(pwdForm.old, pwdForm.new)
-    ElMessage.success('密码已更新')
-    pwdVisible.value = false
-  } finally {
-    pwdSaving.value = false
-  }
+function onUserCommand(cmd) {
+  if (cmd === 'logout') return doLogout()
 }
 
 async function doLogout() {
@@ -132,7 +71,7 @@ async function doLogout() {
   router.push('/login')
 }
 
-onMounted(() => { loadMe(); loadDebug(); })
+onMounted(loadMe)
 </script>
 
 <style scoped>
@@ -146,42 +85,67 @@ onMounted(() => { loadMe(); loadDebug(); })
   height: auto;
   max-width: 168px;
 }
+/* Menu takes the slack so the user bubble always pins to the bottom of the
+   flex column. */
+.menu {
+  flex: 1;
+  min-height: 0;
+}
+/* Flat row pinned to the bottom of the sidebar — styled as a peer of the
+   el-menu items above so it reads as part of the list, not a separate widget.
+   A top rule separates it from the menu. */
+.user-wrap {
+  border-top: 1px solid #f1f5f9;
+}
+/* el-dropdown defaults to inline-block so it shrinks to fit its content;
+   force it full-width so .user-box fills the sidebar like the menu items. */
+:deep(.el-dropdown) {
+  display: block;
+}
 .user-box {
-  position: absolute;
-  bottom: 16px;
-  left: 16px;
-  right: 16px;
-  border-top: 1px solid #e4e7ed;
-  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  color: #303133;
+  font-size: 14px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.user-box:hover {
+  background: #f5f7fa;
+}
+.avatar {
+  flex: none;
+  background: #dbe4f0;
+  color: #3d5a80;
+  font-size: 14px;
 }
 .user-name {
-  font-size: 13px;
-  color: #303133;
-  margin-bottom: 4px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.admin-tag {
-  background: #f0f9eb;
-  color: #67c23a;
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 8px;
-}
-.user-actions {
-  display: flex;
-  gap: 4px;
-}
-.debug-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-  padding: 4px 0;
-}
-.debug-label {
-  font-size: 12px;
+.chev {
+  flex: none;
+  margin-left: auto;
+  transform: rotate(-90deg);
   color: #909399;
+  font-size: 12px;
+}
+/* Active menu item renders as a full-width horizontal bar instead of the
+   default left-side indicator — easier to scan the sidebar. */
+:deep(.el-menu-item.is-active) {
+  background: #ecf5ff;
+  color: #409eff;
+}
+:deep(.el-menu-item.is-active::before) {
+  background-color: transparent;
+}
+.dd-user {
+  margin-right: 6px;
 }
 </style>
