@@ -137,6 +137,14 @@ pub struct TestModelReq {
     pub model: String,
 }
 
+/// Body for `POST /api/channels/:id/models` — set the channel's `models`
+/// list without touching any other column. Used by the models-management
+/// page so it never accidentally clobbers website / base_url / api_key.
+#[derive(Deserialize)]
+pub struct UpdateChannelModelsReq {
+    pub models: String,
+}
+
 pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -218,6 +226,26 @@ pub async fn delete_channel(
 ) -> Result<Json<Value>, StatusCode> {
     require_admin(&state, &headers)?;
     sqlx::query("DELETE FROM channels WHERE id=?")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /api/channels/:id/models — set the models list on a single channel
+/// without touching any other column. The full-PUT `update_channel` makes
+/// it too easy for the models page to clobber website / base_url / api_key
+/// when it only meant to flip a model switch.
+pub async fn update_channel_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateChannelModelsReq>,
+) -> Result<Json<Value>, StatusCode> {
+    require_admin(&state, &headers)?;
+    sqlx::query("UPDATE channels SET models=? WHERE id=?")
+        .bind(&req.models)
         .bind(id)
         .execute(&state.pool)
         .await

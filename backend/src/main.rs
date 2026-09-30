@@ -74,6 +74,10 @@ async fn main() {
             "/api/channels/:id",
             axum::routing::put(admin::update_channel).delete(admin::delete_channel),
         )
+        .route(
+            "/api/channels/:id/models",
+            post(admin::update_channel_models),
+        )
         .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
         .route(
             "/api/tokens/:id",

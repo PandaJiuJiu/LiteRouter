@@ -86,6 +86,36 @@
         <el-button type="primary" @click="saveManual">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 选择要添加的模型 -->
+    <el-dialog v-model="selectVisible"
+      :title="`选择要添加到「${selectTarget?.name || ''}」的模型`"
+      width="560px" top="6vh" @closed="onSelectClosed">
+      <div class="select-toolbar">
+        <span class="hint">已选 {{ selectedArr.length }} / {{ fetchedList.length }}</span>
+        <div>
+          <el-button size="small" @click="selectAll">全选</el-button>
+          <el-button size="small" @click="selectNone">全不选</el-button>
+          <el-button size="small" @click="selectInverse">反选</el-button>
+        </div>
+      </div>
+      <el-input v-model="selectFilter" placeholder="过滤模型名（不区分大小写）"
+        clearable class="select-filter" />
+      <div class="select-list">
+        <el-checkbox-group v-model="selectedArr">
+          <el-checkbox v-for="m in filteredList" :key="m" :value="m" class="select-row">
+            <span class="select-name">{{ m }}</span>
+          </el-checkbox>
+        </el-checkbox-group>
+        <el-empty v-if="!filteredList.length" description="无匹配模型" :image-size="60" />
+      </div>
+      <template #footer>
+        <el-button @click="selectVisible = false">取消</el-button>
+        <el-button type="primary" :loading="selectSaving" @click="confirmSelect">
+          添加到渠道
+        </el-button>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
@@ -94,7 +124,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { CircleCheckFilled, CircleCloseFilled, Refresh } from '@element-plus/icons-vue'
-import { listChannels, updateChannel, fetchModels, testModel } from '../api'
+import { listChannels, updateChannelModels, fetchModels, testModel } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -117,6 +147,20 @@ const known = reactive({})
 const manualVisible = ref(false)
 const manualInput = ref('')
 const manualTarget = ref(null)
+
+// "选择要添加的模型" 对话框状态
+const selectVisible = ref(false)
+const selectTarget = ref(null)
+const fetchedList = ref([])
+const selectedArr = ref([])
+const selectFilter = ref('')
+const selectSaving = ref(false)
+
+const filteredList = computed(() => {
+  const f = selectFilter.value.trim().toLowerCase()
+  if (!f) return fetchedList.value
+  return fetchedList.value.filter((m) => m.toLowerCase().includes(f))
+})
 
 function ensureKnown(chId) {
   if (!known[chId]) known[chId] = []
@@ -149,17 +193,6 @@ function isSelected(ch, m) {
   return splitModels(ch.models).includes(m)
 }
 
-function savePayload(ch, models) {
-  return {
-    name: ch.name,
-    base_url: ch.base_url,
-    base_url_anthropic: ch.base_url_anthropic || '',
-    api_key: ch.api_key,
-    enabled: !!ch.enabled,
-    models,
-  }
-}
-
 async function load() {
   loading.value = true
   try {
@@ -184,14 +217,89 @@ async function fetchList(ch) {
       ElMessage.warning('上游未返回任何模型')
       return
     }
-    const added = rememberModels(ch.id, models)
-    ElMessage.success(
-      added > 0
-        ? `获取到 ${models.length} 个模型，新增 ${added} 个`
-        : `获取到 ${models.length} 个模型（无新增）`,
-    )
+    // 去重 + 排序，让列表更易扫
+    const unique = [...new Set(models)].sort()
+    // 默认勾选 = 当前渠道已配置的 ∩ 这次拉到的
+    const existing = new Set(splitModels(ch.models))
+    selectTarget.value = ch
+    fetchedList.value = unique
+    selectedArr.value = unique.filter((m) => existing.has(m))
+    selectFilter.value = ''
+    selectVisible.value = true
   } finally {
     ch._fetching = false
+  }
+}
+
+function selectAll() {
+  // 在当前过滤范围内追加，避免覆盖已勾选但被过滤掉的项
+  const set = new Set(selectedArr.value)
+  for (const m of filteredList.value) set.add(m)
+  selectedArr.value = [...set]
+}
+
+function selectNone() {
+  // 仅清掉当前过滤范围内已勾选的，保留被过滤掉的项
+  const filtered = new Set(filteredList.value)
+  selectedArr.value = selectedArr.value.filter((m) => !filtered.has(m))
+}
+
+function selectInverse() {
+  const filtered = new Set(filteredList.value)
+  const current = new Set(selectedArr.value)
+  const next = new Set()
+  // 未在过滤范围内的保持原样
+  for (const m of current) if (!filtered.has(m)) next.add(m)
+  // 过滤范围内反选
+  for (const m of filtered) if (!current.has(m)) next.add(m)
+  selectedArr.value = [...next]
+}
+
+function onSelectClosed() {
+  // 关闭后清掉临时状态，避免下次打开残留
+  fetchedList.value = []
+  selectedArr.value = []
+  selectFilter.value = ''
+  selectTarget.value = null
+}
+
+async function confirmSelect() {
+  const ch = selectTarget.value
+  if (!ch) {
+    selectVisible.value = false
+    return
+  }
+  // 拍下旧值快照，后面要算"新增多少"
+  const oldModels = splitModels(ch.models)
+  const merged = [...new Set([...oldModels, ...selectedArr.value])]
+  const newModels = merged.join(',')
+  // 没变化就不写库，但弹个提示让用户知道发生了什么
+  if (newModels === ch.models) {
+    selectVisible.value = false
+    ElMessage.info('没有变化，未保存')
+    return
+  }
+  selectSaving.value = true
+  try {
+    await updateChannelModels(ch.id, newModels)
+    ch.models = newModels
+    // 只把"真正要在这个渠道里"的模型加入 known——上游拉到的全部模型只
+    // 是候选，未勾选的就不该出现卡片，否则刷新后也没了。
+    // rememberModels 自身去重，selectedArr 里已存在的旧模型是 no-op。
+    rememberModels(ch.id, selectedArr.value)
+    const oldSet = new Set(oldModels)
+    const added = selectedArr.value.filter((m) => !oldSet.has(m)).length
+    ElMessage.success(
+      added > 0
+        ? `已添加 ${added} 个模型到「${ch.name}」`
+        : `「${ch.name}」模型列表已更新`,
+    )
+    selectVisible.value = false
+  } catch (e) {
+    const detail = e?.response?.data?.message || e.message || '未知错误'
+    ElMessage.error(`保存失败：${detail}`)
+  } finally {
+    selectSaving.value = false
   }
 }
 
@@ -203,7 +311,7 @@ async function toggleModel(ch, m, enabled) {
   if (newModels === ch.models) return
   ch._togglingModel = m
   try {
-    await updateChannel(ch.id, savePayload(ch, newModels))
+    await updateChannelModels(ch.id, newModels)
     ch.models = newModels
   } catch (e) {
     ElMessage.error(`更新 ${m} 失败`)
@@ -288,7 +396,7 @@ async function saveManual() {
     return
   }
   const models = [...new Set([...splitModels(ch.models), ...adds])].join(',')
-  await updateChannel(ch.id, savePayload(ch, models))
+  await updateChannelModels(ch.id, models)
   ch.models = models
   rememberModels(ch.id, adds)
   manualVisible.value = false
@@ -417,5 +525,33 @@ onMounted(load)
 .hint {
   color: #909399;
   font-size: 12px;
+}
+.select-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.select-filter {
+  margin-bottom: 10px;
+}
+.select-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: #fafafa;
+}
+.select-row {
+  display: flex;
+  width: 100%;
+  margin: 0 !important;
+  padding: 4px 0;
+  word-break: break-all;
+}
+.select-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
 }
 </style>

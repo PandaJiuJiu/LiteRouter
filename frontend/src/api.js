@@ -72,6 +72,11 @@ export const fetchModels = (c) =>
   api.post('/channels/fetch-models', c).then((r) => r.data)
 export const testModel = (c) =>
   api.post('/channels/test-model', c).then((r) => r.data)
+// Set the channel's models list without touching any other column.
+// Use this from the models-management page so website / base_url /
+// api_key can't be clobbered by mistake.
+export const updateChannelModels = (id, models) =>
+  api.post(`/channels/${id}/models`, { models })
 
 // ---------- tokens ----------
 export const listTokens = () => api.get('/tokens').then((r) => r.data.tokens)
