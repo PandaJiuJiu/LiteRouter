@@ -64,6 +64,7 @@ async fn main() {
             axum::routing::put(admin::toggle_token).delete(admin::delete_token),
         )
         .route("/api/logs", get(admin::list_logs))
+        .route("/api/logs/:id", get(admin::get_log))
         .route("/api/usage", get(admin::usage))
         .route(
             "/api/mappings",

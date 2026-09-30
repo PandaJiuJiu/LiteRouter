@@ -4,25 +4,20 @@
       <span>调用日志</span>
       <el-button @click="load">刷新</el-button>
     </div>
-    <el-table :data="logs" v-loading="loading">
+    <el-table :data="logs" v-loading="loading" @row-click="open">
       <el-table-column label="请求时间" min-width="180">
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
       <el-table-column prop="token_name" label="令牌" width="160" />
-      <el-table-column prop="request_model" label="请求模型" width="180">
+      <el-table-column label="模型" min-width="280">
         <template #default="{ row }">
-          <span v-if="row.request_model">{{ row.request_model }}</span>
-          <span v-else class="hint">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="上游模型" min-width="280">
-        <template #default="{ row }">
-          <span v-if="row.model" :title="row.token_name">
-            {{ row.channel_name }}<span class="hint">：</span>{{ row.model }}
+          <span v-if="row.request_model && row.request_model !== row.model">
+            {{ row.request_model }}<span class="hint">→</span>{{ row.model }}
           </span>
-          <span v-else class="hint">—</span>
+          <span v-else>{{ row.model }}</span>
+          <span class="hint">（{{ row.channel_name }}）</span>
         </template>
       </el-table-column>
       <el-table-column label="状态码" width="90">
@@ -32,13 +27,15 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="Tokens" width="170">
+      <el-table-column label="Tokens" width="110" prop="total_tokens">
         <template #default="{ row }">
-          <span v-if="row.total_tokens > 0" :title="`Prompt ${row.prompt_tokens} / Completion ${row.completion_tokens}`">
-            {{ fmt(row.prompt_tokens) }} + {{ fmt(row.completion_tokens) }}
-            <span class="hint">= {{ fmt(row.total_tokens) }}</span>
-          </span>
+          <span v-if="row.total_tokens > 0" class="num">{{ fmt(row.total_tokens) }}</span>
           <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="" width="50">
+        <template #default>
+          <span class="chev">›</span>
         </template>
       </el-table-column>
     </el-table>
@@ -50,8 +47,10 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { listLogs } from '../api'
 
+const router = useRouter()
 const logs = ref([])
 const loading = ref(false)
 const page = ref(1)
@@ -70,6 +69,10 @@ function fmt(n) {
   return Number(n || 0).toLocaleString()
 }
 
+function open(row) {
+  router.push(`/logs/${row.id}`)
+}
+
 onMounted(load)
 </script>
 
@@ -85,5 +88,16 @@ onMounted(load)
 .hint {
   color: #909399;
   font-size: 12px;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+:deep(.el-table__row) {
+  cursor: pointer;
+}
+.chev {
+  color: #c0c4cc;
+  font-size: 18px;
+  line-height: 1;
 }
 </style>

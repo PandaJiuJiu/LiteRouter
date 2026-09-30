@@ -796,6 +796,12 @@ pub async fn list_logs(
                 "request_model": r.get::<String, _>("request_model"),
                 "channel_name": r.get::<String, _>("channel_name"),
                 "status_code": r.get::<i64, _>("status_code"),
+                "id": r.get::<i64, _>("id"),
+                "token_name": r.get::<String, _>("token_name"),
+                "model": r.get::<String, _>("model"),
+                "request_model": r.get::<String, _>("request_model"),
+                "channel_name": r.get::<String, _>("channel_name"),
+                "status_code": r.get::<i64, _>("status_code"),
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "total_tokens": r.get::<i64, _>("total_tokens"),
@@ -804,6 +810,58 @@ pub async fn list_logs(
         })
         .collect();
     Ok(Json(json!({ "logs": logs })))
+}
+
+/// GET /api/logs/:id — full metadata for a single request, used by the
+/// log detail page. Same user-scoping as `list_logs`: non-admins can only
+/// see logs against tokens they own.
+pub async fn get_log(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, StatusCode> {
+    let user = check_auth(&state, &headers)?;
+    let row = sqlx::query("SELECT * FROM logs WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // Non-admins can only inspect logs for tokens they own.
+    if !user.is_admin {
+        let owner = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE((SELECT user_id FROM tokens WHERE name = ?), 0)",
+        )
+        .bind(row.get::<String, _>("token_name"))
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if owner != user.id {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    Ok(Json(json!({
+        "log": {
+            "id": row.get::<i64, _>("id"),
+            "token_name": row.get::<String, _>("token_name"),
+            "channel_name": row.get::<String, _>("channel_name"),
+            "status_code": row.get::<i64, _>("status_code"),
+            "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
+            "completion_tokens": row.get::<i64, _>("completion_tokens"),
+            "total_tokens": row.get::<i64, _>("total_tokens"),
+            "cache_read_tokens": row.get::<i64, _>("cache_read_tokens"),
+            "cache_creation_tokens": row.get::<i64, _>("cache_creation_tokens"),
+            "reasoning_tokens": row.get::<i64, _>("reasoning_tokens"),
+            "request_model": row.get::<String, _>("request_model"),
+            "upstream_model": row.get::<String, _>("upstream_model"),
+            "latency_ms": row.get::<i64, _>("latency_ms"),
+            "stream": row.get::<i64, _>("stream") != 0,
+            "protocol": row.get::<String, _>("protocol"),
+            "convert": row.get::<String, _>("convert"),
+            "error": row.get::<String, _>("error"),
+            "created_at": row.get::<i64, _>("created_at"),
+        }
+    })))
 }
 
 /// GET /api/usage?range=7d — aggregated token usage & request counts,

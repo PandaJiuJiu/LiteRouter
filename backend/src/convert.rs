@@ -516,6 +516,81 @@ pub fn anthropic_err_to_openai(body: &Value) -> Value {
 
 // =========================== streaming ===========================
 
+/// Full token breakdown for one request. `prompt`/`completion`/`total` are
+/// the headline numbers; the rest are the sub-counters that explain them.
+/// Field names differ per provider (`prompt_tokens` vs `input_tokens`), so
+/// the parsers below accept either spelling and the sub-counters simply
+/// read 0 on the provider that doesn't report them.
+#[derive(Default, Clone, Copy)]
+pub struct Usage {
+    pub prompt: i64,
+    pub completion: i64,
+    pub total: i64,
+    /// Anthropic: prompt tokens served from the prompt cache (billed cheap).
+    pub cache_read: i64,
+    /// Anthropic: prompt tokens written into the cache (billed a premium).
+    pub cache_creation: i64,
+    /// OpenAI: reasoning tokens, a subset of `completion`.
+    pub reasoning: i64,
+}
+
+impl Usage {
+    /// True when nothing billable was reported.
+    pub fn is_empty(&self) -> bool {
+        self.prompt == 0 && self.completion == 0
+    }
+}
+
+/// Read a token count out of a `usage` object, trying each name in order.
+fn usage_field(u: &Value, names: &[&str]) -> i64 {
+    names
+        .iter()
+        .find_map(|n| u.get(*n).and_then(|x| x.as_i64()))
+        .unwrap_or(0)
+}
+
+/// Build a `Usage` from an upstream `usage` object, accepting both the
+/// OpenAI and Anthropic spellings for the shared fields.
+pub fn parse_usage_obj(u: &Value) -> Usage {
+    let prompt = usage_field(u, &["prompt_tokens", "input_tokens"]);
+    let completion = usage_field(u, &["completion_tokens", "output_tokens"]);
+    // OpenAI nests it under completion_tokens_details; Anthropic reports no
+    // equivalent on the response object.
+    let reasoning = u
+        .get("completion_tokens_details")
+        .map(|d| usage_field(d, &["reasoning_tokens"]))
+        .unwrap_or(0);
+    // Trust the upstream's total when present, but never let it come out
+    // below the parts we summed ourselves.
+    let total = usage_field(u, &["total_tokens"]).max(prompt + completion);
+    Usage {
+        prompt,
+        completion,
+        total,
+        cache_read: usage_field(u, &["cache_read_input_tokens"]),
+        cache_creation: usage_field(u, &["cache_creation_input_tokens"]),
+        reasoning,
+    }
+}
+
+/// Pull the token breakdown out of one SSE `data:` payload. Accepts both
+/// the OpenAI shape (`{usage:{prompt_tokens}}`) and the Anthropic shape,
+/// which spreads it across two events: `message_start` nests it under
+/// `message.usage`, `message_delta` puts it at the top level. Returns None
+/// for payloads without a usage block — the caller overwrites on each hit,
+/// so the last event carrying usage wins (it has the final output count).
+pub fn usage_from_sse_payload(payload: &str) -> Option<Usage> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let u = v
+        .get("usage")
+        .or_else(|| v.get("message").and_then(|m| m.get("usage")))?;
+    let parsed = parse_usage_obj(u);
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(parsed)
+}
+
 /// One streaming converter: feed it `data:` payloads from the upstream SSE
 /// (the payload only, without the `data: ` prefix), receive complete
 /// client-protocol SSE event blocks (each ending in a blank line).
@@ -523,10 +598,10 @@ pub trait SseConverter: Send {
     fn on_data(&mut self, payload: &str) -> Vec<String>;
     /// Emit any remaining events when the upstream stream ends.
     fn finish(&mut self) -> Vec<String>;
-    /// Final (prompt, completion) token counts the converter captured from
-    /// upstream chunks. None means no usage was reported in the stream — the
-    /// log row will record 0 tokens in that case.
-    fn usage(&self) -> Option<(i64, i64)> { None }
+    /// Final token breakdown the converter captured from upstream chunks.
+    /// None means no usage was reported in the stream — the log row will
+    /// record 0 tokens in that case.
+    fn usage(&self) -> Option<Usage> { None }
 }
 
 fn sse_event(name: &str, data: &Value) -> String {
@@ -553,7 +628,9 @@ pub struct OpenAiToAnthropicStream {
     /// per OpenAI tool-call index: (block index, started, name)
     tools: Vec<Option<(usize, bool, String)>>,
     finish_reason: Option<String>,
-    usage: (i64, i64), // (input, output) seen so far
+    /// Latest usage block seen upstream. OpenAI streams it once, in the
+    /// final chunk when the caller asked for `stream_options.include_usage`.
+    usage: Usage,
     id: String,
 }
 
@@ -566,7 +643,7 @@ impl OpenAiToAnthropicStream {
             text_block: None,
             tools: Vec::new(),
             finish_reason: None,
-            usage: (0, 0),
+            usage: Usage::default(),
             id: format!("stream-{}", crate::db::now()),
         }
     }
@@ -598,12 +675,10 @@ impl SseConverter for OpenAiToAnthropicStream {
             ));
         }
         // capture usage if the upstream includes it (final chunks often do)
-        if let Some(u) = v.get("usage").and_then(|u| u.as_object()) {
-            if let Some(p) = u.get("prompt_tokens").and_then(|x| x.as_i64()) {
-                self.usage.0 = p;
-            }
-            if let Some(c) = u.get("completion_tokens").and_then(|x| x.as_i64()) {
-                self.usage.1 = c;
+        if let Some(u) = v.get("usage") {
+            let parsed = parse_usage_obj(u);
+            if !parsed.is_empty() {
+                self.usage = parsed;
             }
         }
         let choice = match v.get("choices").and_then(|c| c.get(0)) {
@@ -747,21 +822,18 @@ impl SseConverter for OpenAiToAnthropicStream {
             &json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": reason, "stop_sequence": Value::Null },
-                "usage": { "input_tokens": self.usage.0, "output_tokens": self.usage.1 }
+                "usage": { "input_tokens": self.usage.prompt, "output_tokens": self.usage.completion }
             }),
         ));
         out.push(sse_event("message_stop", &json!({ "type": "message_stop" })));
         out
     }
 
-    fn usage(&self) -> Option<(i64, i64)> {
-        // OpenAI's chunk.usage uses prompt_tokens / completion_tokens. We've
-        // been storing them as-is into self.usage, so we can just return it
-        // whenever any non-zero count was observed.
-        if self.usage.0 > 0 || self.usage.1 > 0 {
-            Some(self.usage)
-        } else {
+    fn usage(&self) -> Option<Usage> {
+        if self.usage.is_empty() {
             None
+        } else {
+            Some(self.usage)
         }
     }
 }
@@ -773,7 +845,10 @@ pub struct AnthropicToOpenAiStream {
     id: String,
     tool_count: usize, // number of tool_use blocks seen -> openai tool index
     finish_reason: Option<String>,
-    usage: (i64, i64), // (input, output)
+    /// Accumulated usage. Anthropic streams it in two places: `message_start`
+    /// carries the input counts, `message_delta` the final output count, so
+    /// each update only overwrites the fields it actually reports.
+    usage: Usage,
 }
 
 impl AnthropicToOpenAiStream {
@@ -784,7 +859,7 @@ impl AnthropicToOpenAiStream {
             id: format!("stream-{}", crate::db::now()),
             tool_count: 0,
             finish_reason: None,
-            usage: (0, 0),
+            usage: Usage::default(),
         }
     }
 }
@@ -804,6 +879,20 @@ impl SseConverter for AnthropicToOpenAiStream {
                     .and_then(|i| i.as_str())
                 {
                     self.id = id.strip_prefix("msg_").unwrap_or(id).to_string();
+                }
+                // message_start is the only place the input counts appear;
+                // message_delta only carries the final output count.
+                if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
+                    let parsed = parse_usage_obj(u);
+                    if parsed.prompt > 0 {
+                        self.usage.prompt = parsed.prompt;
+                    }
+                    if parsed.cache_read > 0 {
+                        self.usage.cache_read = parsed.cache_read;
+                    }
+                    if parsed.cache_creation > 0 {
+                        self.usage.cache_creation = parsed.cache_creation;
+                    }
                 }
                 out.push(openai_chunk(
                     &self.id,
@@ -872,11 +961,12 @@ impl SseConverter for AnthropicToOpenAiStream {
                     self.finish_reason = Some(r.to_string());
                 }
                 if let Some(u) = v.get("usage") {
-                    if let Some(i) = u.get("input_tokens").and_then(|x| x.as_i64()) {
-                        self.usage.0 = i;
+                    let parsed = parse_usage_obj(u);
+                    if parsed.completion > 0 {
+                        self.usage.completion = parsed.completion;
                     }
-                    if let Some(o) = u.get("output_tokens").and_then(|x| x.as_i64()) {
-                        self.usage.1 = o;
+                    if parsed.prompt > 0 {
+                        self.usage.prompt = parsed.prompt;
                     }
                 }
             }
@@ -908,9 +998,9 @@ impl SseConverter for AnthropicToOpenAiStream {
                 "model": self.model,
                 "choices": [],
                 "usage": {
-                    "prompt_tokens": self.usage.0,
-                    "completion_tokens": self.usage.1,
-                    "total_tokens": self.usage.0 + self.usage.1
+                    "prompt_tokens": self.usage.prompt,
+                    "completion_tokens": self.usage.completion,
+                    "total_tokens": self.usage.total
                 }
             })
         ));
@@ -918,13 +1008,11 @@ impl SseConverter for AnthropicToOpenAiStream {
         out
     }
 
-    fn usage(&self) -> Option<(i64, i64)> {
-        // Anthropic SSE reports input_tokens / output_tokens. We copy them
-        // straight into self.usage, so return as-is when any non-zero.
-        if self.usage.0 > 0 || self.usage.1 > 0 {
-            Some(self.usage)
-        } else {
+    fn usage(&self) -> Option<Usage> {
+        if self.usage.is_empty() {
             None
+        } else {
+            Some(self.usage)
         }
     }
 }

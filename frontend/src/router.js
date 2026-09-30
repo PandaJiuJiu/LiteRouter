@@ -15,6 +15,7 @@ const routes = [
       { path: 'tokens', component: () => import('./views/Tokens.vue') },
       { path: 'mappings', component: () => import('./views/Mappings.vue') },
       { path: 'logs', component: () => import('./views/Logs.vue') },
+      { path: 'logs/:id', component: () => import('./views/LogDetail.vue') },
       { path: 'users', component: () => import('./views/Users.vue') },
     ],
   },

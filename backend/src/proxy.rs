@@ -23,6 +23,7 @@ use futures_util::stream;
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     // OpenAI clients: "Authorization: Bearer sk-..."
@@ -267,51 +268,90 @@ async fn pinned_channel(
     })
 }
 
-async fn log_request(
-    pool: &sqlx::SqlitePool,
-    _http: &reqwest::Client,
-    token_name: &str,
-    request_model: &str,
-    model: &str,
-    channel_name: &str,
+/// Everything we know about one relayed request, collected as the request
+/// travels through the pipeline and written to `logs` once it settles.
+/// Deliberately excludes the prompt and the reply text — this is metadata
+/// only (routing, timing, token breakdown), so nothing user-authored lands
+/// in the DB.
+struct LogEntry<'a> {
+    token_name: &'a str,
+    /// The model the client asked for.
+    request_model: &'a str,
+    /// The model actually sent upstream, after mappings rewriting.
+    upstream_model: &'a str,
+    channel_name: &'a str,
     status: i64,
-    usage: Option<(i64, i64, i64)>,
-) {
-    let (p, c, t) = usage.unwrap_or((0, 0, 0));
+    protocol: &'a str,
+    convert: ConvertMode,
+    streaming: bool,
+    latency_ms: i64,
+    error: &'a str,
+    usage: Option<convert::Usage>,
+}
+
+async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry<'_>) {
+    let u = e.usage.unwrap_or_default();
     let _ = sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(token_name)
-    .bind(model)
-    .bind(channel_name)
-    .bind(status)
-    .bind(p)
-    .bind(c)
-    .bind(t)
+    .bind(e.token_name)
+    .bind(e.upstream_model)
+    .bind(e.channel_name)
+    .bind(e.status)
+    .bind(u.prompt)
+    .bind(u.completion)
+    .bind(u.total)
     .bind(now())
-    .bind(request_model)
+    .bind(e.request_model)
+    .bind(e.latency_ms)
+    .bind(e.streaming as i64)
+    .bind(e.protocol)
+    .bind(convert_label(e.convert))
+    .bind(e.upstream_model)
+    .bind(&e.error)
+    .bind(u.cache_read)
+    .bind(u.cache_creation)
+    .bind(u.reasoning)
     .execute(pool)
     .await;
 }
 
-/// Extract (prompt, completion, total) token counts from an upstream JSON body.
-/// Supports OpenAI ({prompt_tokens, completion_tokens, total_tokens}) and
-/// Anthropic ({input_tokens, output_tokens}) shapes.
-fn parse_usage(body: &[u8]) -> Option<(i64, i64, i64)> {
+fn convert_label(mode: ConvertMode) -> &'static str {
+    match mode {
+        ConvertMode::None => "none",
+        ConvertMode::ToOpenAI => "to_openai",
+        ConvertMode::ToAnthropic => "to_anthropic",
+    }
+}
+
+/// Same as `log_request` but takes an owned `OwnedLogEntry`. Used by the
+/// failover loop, where the row needs to live across an `await` and may
+/// not borrow from the relay loop.
+async fn log_request_owned(pool: &sqlx::SqlitePool, o: &OwnedLogEntry, usage: Option<convert::Usage>) {
+    let e = LogEntry {
+        token_name: &o.token_name,
+        request_model: &o.request_model,
+        upstream_model: &o.upstream_model,
+        channel_name: &o.channel_name,
+        status: o.status,
+        protocol: &o.protocol,
+        convert: o.convert,
+        streaming: o.streaming,
+        latency_ms: o.latency_ms,
+        error: &o.error,
+        usage,
+    };
+    log_request(pool, &e).await;
+}
+
+/// Extract the token breakdown from an upstream JSON body (non-streaming).
+fn parse_usage(body: &[u8]) -> Option<convert::Usage> {
     let v: Value = serde_json::from_slice(body).ok()?;
-    let u = v.get("usage")?;
-    let prompt = u.get("prompt_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    let completion = u.get("completion_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    // Anthropic uses input_tokens/output_tokens
-    let input = u.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    let output = u.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
-    let p = if prompt > 0 { prompt } else { input };
-    let c = if completion > 0 { completion } else { output };
-    if p == 0 && c == 0 {
+    let u = convert::parse_usage_obj(v.get("usage")?);
+    if u.is_empty() {
         return None;
     }
-    let t = u.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(p + c);
-    Some((p, c, t))
+    Some(u)
 }
 
 fn error_response(status: StatusCode, message: &str, retry_after: Option<&str>) -> Response {
@@ -373,35 +413,50 @@ fn build_request(
 /// drop-cancels-upstream mechanism: when the client disconnects, axum drops
 /// the body, which drops the stream, which drops `resp`, which cancels the
 /// upstream connection.
-/// Bundles everything needed to write the final log row once the stream ends.
+/// Owns everything needed to write the final log row once the stream ends.
 /// The stream closure captures one of these by value; when the upstream body
 /// exhausts, the closure spawns a tokio task that calls `log_request` with
 /// the captured usage. This lets the response body be streamed straight to
 /// the client (no buffering) while still recording the eventual token count.
+///
+/// `LogEntry` borrows, so the streaming path needs an owned clone to move
+/// into the spawned task.
 struct StreamLog {
     pool: sqlx::SqlitePool,
-    http: reqwest::Client,
+    entry: OwnedLogEntry,
+}
+
+/// Owned counterpart of `LogEntry` — same fields, no lifetimes, so it can
+/// cross a `tokio::spawn` boundary.
+struct OwnedLogEntry {
     token_name: String,
     request_model: String,
-    model: String,
+    upstream_model: String,
     channel_name: String,
     status: i64,
+    protocol: String,
+    convert: ConvertMode,
+    streaming: bool,
+    latency_ms: i64,
+    error: String,
 }
 
 impl StreamLog {
-    async fn spawn_inline(self, usage: Option<(i64, i64)>) {
-        let usage_triple = usage.map(|(p, c)| (p, c, p + c));
-        log_request(
-            &self.pool,
-            &self.http,
-            &self.token_name,
-            &self.request_model,
-            &self.model,
-            &self.channel_name,
-            self.status,
-            usage_triple,
-        )
-        .await;
+    async fn spawn_inline(self, usage: Option<convert::Usage>) {
+        let e = LogEntry {
+            token_name: &self.entry.token_name,
+            request_model: &self.entry.request_model,
+            upstream_model: &self.entry.upstream_model,
+            channel_name: &self.entry.channel_name,
+            status: self.entry.status,
+            protocol: &self.entry.protocol,
+            convert: self.entry.convert,
+            streaming: self.entry.streaming,
+            latency_ms: self.entry.latency_ms,
+            error: &self.entry.error,
+            usage,
+        };
+        log_request(&self.pool, &e).await;
     }
 }
 
@@ -421,14 +476,14 @@ impl StreamLog {
 struct LogOnEnd<S> {
     inner: S,
     log: Option<StreamLog>,
-    usage: Arc<Mutex<Option<(i64, i64)>>>,
+    usage: Arc<Mutex<Option<convert::Usage>>>,
     /// If set, overrides `usage` when Drop fires. Used for the converted
     /// path so the converter's own usage counter is the source of truth.
     converter_usage: Option<Arc<Mutex<Box<dyn SseConverter>>>>,
 }
 
 impl<S> LogOnEnd<S> {
-    fn wrap(inner: S, log: StreamLog, usage: Arc<Mutex<Option<(i64, i64)>>>) -> Self {
+    fn wrap(inner: S, log: StreamLog, usage: Arc<Mutex<Option<convert::Usage>>>) -> Self {
         Self { inner, log: Some(log), usage, converter_usage: None }
     }
     fn wrap_with_converter(
@@ -482,28 +537,11 @@ impl<S> Drop for LogOnEnd<S> {
     }
 }
 
-/// Pull (prompt, completion) token counts out of one SSE `data:` payload.
-/// Accepts both the OpenAI shape ({prompt_tokens, completion_tokens}) and
-/// the Anthropic shape ({input_tokens, output_tokens}); returns the most
-/// recent non-zero pair seen. Returns None for payloads without a usage
-/// block — the caller is expected to overwrite earlier values.
-fn usage_from_sse_payload(payload: &str) -> Option<(i64, i64)> {
-    let v: Value = serde_json::from_str(payload).ok()?;
-    let u = v.get("usage")?;
-    let prompt = u
-        .get("prompt_tokens")
-        .or_else(|| u.get("input_tokens"))
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0);
-    let completion = u
-        .get("completion_tokens")
-        .or_else(|| u.get("output_tokens"))
-        .and_then(|x| x.as_i64())
-        .unwrap_or(0);
-    if prompt == 0 && completion == 0 {
-        return None;
-    }
-    Some((prompt, completion))
+/// Pull the token breakdown out of one SSE `data:` payload. Implemented
+/// in `convert.rs` since that's where the OpenAI/Anthropic field-name
+/// knowledge already lives; re-exported here for the passthrough path.
+fn usage_from_sse_payload(payload: &str) -> Option<convert::Usage> {
+    convert::usage_from_sse_payload(payload)
 }
 
 /// Forward an upstream SSE byte stream to the client verbatim, but parse
@@ -515,7 +553,7 @@ fn passthrough_stream(
     content_type: Option<axum::http::HeaderValue>,
     log: StreamLog,
 ) -> Response {
-    let usage: Arc<Mutex<Option<(i64, i64)>>> = Arc::new(Mutex::new(None));
+    let usage: Arc<Mutex<Option<convert::Usage>>> = Arc::new(Mutex::new(None));
     let usage_for_drop = Arc::clone(&usage);
     let body_stream = stream::unfold(
         (resp, Vec::<u8>::new(), Arc::clone(&usage)),
@@ -639,6 +677,9 @@ fn converted_stream(
 /// the outcome against `channel_name`. Streaming requests pass through
 /// unchanged; non-streaming responses are buffered so we can extract usage.
 /// `convert` says which protocol translation this hop needs.
+/// `start` is when the relay started, so we can record how long the upstream
+/// took to first respond (TTFB); on stream replay it's frozen at the
+/// transition.
 async fn respond_from_upstream(
     state: &AppState,
     token_name: &str,
@@ -647,25 +688,38 @@ async fn respond_from_upstream(
     cand: &Candidate,
     resp: reqwest::Response,
     is_streaming: bool,
+    protocol: &str,
+    streaming: bool,
+    start: Instant,
 ) -> Response {
     let channel_name = cand.name.as_str();
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let convert = cand.convert;
+    // Latency up to "we got the upstream's response headers". For streams
+    // this is the TTFB, which is what people usually want; for buffered
+    // responses this is the whole round-trip.
+    let latency_ms = start.elapsed().as_millis() as i64;
 
     if !is_streaming {
         let content_type = resp.headers().get("content-type").cloned();
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                log_request(
+                log_request_owned(
                     &state.pool,
-                    &state.http,
-                    token_name,
-                    request_model,
-                    model,
-                    channel_name,
-                    status.as_u16() as i64,
+                    &OwnedLogEntry {
+                        token_name: token_name.to_string(),
+                        request_model: request_model.to_string(),
+                        upstream_model: model.to_string(),
+                        channel_name: channel_name.to_string(),
+                        status: status.as_u16() as i64,
+                        protocol: protocol.to_string(),
+                        convert,
+                        streaming,
+                        latency_ms,
+                        error: format!("upstream body read failed: {}", e),
+                    },
                     None,
                 )
                 .await;
@@ -677,14 +731,20 @@ async fn respond_from_upstream(
             }
         };
         let usage = parse_usage(&bytes);
-        log_request(
+        log_request_owned(
             &state.pool,
-            &state.http,
-            token_name,
-            request_model,
-            model,
-            channel_name,
-            status.as_u16() as i64,
+            &OwnedLogEntry {
+                token_name: token_name.to_string(),
+                request_model: request_model.to_string(),
+                upstream_model: model.to_string(),
+                channel_name: channel_name.to_string(),
+                status: status.as_u16() as i64,
+                protocol: protocol.to_string(),
+                convert,
+                streaming,
+                latency_ms,
+                error: String::new(),
+            },
             usage,
         )
         .await;
@@ -728,12 +788,18 @@ async fn respond_from_upstream(
     // upstream ends, the client finishes, or the client disconnects).
     let log = StreamLog {
         pool: state.pool.clone(),
-        http: state.http.clone(),
-        token_name: token_name.to_string(),
-        request_model: request_model.to_string(),
-        model: model.to_string(),
-        channel_name: channel_name.to_string(),
-        status: status.as_u16() as i64,
+        entry: OwnedLogEntry {
+            token_name: token_name.to_string(),
+            request_model: request_model.to_string(),
+            upstream_model: model.to_string(),
+            channel_name: channel_name.to_string(),
+            status: status.as_u16() as i64,
+            protocol: protocol.to_string(),
+            convert,
+            streaming,
+            latency_ms,
+            error: String::new(),
+        },
     };
     match convert {
         ConvertMode::None => {
@@ -782,6 +848,9 @@ async fn relay(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // One clock per request, started after auth+parse so the logged
+    // latency reflects only the upstream work.
+    let relay_start = Instant::now();
 
     // 3+4. walk the ordered target list; for each (channel, model) target,
     // rewrite the request body's model field and try it — pinned targets go
@@ -857,6 +926,9 @@ async fn relay(
                             cand,
                             resp,
                             is_streaming,
+                            protocol,
+                            is_streaming,
+                            relay_start,
                         )
                         .await;
                     }
@@ -870,6 +942,9 @@ async fn relay(
                             cand,
                             resp,
                             is_streaming,
+                            protocol,
+                            is_streaming,
+                            relay_start,
                         )
                         .await;
                     }
@@ -881,14 +956,48 @@ async fn relay(
                             }
                         }
                     }
-                    log_request(&state.pool, &state.http, &token_name, &model, target_model, &cand.name, code as i64, None).await;
-                    all_errors.push(format!("{} ({}) -> HTTP {}", cand.name, target_model, code));
+                    let err_msg = format!("HTTP {}", code);
+                    log_request_owned(
+                        &state.pool,
+                        &OwnedLogEntry {
+                            token_name: token_name.clone(),
+                            request_model: model.clone(),
+                            upstream_model: target_model.clone(),
+                            channel_name: cand.name.clone(),
+                            status: code as i64,
+                            protocol: protocol.to_string(),
+                            convert: cand.convert,
+                            streaming: is_streaming,
+                            latency_ms: relay_start.elapsed().as_millis() as i64,
+                            error: err_msg.clone(),
+                        },
+                        None,
+                    )
+                    .await;
+                    all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
                     if code == 429 {
                         retriable_429_count += 1;
                     }
                 }
                 Err(e) => {
-                    log_request(&state.pool, &state.http, &token_name, &model, target_model, &cand.name, -1, None).await;
+                    let err_msg = format!("transport: {}", e);
+                    log_request_owned(
+                        &state.pool,
+                        &OwnedLogEntry {
+                            token_name: token_name.clone(),
+                            request_model: model.clone(),
+                            upstream_model: target_model.clone(),
+                            channel_name: cand.name.clone(),
+                            status: -1,
+                            protocol: protocol.to_string(),
+                            convert: cand.convert,
+                            streaming: is_streaming,
+                            latency_ms: relay_start.elapsed().as_millis() as i64,
+                            error: err_msg.clone(),
+                        },
+                        None,
+                    )
+                    .await;
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, e));
                     transport_err_count += 1;
                 }
