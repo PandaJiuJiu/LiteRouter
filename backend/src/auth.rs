@@ -117,7 +117,7 @@ pub async fn setup(
     .await;
     let user_id = match res {
         Ok(r) => r.last_insert_rowid(),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
+        Err(ref e) if db::is_unique_violation(e) => {
             return Err((StatusCode::CONFLICT, json_err("用户名已存在")))
         }
         Err(_) => {

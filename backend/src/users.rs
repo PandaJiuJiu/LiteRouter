@@ -97,7 +97,7 @@ pub async fn create_user(
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, json_err("数据库错误")))?;
             Ok(Json(row_user(&row)))
         }
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
+        Err(ref e) if crate::db::is_unique_violation(e) => {
             Err((StatusCode::CONFLICT, json_err("用户名已存在")))
         }
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, json_err("创建失败"))),

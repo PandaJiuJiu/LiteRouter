@@ -51,6 +51,19 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// SQLITE_CONSTRAINT_UNIQUE. Written out as a named constant because the
+/// numeric result code is easy to mistype and, when it is, the handler that
+/// depends on it silently degrades to a 500 instead of a 409 — there is no
+/// compiler to catch a wrong string literal.
+const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
+
+/// True when `err` is a UNIQUE constraint violation, i.e. the caller tried to
+/// insert a duplicate key. Handlers that validate uniqueness up front still
+/// need this: the check is not atomic with the insert.
+pub fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(e) if e.code().as_deref() == Some(SQLITE_CONSTRAINT_UNIQUE))
+}
+
 /// Hash a plaintext password. Returns (hex_hash, hex_salt). Caller persists
 /// both columns; verification needs them together.
 pub fn hash_password(plain: &str) -> (String, String) {
