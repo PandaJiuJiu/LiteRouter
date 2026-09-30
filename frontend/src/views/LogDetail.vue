@@ -17,6 +17,9 @@
         <el-tag v-if="log.convert && log.convert !== 'none'" size="small" type="warning">
           协议转换 {{ log.convert }}
         </el-tag>
+        <el-tag v-if="log.failed_count > 0" size="small" type="warning" effect="plain">
+          失败 {{ log.failed_count }} 次后成功
+        </el-tag>
       </div>
 
       <el-alert v-if="log.error" type="error" :title="log.error" :closable="false" show-icon />
@@ -26,12 +29,53 @@
         <h3>请求</h3>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="令牌">{{ log.token_name }}</el-descriptions-item>
-          <el-descriptions-item label="渠道">{{ log.channel_name }}</el-descriptions-item>
           <el-descriptions-item label="客户端协议">{{ log.protocol || '—' }}</el-descriptions-item>
           <el-descriptions-item label="时间">{{ formatTime(log.created_at) }}</el-descriptions-item>
-          <el-descriptions-item label="客户端请求模型">{{ log.request_model || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="上游实际模型">{{ log.upstream_model || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="请求模型 → 转发模型">
+            {{ log.request_model || '—' }} → {{ log.upstream_model || log.request_model || '—' }}
+          </el-descriptions-item>
         </el-descriptions>
+      </section>
+
+      <!-- 转发链路：一次请求 = 一行日志，内部的每一次上游尝试在这里按顺序展开 -->
+      <section v-if="log.attempts && log.attempts.length > 1">
+        <h3>
+          转发链路
+          <span class="hint">
+            共 {{ log.attempts.length }} 次尝试，其中
+            {{ log.failed_count }} 次失败
+          </span>
+        </h3>
+        <el-table :data="log.attempts" size="small" border>
+          <el-table-column label="#" width="46">
+            <template #default="{ row }">{{ row.seq + 1 }}</template>
+          </el-table-column>
+          <el-table-column prop="upstream_model" label="上游模型" min-width="170" show-overflow-tooltip />
+          <el-table-column label="渠道" min-width="130">
+            <template #default="{ row }">{{ row.channel_name || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="结果" width="110">
+            <template #default="{ row }">
+              <el-tag :type="row.ok ? 'success' : 'danger'" size="small">
+                {{ row.ok ? '成功' : row.status_code === -1 ? '连接失败' : row.status_code }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="耗时" width="90">
+            <template #default="{ row }">
+              <span class="num">{{ row.latency_ms.toLocaleString() }} ms</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="错误" min-width="180" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="row.error" class="err">{{ row.error }}</span>
+              <span v-else class="hint">—</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <p class="hint note">
+          耗时为从请求进入网关到该次尝试结束的累计值，因此后面的尝试会更大。
+        </p>
       </section>
 
       <!-- Token 明细：cache 段只在该次请求非零时显示 -->
@@ -114,6 +158,15 @@ onMounted(load)
 .hint {
   color: #909399;
   font-size: 12px;
+}
+.err {
+  color: #f56c6c;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.note {
+  margin: 6px 0 0;
 }
 section {
   margin-top: 20px;

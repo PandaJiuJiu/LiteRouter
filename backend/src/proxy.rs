@@ -1120,14 +1120,29 @@ async fn relay(
         attempted,
         all_errors.join("\n  - ")
     );
-    // Every attempt failed, so there is no winner — the last one stands in as
-    // the row's headline outcome, with the full chain in the detail page.
+    // Every attempt failed. Create a synthetic "all-failed" winner with an
+    // empty channel_name so the parent row shows "—" for the channel rather
+    // than misleadingly naming the last failed channel. The actual failure
+    // chain is preserved in `attempts` for the detail page.
+    let all_failed = Attempt {
+        upstream_model: attempts
+            .last()
+            .map(|a| a.upstream_model.clone())
+            .unwrap_or_default(),
+        channel_name: String::new(),
+        status: final_status.as_u16() as i64,
+        error: err.clone(),
+        latency_ms: relay_start.elapsed().as_millis() as i64,
+        convert: ConvertMode::None,
+        ok: false,
+        usage: None,
+    };
     let entry = LogEntry {
         token_name,
         request_model: model,
         protocol: protocol.to_string(),
         streaming: is_streaming,
-        winner: None,
+        winner: Some(all_failed),
         attempts,
     };
     log_request(&state.pool, &entry).await;
