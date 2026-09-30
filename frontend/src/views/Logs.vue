@@ -11,12 +11,10 @@
         </template>
       </el-table-column>
       <el-table-column prop="token_name" label="令牌" width="160" />
-      <el-table-column label="模型" min-width="280">
+      <el-table-column prop="request_model" label="请求模型" min-width="180" show-overflow-tooltip />
+      <el-table-column label="转发模型" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
-          <span v-if="row.request_model && row.request_model !== row.model">
-            {{ row.request_model }}<span class="hint">→</span>{{ row.model }}
-          </span>
-          <span v-else>{{ row.model }}</span>
+          <span>{{ row.upstream_model || row.request_model }}</span>
           <span class="hint">（{{ row.channel_name }}）</span>
         </template>
       </el-table-column>

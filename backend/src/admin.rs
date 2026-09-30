@@ -790,16 +790,21 @@ pub async fn list_logs(
     let logs: Vec<Value> = rows
         .iter()
         .map(|r| {
+            // `upstream_model` is empty on rows written before 0014; `model`
+            // has always held the post-mapping name, so fall back to it.
+            let upstream_model = {
+                let m = r.get::<String, _>("upstream_model");
+                if m.is_empty() {
+                    r.get::<String, _>("model")
+                } else {
+                    m
+                }
+            };
             json!({
-                "token_name": r.get::<String, _>("token_name"),
-                "model": r.get::<String, _>("model"),
-                "request_model": r.get::<String, _>("request_model"),
-                "channel_name": r.get::<String, _>("channel_name"),
-                "status_code": r.get::<i64, _>("status_code"),
                 "id": r.get::<i64, _>("id"),
                 "token_name": r.get::<String, _>("token_name"),
-                "model": r.get::<String, _>("model"),
                 "request_model": r.get::<String, _>("request_model"),
+                "upstream_model": upstream_model,
                 "channel_name": r.get::<String, _>("channel_name"),
                 "status_code": r.get::<i64, _>("status_code"),
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
@@ -840,6 +845,16 @@ pub async fn get_log(
             return Err(StatusCode::NOT_FOUND);
         }
     }
+    // `upstream_model` is empty on rows written before 0014; `model` has
+    // always held the post-mapping name, so fall back to it.
+    let upstream_model = {
+        let m = row.get::<String, _>("upstream_model");
+        if m.is_empty() {
+            row.get::<String, _>("model")
+        } else {
+            m
+        }
+    };
     Ok(Json(json!({
         "log": {
             "id": row.get::<i64, _>("id"),
@@ -853,7 +868,7 @@ pub async fn get_log(
             "cache_creation_tokens": row.get::<i64, _>("cache_creation_tokens"),
             "reasoning_tokens": row.get::<i64, _>("reasoning_tokens"),
             "request_model": row.get::<String, _>("request_model"),
-            "upstream_model": row.get::<String, _>("upstream_model"),
+            "upstream_model": upstream_model,
             "latency_ms": row.get::<i64, _>("latency_ms"),
             "stream": row.get::<i64, _>("stream") != 0,
             "protocol": row.get::<String, _>("protocol"),
