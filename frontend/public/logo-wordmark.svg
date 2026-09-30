@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 60" width="220" height="60" role="img" aria-label="LiteRouter">
+  <defs>
+    <linearGradient id="lrGradText" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <!-- Wordmark only: "Lite" neutral, "Router" bold + gradient -->
+  <g font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">
+    <text x="0" y="44" font-size="44" font-weight="500" fill="#475569" letter-spacing="-1">Lite</text>
+    <text x="72" y="44" font-size="44" font-weight="700" fill="url(#lrGradText)" letter-spacing="-1">Router</text>
+  </g>
+</svg>

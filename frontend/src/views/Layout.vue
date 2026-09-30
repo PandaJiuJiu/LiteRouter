@@ -1,7 +1,7 @@
 <template>
   <el-container style="height: 100vh">
     <el-aside width="200px" style="border-right: 1px solid #e4e7ed">
-      <div class="logo"><img src="/logo.svg" alt="LiteRouter" /></div>
+      <div class="logo"><img src="/logo-wordmark.svg" alt="LiteRouter" /></div>
       <el-menu :default-active="$route.path" router>
         <el-menu-item v-if="isAdmin" index="/channels">渠道管理</el-menu-item>
         <el-menu-item index="/tokens">令牌管理</el-menu-item>
