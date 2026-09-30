@@ -757,6 +757,33 @@ pub async fn list_logs(
     let user = check_auth(&state, &headers)?;
     let offset = (q.page - 1).max(0) * q.size;
     let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
+    // Count must run under the same visibility rules as the page query, or
+    // the total leaks the existence of other users' logs.
+    let total: i64 = if !user.is_admin && allowed.is_empty() {
+        0
+    } else if user.is_admin {
+        sqlx::query_scalar("SELECT COUNT(*) FROM logs")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        let placeholders = std::iter::repeat("?")
+            .take(allowed.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM logs WHERE token_name IN ({})",
+            placeholders
+        );
+        let mut query = sqlx::query_scalar(&sql);
+        for n in &allowed {
+            query = query.bind(n);
+        }
+        query
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
     // If a non-admin has no tokens at all, skip the IN clause with a 1=0
     // guard — empty `token IN ()` is invalid SQL in SQLite.
     let rows = if !user.is_admin && allowed.is_empty() {
@@ -814,7 +841,7 @@ pub async fn list_logs(
             })
         })
         .collect();
-    Ok(Json(json!({ "logs": logs })))
+    Ok(Json(json!({ "logs": logs, "total": total })))
 }
 
 /// GET /api/logs/:id — full metadata for a single request, used by the

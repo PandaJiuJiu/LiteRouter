@@ -37,9 +37,16 @@
         </template>
       </el-table-column>
     </el-table>
-    <el-pagination style="margin-top: 12px; justify-content: flex-end"
-      layout="prev, pager, next" :page-size="size" :current-page="page"
-      @current-change="(p) => { page = p; load() }" />
+    <el-pagination
+      style="margin-top: 12px; justify-content: flex-end"
+      layout="total, sizes, prev, pager, next"
+      :total="total"
+      :page-size="size"
+      :current-page="page"
+      :page-sizes="[20, 50, 100, 200]"
+      @current-change="(p) => { page = p; load() }"
+      @size-change="(s) => { size = s; page = 1; load() }"
+    />
   </el-card>
 </template>
 
@@ -50,14 +57,22 @@ import { listLogs } from '../api'
 
 const router = useRouter()
 const logs = ref([])
+const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const size = 50
+const size = ref(50)
 
 async function load() {
   loading.value = true
   try {
-    logs.value = await listLogs(page.value, size)
+    const data = await listLogs(page.value, size.value)
+    logs.value = data.logs
+    total.value = data.total
+    // A stale page (e.g. after deletions) can leave us past the last page.
+    if (page.value > 1 && logs.value.length === 0) {
+      page.value = Math.max(1, Math.ceil(total.value / size.value))
+      return load()
+    }
   } finally {
     loading.value = false
   }

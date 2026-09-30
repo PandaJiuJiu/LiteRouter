@@ -81,7 +81,7 @@ export const deleteToken = (id) => api.delete(`/tokens/${id}`)
 
 // ---------- logs / usage ----------
 export const listLogs = (page = 1, size = 50) =>
-  api.get('/logs', { params: { page, size } }).then((r) => r.data.logs)
+  api.get('/logs', { params: { page, size } }).then((r) => r.data)
 export const getLog = (id) => api.get(`/logs/${id}`).then((r) => r.data.log)
 export const fetchUsage = (range = 7) =>
   api.get('/usage', { params: { range } }).then((r) => r.data)
