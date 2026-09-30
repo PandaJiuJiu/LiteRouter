@@ -39,38 +39,52 @@
       <!-- 模型卡片网格 -->
       <div v-if="modelList(ch).length" class="model-grid">
         <div v-for="m in modelList(ch)" :key="m" class="model-card"
-             :class="{ 'is-enabled': isSelected(ch, m), testing: ch._testingModel === m }">
-          <div class="model-card-header">
-            <span class="model-name" :title="m">{{ m }}</span>
+             :class="{ 'is-enabled': isSelected(ch, m), 'is-testing': ch._testingModel === m }">
+          <div class="model-card-top">
+            <div class="model-name" :title="m">{{ m }}</div>
             <el-switch :model-value="isSelected(ch, m)"
                        :loading="ch._togglingModel === m"
                        @change="(v) => toggleModel(ch, m, v)" />
           </div>
-          <div class="model-card-footer">
-            <div class="model-status">
-              <template v-for="proto in PROTOCOLS" :key="proto">
-                <template v-if="ch._testResult?.[m]?.protocols?.[proto]">
-                  <el-tooltip v-if="ch._testResult[m].protocols[proto].ok === false"
-                              :content="ch._testResult[m].protocols[proto].error || '不可用'"
-                              placement="top">
-                    <span class="status-pill fail">
-                      <el-icon><CircleCloseFilled /></el-icon>
-                      {{ proto }}
-                    </span>
-                  </el-tooltip>
-                  <span v-else class="status-pill ok">
-                    <el-icon><CircleCheckFilled /></el-icon>
-                    {{ proto }}
-                  </span>
-                </template>
+          <div class="model-card-status">
+            <template v-for="proto in PROTOCOLS" :key="proto">
+              <template v-if="ch._testResult?.[m]?.protocols?.[proto]">
+                <el-tooltip v-if="ch._testResult[m].protocols[proto].ok === false"
+                            :content="ch._testResult[m].protocols[proto].error || '不可用'"
+                            placement="top">
+                  <div class="status-line fail">
+                    <el-icon class="status-icon"><CircleCloseFilled /></el-icon>
+                    <span class="status-proto">{{ proto }}</span>
+                    <span class="status-text">不可用</span>
+                  </div>
+                </el-tooltip>
+                <div v-else class="status-line ok">
+                  <el-icon class="status-icon"><CircleCheckFilled /></el-icon>
+                  <span class="status-proto">{{ proto }}</span>
+                  <span class="status-text">可用</span>
+                </div>
               </template>
-              <span v-if="!hasTestResult(ch, m)" class="untested">未测试</span>
-            </div>
-            <el-button size="small" :loading="ch._testingModel === m"
+            </template>
+            <div v-if="!hasTestResult(ch, m)" class="status-untested">尚未测试</div>
+          </div>
+          <div class="model-card-actions">
+            <el-button class="action-btn" :loading="ch._testingModel === m"
                        @click="pingModel(ch, m)">
               <el-icon><Refresh /></el-icon>
               <span>测试</span>
             </el-button>
+            <el-popconfirm class="action-pop"
+                           :title="`从「${ch.name}」移除「${m}」？该模型的测试结果也会清空`"
+                           confirm-button-text="移除"
+                           cancel-button-text="取消"
+                           @confirm="removeModel(ch, m)">
+              <template #reference>
+                <el-button class="action-btn" type="danger" plain>
+                  <el-icon><Delete /></el-icon>
+                  <span>删除</span>
+                </el-button>
+              </template>
+            </el-popconfirm>
           </div>
         </div>
       </div>
@@ -123,7 +137,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { CircleCheckFilled, CircleCloseFilled, Refresh } from '@element-plus/icons-vue'
+import { CircleCheckFilled, CircleCloseFilled, Delete, Refresh } from '@element-plus/icons-vue'
 import { listChannels, updateChannelModels, fetchModels, testModel } from '../api'
 
 const route = useRoute()
@@ -320,6 +334,34 @@ async function toggleModel(ch, m, enabled) {
   }
 }
 
+// 完全删除：从 ch.models 移除并持久化，从 known 移除（卡片消失），
+// 测试结果也清掉。要恢复只能重新获取或手动添加。
+async function removeModel(ch, m) {
+  // 1. 持久化 ch.models（如果该模型在其中）
+  const cur = splitModels(ch.models)
+  const inSaved = cur.includes(m)
+  if (inSaved) {
+    const newModels = cur.filter((x) => x !== m).join(',')
+    try {
+      await updateChannelModels(ch.id, newModels)
+      ch.models = newModels
+    } catch (e) {
+      const detail = e?.response?.data?.message || e.message || '未知错误'
+      ElMessage.error(`移除 ${m} 失败：${detail}`)
+      return  // 写库失败就不动 known，避免前端状态和数据库脱钩
+    }
+  }
+  // 2. 从 known 移除，让卡片消失
+  const list = known[ch.id]
+  if (list) {
+    const idx = list.indexOf(m)
+    if (idx >= 0) list.splice(idx, 1)
+  }
+  // 3. 清掉残留的测试结果，避免下次同名的卡片（罕见）读到旧状态
+  if (ch._testResult) delete ch._testResult[m]
+  ElMessage.success(`已从「${ch.name}」移除 ${m}`)
+}
+
 async function pingModel(ch, m) {
   ch._testingModel = m
   try {
@@ -436,91 +478,118 @@ onMounted(load)
   margin-top: 8px;
 }
 .model-card {
-  border: 1px solid #e4e7ed;
-  border-radius: 8px;
-  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
   background: #fff;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  border: 1px solid #ebeef5;
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease,
+    transform 0.2s ease, background 0.25s ease;
+}
+.model-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+  transform: translateY(-1px);
 }
 .model-card.is-enabled {
+  border-color: #79bbff;
+  background: linear-gradient(135deg, #ecf5ff 0%, #f5fbff 100%);
+  box-shadow: 0 2px 8px rgba(64, 158, 255, 0.1);
+}
+.model-card.is-enabled:hover {
+  box-shadow: 0 4px 14px rgba(64, 158, 255, 0.18);
   border-color: #409eff;
-  background: #ecf5ff;
 }
-.model-card.testing {
-  opacity: 0.75;
+.model-card.is-testing {
+  opacity: 0.65;
+  pointer-events: none;
 }
-.model-card-header {
+
+.model-card-top {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 .model-name {
   font-weight: 600;
   font-size: 14px;
-  color: #303133;
+  color: #1f2329;
   word-break: break-all;
-  line-height: 1.4;
+  line-height: 1.5;
+  flex: 1;
+  min-width: 0;
+  letter-spacing: -0.01em;
+}
+.model-card.is-enabled .model-name {
+  color: #0958d9;
+}
+
+.model-card-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.025);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  min-height: 38px;
+  justify-content: center;
+}
+.model-card.is-enabled .model-card-status {
+  background: rgba(64, 158, 255, 0.08);
+}
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  width: 100%;
+}
+.status-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.status-line.ok { color: #16a34a; }
+.status-line.fail { color: #dc2626; cursor: help; }
+.status-proto {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.status-text {
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0.85;
+  letter-spacing: 0.02em;
+}
+.status-untested {
+  color: #909399;
+  font-size: 12px;
+  font-style: italic;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+
+.model-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+.model-card-actions > .action-btn,
+.model-card-actions > .action-pop {
   flex: 1;
   min-width: 0;
 }
-.model-card.is-enabled .model-name {
-  color: #409eff;
-}
-.model-card-footer {
+/* el-popconfirm 包裹了内部按钮，需要让内部按钮填满 popconfirm 宽度 */
+.model-card-actions .action-pop {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-top: 1px dashed #e4e7ed;
-  padding-top: 8px;
 }
-.model-status {
-  font-size: 12px;
-  color: #606266;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-}
-.model-status .ok { color: #67c23a; font-size: 14px; }
-.model-status .fail { color: #f56c6c; font-size: 14px; }
-.model-status .via {
-  color: #909399;
-  margin-left: 2px;
-}
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 16px;
-  cursor: default;
-}
-.status-pill.ok {
-  background: #f0f9eb;
-  color: #67c23a;
-}
-.status-pill.fail {
-  background: #fef0f0;
-  color: #f56c6c;
-  cursor: help;
-}
-.status-pill .el-icon {
-  font-size: 12px;
-}
-.fail-text {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  cursor: help;
-}
-.untested {
-  color: #c0c4cc;
-  font-style: italic;
+.model-card-actions .action-pop .action-btn {
+  width: 100%;
 }
 .hint {
   color: #909399;
