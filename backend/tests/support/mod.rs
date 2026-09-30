@@ -22,7 +22,7 @@ use axum::Router;
 use literouter::{build_router, build_state, db};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The single password every fixture user is created with.
 pub const PASSWORD: &str = "test-password-1234";
@@ -149,30 +149,35 @@ pub async fn insert_mapping_targets(pool: &SqlitePool, alias: &str, targets: &Va
         .last_insert_rowid()
 }
 
-/// Mount the full API over a database, exactly as `main` would.
-pub async fn mount(pool: SqlitePool) -> Router {
+/// Mount the full API over a database, exactly as `main` would. The
+/// breaker comes back too so tests can pre-trip it without first having to
+/// drive N real failures through the relay.
+pub async fn mount(pool: SqlitePool) -> (Router, Arc<literouter::breaker::Breaker>) {
     let state = build_state(pool).await;
-    build_router(state)
+    let breaker = state.breaker.clone();
+    (build_router(state), breaker)
 }
 
 /// `TestDb` + mounted `Router`, the pair almost every API test needs.
 pub struct Harness {
     pub db: TestDb,
     pub router: Router,
+    /// The same `Arc<Breaker>` the mounted router is using.
+    pub breaker: Arc<literouter::breaker::Breaker>,
 }
 
 impl Harness {
     pub async fn new() -> Self {
         let db = TestDb::new().await;
-        let router = mount(db.pool.clone()).await;
-        Self { db, router }
+        let (router, breaker) = mount(db.pool.clone()).await;
+        Self { db, router, breaker }
     }
 
     /// A harness that already has an `admin` user.
     pub async fn with_admin() -> Self {
         let db = TestDb::with_admin().await;
-        let router = mount(db.pool.clone()).await;
-        Self { db, router }
+        let (router, breaker) = mount(db.pool.clone()).await;
+        Self { db, router, breaker }
     }
 
     pub fn pool(&self) -> &SqlitePool {
