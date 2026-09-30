@@ -88,6 +88,10 @@ async fn main() {
         .route("/api/usage", get(admin::usage))
         .route("/api/settings/debug-logging", get(settings::get_debug_logging).put(settings::set_debug_logging))
         .route(
+            "/api/settings/language",
+            get(settings::get_language).put(settings::set_language),
+        )
+        .route(
             "/api/settings/breaker",
             get(settings::get_breaker_config).put(settings::set_breaker_config),
         )

@@ -1,24 +1,24 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>调用日志</span>
+      <span>{{ t('logs.title') }}</span>
       <div class="filters">
         <el-radio-group v-model="range" @change="reload">
-          <el-radio-button :value="1">一小时</el-radio-button>
-          <el-radio-button :value="24">当日</el-radio-button>
-          <el-radio-button :value="168">一周</el-radio-button>
-          <el-radio-button :value="0">全部</el-radio-button>
+          <el-radio-button :value="1">{{ t('logs.range.hour') }}</el-radio-button>
+          <el-radio-button :value="24">{{ t('logs.range.day') }}</el-radio-button>
+          <el-radio-button :value="168">{{ t('logs.range.week') }}</el-radio-button>
+          <el-radio-button :value="0">{{ t('logs.range.all') }}</el-radio-button>
         </el-radio-group>
-        <el-button @click="load">刷新</el-button>
+        <el-button @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
     <el-table :data="logs" v-loading="loading" @row-click="open">
-      <el-table-column label="请求时间" width="165" show-overflow-tooltip>
+      <el-table-column :label="t('logs.col.time')" width="165" show-overflow-tooltip>
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column label="来源" width="290">
+      <el-table-column :label="t('logs.col.source')" width="290">
         <template #default="{ row }">
           <el-tooltip
             v-if="row.client_ip || row.user_agent"
@@ -35,9 +35,9 @@
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="token_name" label="令牌" width="120" show-overflow-tooltip />
-      <el-table-column prop="request_model" label="请求模型" min-width="150" show-overflow-tooltip />
-      <el-table-column label="转发模型" min-width="200" show-overflow-tooltip>
+      <el-table-column prop="token_name" :label="t('logs.col.token')" width="120" show-overflow-tooltip />
+      <el-table-column prop="request_model" :label="t('logs.col.requestModel')" min-width="150" show-overflow-tooltip />
+      <el-table-column :label="t('logs.col.upstreamModel')" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
           <span>{{ row.upstream_model || row.request_model }}</span>
           <span class="hint">（{{ row.channel_name }}）</span>
@@ -49,20 +49,20 @@
             <template #content>
               <div class="fail-tip">
                 <div class="fail-tip-title">
-                  前 {{ row.failed_attempts.length }} 次转发失败，已自动切换渠道
+                  {{ t('logs.failTipTitle', { count: row.failed_attempts.length }) }}
                 </div>
                 <div v-for="(f, i) in row.failed_attempts" :key="i" class="fail-tip-row">
-                  {{ f.upstream_model }}（{{ f.channel_name || '无渠道' }}）— {{ f.error || f.status_code }}
+                  {{ f.upstream_model }}（{{ f.channel_name || t('logs.noChannel') }}）— {{ f.error || f.status_code }}
                 </div>
               </div>
             </template>
             <el-tag type="warning" size="small" effect="plain" class="fail-badge">
-              失败 {{ row.failed_attempts.length }} 次
+              {{ t('logs.failBadge', { count: row.failed_attempts.length }) }}
             </el-tag>
           </el-tooltip>
         </template>
       </el-table-column>
-      <el-table-column label="状态码" width="90">
+      <el-table-column :label="t('logs.col.statusCode')" width="90">
         <template #default="{ row }">
           <el-tag :type="row.status_code >= 200 && row.status_code < 300 ? 'success' : 'danger'">
             {{ row.status_code }}
@@ -83,7 +83,7 @@
     </el-table>
     <div class="pager-row">
       <div v-if="isAdmin" class="debug-cell">
-        <span class="debug-label">调试日志</span>
+        <span class="debug-label">{{ t('logs.debugLogging') }}</span>
         <el-switch
           :model-value="debugLogging.enabled"
           size="small"
@@ -107,9 +107,11 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { listLogs, me } from '../api'
 import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
 
+const { t } = useI18n()
 const router = useRouter()
 const logs = ref([])
 const total = ref(0)

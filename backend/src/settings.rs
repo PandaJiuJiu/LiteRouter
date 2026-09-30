@@ -1,4 +1,4 @@
-use crate::auth::require_admin;
+use crate::auth::{self, require_admin};
 use crate::breaker::BreakerConfig;
 use crate::db;
 use crate::proxy;
@@ -54,6 +54,76 @@ pub async fn set_debug_logging(
     proxy::set_debug_logging(req.enabled);
 
     Ok(Json(json!({ "enabled": req.enabled })))
+}
+
+// ---------- UI language ----------
+
+/// The only two UI languages the SPA ships. Anything else is rejected on
+/// write so a stray value can't end up in the DB and break rendering.
+pub const LANGUAGES: [&str; 2] = ["zh-CN", "en-US"];
+
+/// Coerce a client-supplied language into one of [`LANGUAGES`], falling back
+/// to Chinese. Used on the setup path where the field is optional and an
+/// unknown value should not fail account creation.
+pub fn normalize_language(raw: Option<&str>) -> String {
+    match raw {
+        Some(v) if LANGUAGES.contains(&v) => v.to_string(),
+        _ => LANGUAGES[0].to_string(),
+    }
+}
+
+/// Persist the UI language. UPSERT so it works whether or not the migration
+/// has seeded the key.
+pub async fn store_language(pool: &sqlx::SqlitePool, lang: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('ui_language', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(lang)
+    .execute(pool)
+    .await;
+}
+
+/// Read the configured UI language. Defaults to Chinese if the row is missing
+/// or unreadable — never fail a request over a cosmetic setting.
+pub async fn current_language(pool: &sqlx::SqlitePool) -> String {
+    normalize_language(db::get_setting(pool, "ui_language").await.ok().flatten().as_deref())
+}
+
+/// GET /api/settings/language — public. The login and setup pages need to
+/// render in the right language before any session exists.
+pub async fn get_language(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({ "language": current_language(&state.pool).await }))
+}
+
+#[derive(Deserialize)]
+pub struct SetLanguageReq {
+    language: String,
+}
+
+/// PUT /api/settings/language — any signed-in user may switch the UI
+/// language; it is a global preference, not an admin-only setting.
+pub async fn set_language(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SetLanguageReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _user = auth::check_auth(&state, &headers).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "未登录" })),
+        )
+    })?;
+
+    if !LANGUAGES.contains(&req.language.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("不支持的语言：{}", req.language) }).into(),
+        ));
+    }
+
+    store_language(&state.pool, &req.language).await;
+    Ok(Json(json!({ "language": req.language })))
 }
 
 // ---------- breaker (circuit breaker) ----------

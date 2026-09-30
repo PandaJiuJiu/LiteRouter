@@ -27,6 +27,8 @@ pub struct LoginReq {
 pub struct SetupReq {
     pub username: String,
     pub password: String,
+    /// 首次初始化时选择的 UI 语言。`Option` 保持对旧前端的兼容，缺省落到中文。
+    pub language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +75,7 @@ pub async fn setup_status(
         "authenticated": auth.is_some(),
         "is_admin": auth.map(|u| u.is_admin).unwrap_or(false),
         "username": username,
+        "language": crate::settings::current_language(&state.pool).await,
     }))
 }
 
@@ -131,10 +134,16 @@ pub async fn setup(
             created_at: ts,
         },
     );
+
+    // 语言在向导里就选好了，这里顺手落库 —— 免得前端再发一次请求。
+    let language = crate::settings::normalize_language(req.language.as_deref());
+    crate::settings::store_language(&state.pool, &language).await;
+
     Ok(Json(json!({
         "session": session,
         "username": username,
         "is_admin": true,
+        "language": language,
     })))
 }
 

@@ -1,76 +1,76 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>模型路由：客户端按此模型名发起请求，网关按列表顺序依次转发到指定渠道/模型，前面的失败时自动回退到后面的</span>
-      <el-button type="primary" @click="openCreate">添加路由</el-button>
+      <span>{{ t('mappings.description') }}</span>
+      <el-button type="primary" @click="openCreate">{{ t('mappings.add') }}</el-button>
     </div>
     <el-table :data="mappings" v-loading="loading">
-      <el-table-column prop="alias" label="客户端模型名" min-width="160" />
+      <el-table-column prop="alias" :label="t('mappings.col.alias')" min-width="160" />
       <el-table-column label="→" width="50" align="center">
         <template #default>→</template>
       </el-table-column>
-      <el-table-column label="转发目标（按顺序）" min-width="360">
+      <el-table-column :label="t('mappings.col.targets')" min-width="360">
         <template #default="{ row }">
           <el-tag
-            v-for="(t, i) in row.targets"
+            v-for="(tgt, i) in row.targets"
             :key="i"
             class="target-tag"
             :type="i === 0 ? 'primary' : 'info'"
           >
-            {{ i + 1 }}. {{ formatTarget(t) }}
+            {{ i + 1 }}. {{ formatTarget(tgt) }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="180">
+      <el-table-column :label="t('mappings.col.created')" width="180">
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="140">
+      <el-table-column :label="t('mappings.col.actions')" width="140">
         <template #default="{ row }">
-          <el-button size="small" @click="openEdit(row)">编辑</el-button>
-          <el-popconfirm title="确认删除该路由？" @confirm="remove(row.id)">
+          <el-button size="small" @click="openEdit(row)">{{ t('common.edit') }}</el-button>
+          <el-popconfirm :title="t('mappings.deleteConfirm')" @confirm="remove(row.id)">
             <template #reference>
-              <el-button size="small" type="danger">删除</el-button>
+              <el-button size="small" type="danger">{{ t('common.delete') }}</el-button>
             </template>
           </el-popconfirm>
         </template>
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑路由' : '添加路由'" width="720px" @closed="resetForm">
+    <el-dialog v-model="dialogVisible" :title="editingId ? t('mappings.editRoute') : t('mappings.add')" width="720px" @closed="resetForm">
       <el-form :model="form" label-position="top">
-        <el-form-item label="客户端模型名">
-          <el-input v-model="form.alias" placeholder="客户端请求里填的模型名，如 my-model" />
+        <el-form-item :label="t('mappings.aliasLabel')">
+          <el-input v-model="form.alias" :placeholder="t('mappings.aliasPlaceholder')" />
         </el-form-item>
       </el-form>
       <div class="target-section">
-        <div class="target-section-title">上游模型列表</div>
-        <div v-for="(t, i) in form.targets" :key="i" class="target-row">
+        <div class="target-section-title">{{ t('mappings.targetSection') }}</div>
+        <div v-for="(tgt, i) in form.targets" :key="i" class="target-row">
           <div class="target-row-main">
             <span class="target-index">{{ i + 1 }}.</span>
             <el-select
-              v-model="t.channel"
+              v-model="tgt.channel"
               filterable
               clearable
-              placeholder="任意渠道"
+              :placeholder="t('mappings.anyChannel')"
               class="channel-select"
             >
               <el-option v-for="ch in channelModels" :key="ch.name" :label="ch.name" :value="ch.name" />
             </el-select>
             <el-select
-              v-model="t.model"
+              v-model="tgt.model"
               filterable
               allow-create
               default-first-option
-              placeholder="选择或输入上游模型名"
+              :placeholder="t('mappings.modelPlaceholder')"
               class="model-select"
             >
-              <el-option v-if="t.channel" label="全部模型（该渠道下所有模型，按顺序尝试）" value="*" />
-              <template v-if="t.channel">
-                <el-option-group :label="`渠道：${t.channel}`">
+              <el-option v-if="tgt.channel" :label="t('mappings.allModelsOption')" value="*" />
+              <template v-if="tgt.channel">
+                <el-option-group :label="t('mappings.channelGroup', { channel: tgt.channel })">
                   <el-option
-                    v-for="m in channelModelNames(t.channel)"
+                    v-for="m in channelModelNames(tgt.channel)"
                     :key="m"
                     :label="m"
                     :value="m"
@@ -78,7 +78,7 @@
                 </el-option-group>
               </template>
               <template v-else>
-                <el-option-group v-for="ch in channelModels" :key="ch.name" :label="`渠道：${ch.name}`">
+                <el-option-group v-for="ch in channelModels" :key="ch.name" :label="t('mappings.channelGroup', { channel: ch.name })">
                   <el-option v-for="m in ch.models" :key="`${ch.name}/${m}`" :label="m" :value="m" />
                 </el-option-group>
               </template>
@@ -93,20 +93,16 @@
               :disabled="form.targets.length <= 1"
               @click="form.targets.splice(i, 1)"
             >
-              删除
+              {{ t('common.delete') }}
             </el-button>
           </div>
         </div>
-        <el-button size="small" class="add-target" @click="addTarget">+ 添加目标</el-button>
-        <div class="hint">
-          请求按列表顺序尝试：第 1 个失败或无可用渠道时回退到第 2 个，依此类推。
-          选定渠道即锁定转发到该渠道；模型选「全部模型」表示按该渠道的模型列表逐个尝试；
-          渠道留空表示任意支持该模型的渠道。保存后立即对下一次请求生效。
-        </div>
+        <el-button size="small" class="add-target" @click="addTarget">{{ t('mappings.addTarget') }}</el-button>
+        <div class="hint">{{ t('mappings.help') }}</div>
       </div>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="submit">保存</el-button>
+        <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="saving" @click="submit">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -116,33 +112,26 @@
       <el-collapse-item name="breaker">
         <template #title>
           <div class="breaker-title">
-            <span>熔断器状态</span>
+            <span>{{ t('mappings.breaker.title') }}</span>
             <span class="hint">
-              {{ openCount }} 个 (渠道, 模型) 熔断中
+              {{ t('mappings.breaker.openCount', { count: openCount }) }}
             </span>
           </div>
         </template>
         <div class="breaker-actions">
-          <el-button size="small" @click="refreshBreaker">刷新</el-button>
-          <el-button size="small" type="danger" plain @click="onResetBreaker">一键复位</el-button>
+          <el-button size="small" @click="refreshBreaker">{{ t('common.refresh') }}</el-button>
+          <el-button size="small" type="danger" plain @click="onResetBreaker">{{ t('mappings.breaker.reset') }}</el-button>
         </div>
-        <div class="hint breaker-desc">
-          熔断中的上游组合会被路由自动跳过，不会消耗请求配额也不会出现在 attempt 链里。
-          任意一次失败（5xx / 4xx / 408 / 429 / 网络错误）即熔断 {{ baseDelaySecs }}s；
-          探测再次失败，退避每次翻倍（×2），最多到 {{ maxDelaySecs }}s。
-          到点由后台任务独立发探测验证恢复，恢复前不会主动重试用户请求。
-          后台任务每 {{ probeIntervalSecs }}s 检查一次所有到期组合。
-          恢复正常后该组合会从此表移除。
-        </div>
+        <div class="hint breaker-desc">{{ t('mappings.breaker.desc', breakerParams) }}</div>
         <el-table
           :data="snapshot"
           v-loading="breakerLoading"
           size="small"
-          empty-text="所有上游组合目前都正常"
+          :empty-text="t('mappings.breaker.allHealthy')"
         >
-          <el-table-column prop="channel" label="渠道" width="160" show-overflow-tooltip />
-          <el-table-column prop="target_model" label="模型" min-width="180" show-overflow-tooltip />
-          <el-table-column label="下次探测" width="100">
+          <el-table-column prop="channel" :label="t('mappings.breaker.col.channel')" width="160" show-overflow-tooltip />
+          <el-table-column prop="target_model" :label="t('mappings.breaker.col.model')" min-width="180" show-overflow-tooltip />
+          <el-table-column :label="t('mappings.breaker.col.nextProbe')" width="100">
             <template #default="{ row }">
               <span v-if="row.cooldown_remaining_secs">{{ row.cooldown_remaining_secs }}s</span>
               <span v-else class="hint">—</span>
@@ -157,8 +146,12 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
+import { translate } from '../i18n'
 import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, me, getBreakerConfig } from '../api'
 import { breaker, loadBreakerSnapshot, resetAllBreakers } from '../breaker'
+
+const { t } = useI18n()
 
 const mappings = ref([])
 const channelModels = ref([])
@@ -187,6 +180,13 @@ const snapshot = computed(() => breaker.snapshot)
 const openCount = computed(
   () => snapshot.value.filter((r) => r.state === 'open').length,
 )
+// Breaker doc text interpolates the live thresholds, which come from the
+// server so the description matches what's actually enforced.
+const breakerParams = computed(() => ({
+  base: baseDelaySecs.value,
+  max: maxDelaySecs.value,
+  probe: probeIntervalSecs.value,
+}))
 
 async function refreshBreaker() {
   breakerLoading.value = true
@@ -220,9 +220,9 @@ function channelModelNames(name) {
   return ch ? ch.models : []
 }
 
-function formatTarget(t) {
-  const model = t.model === '*' ? '全部模型' : t.model
-  return t.channel ? `${t.channel}/${model}` : model
+function formatTarget(tgt) {
+  const model = tgt.model === '*' ? translate('mappings.allModels') : tgt.model
+  return tgt.channel ? `${tgt.channel}/${model}` : model
 }
 
 function openCreate() {
@@ -255,15 +255,15 @@ async function submit() {
     .map((t) => ({ channel: (t.channel || '').trim(), model: (t.model || '').trim() }))
     .filter((t) => t.model)
   if (!form.value.alias.trim()) {
-    ElMessage.warning('请填写客户端模型名')
+    ElMessage.warning(t('mappings.aliasRequired'))
     return
   }
   if (targets.length === 0) {
-    ElMessage.warning('请至少填写一个转发目标')
+    ElMessage.warning(t('mappings.needOneTarget'))
     return
   }
   if (targets.some((t) => t.model === '*' && !t.channel)) {
-    ElMessage.warning('「全部模型」需要先选定渠道')
+    ElMessage.warning(t('mappings.allModelsNeedChannel'))
     return
   }
   saving.value = true
@@ -278,12 +278,12 @@ async function submit() {
     } catch (e) {
       // 409 = alias already exists; surface a clearer one
       if (e?.response?.status === 409) {
-        ElMessage.error(`模型名 "${form.value.alias}" 已存在`)
+        ElMessage.error(t('mappings.aliasExists', { alias: form.value.alias }))
         return
       }
       throw e
     }
-    ElMessage.success(editingId.value ? '已保存' : '已添加')
+    ElMessage.success(editingId.value ? t('common.saved') : t('mappings.added'))
     dialogVisible.value = false
     await load()
   } finally {

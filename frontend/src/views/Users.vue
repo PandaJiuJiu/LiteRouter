@@ -1,35 +1,35 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>系统用户：管理员可创建、重置密码或删除账号</span>
-      <el-button type="primary" @click="openCreate">新建用户</el-button>
+      <span>{{ t('users.description') }}</span>
+      <el-button type="primary" @click="openCreate">{{ t('users.create') }}</el-button>
     </div>
 
     <el-table :data="users" v-loading="loading">
-      <el-table-column prop="username" label="用户名" width="200" />
-      <el-table-column label="角色" width="140">
+      <el-table-column prop="username" :label="t('users.col.username')" width="200" />
+      <el-table-column :label="t('users.col.role')" width="140">
         <template #default="{ row }">
-          <el-tag v-if="row.is_admin" type="success" size="small">管理员</el-tag>
-          <el-tag v-else size="small">普通用户</el-tag>
+          <el-tag v-if="row.is_admin" type="success" size="small">{{ t('users.roleAdmin') }}</el-tag>
+          <el-tag v-else size="small">{{ t('users.roleUser') }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="创建时间" width="180">
+      <el-table-column :label="t('users.col.created')" width="180">
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column label="操作">
+      <el-table-column :label="t('users.col.actions')">
         <template #default="{ row }">
-          <el-button size="small" @click="openResetPwd(row)">重置密码</el-button>
+          <el-button size="small" @click="openResetPwd(row)">{{ t('users.resetPassword') }}</el-button>
           <el-popconfirm
             :title="row.is_admin && users.filter((u) => u.is_admin).length <= 1
-              ? '至少保留一个管理员'
-              : `确认删除用户「${row.username}」？`"
+              ? t('users.keepOneAdmin')
+              : t('users.deleteConfirm', { username: row.username })"
             @confirm="remove(row)">
             <template #reference>
               <el-button size="small" type="danger"
                 :disabled="row.is_admin && users.filter((u) => u.is_admin).length <= 1">
-                删除
+                {{ t('common.delete') }}
               </el-button>
             </template>
           </el-popconfirm>
@@ -38,39 +38,40 @@
     </el-table>
 
     <!-- 新建用户 -->
-    <el-dialog v-model="createVisible" title="新建用户" width="440px" @closed="resetFormState">
+    <el-dialog v-model="createVisible" :title="t('users.createTitle')" width="440px" @closed="resetFormState">
       <el-form :model="form" label-width="100px">
-        <el-form-item label="用户名">
-          <el-input v-model="form.username" placeholder="登录用户名" />
+        <el-form-item :label="t('users.col.username')">
+          <el-input v-model="form.username" :placeholder="t('users.usernamePlaceholder')" />
         </el-form-item>
-        <el-form-item label="密码">
+        <el-form-item :label="t('login.password')">
           <el-input v-model="form.password" type="password" show-password
-            placeholder="至少 8 位" />
+            :placeholder="t('common.min8Chars')" />
         </el-form-item>
-        <el-form-item label="角色">
-          <el-switch v-model="form.is_admin" active-text="管理员" inactive-text="普通用户" />
+        <el-form-item :label="t('users.roleLabel')">
+          <el-switch v-model="form.is_admin" :active-text="t('users.roleAdmin')"
+            :inactive-text="t('users.roleUser')" />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="submitCreate">创建</el-button>
+        <el-button @click="createVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="saving" @click="submitCreate">{{ t('common.create') }}</el-button>
       </template>
     </el-dialog>
 
     <!-- 重置密码 -->
-    <el-dialog v-model="resetVisible" title="重置密码" width="440px">
+    <el-dialog v-model="resetVisible" :title="t('users.resetTitle')" width="440px">
       <el-form :model="resetForm" label-width="100px">
-        <el-form-item label="用户">
+        <el-form-item :label="t('users.userLabel')">
           <span>{{ resetTarget?.username }}</span>
         </el-form-item>
-        <el-form-item label="新密码">
+        <el-form-item :label="t('users.newPasswordLabel')">
           <el-input v-model="resetForm.password" type="password" show-password
-            placeholder="至少 8 位" />
+            :placeholder="t('common.min8Chars')" />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="resetVisible = false">取消</el-button>
-        <el-button type="primary" :loading="resetting" @click="submitReset">保存</el-button>
+        <el-button @click="resetVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="resetting" @click="submitReset">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -79,7 +80,10 @@
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { listUsers, createUser, updateUser, deleteUser } from '../api'
+
+const { t } = useI18n()
 
 const users = ref([])
 const loading = ref(false)
@@ -111,11 +115,11 @@ function openCreate() {
 async function submitCreate() {
   const username = form.value.username.trim()
   if (!username) {
-    ElMessage.warning('请输入用户名')
+    ElMessage.warning(t('common.usernameRequired'))
     return
   }
   if (form.value.password.length < 8) {
-    ElMessage.warning('密码至少 8 位')
+    ElMessage.warning(t('common.passwordMinLength'))
     return
   }
   saving.value = true
@@ -125,7 +129,7 @@ async function submitCreate() {
       password: form.value.password,
       is_admin: form.value.is_admin,
     })
-    ElMessage.success('已创建')
+    ElMessage.success(t('users.created'))
     createVisible.value = false
     await load()
   } finally {
@@ -141,13 +145,13 @@ function openResetPwd(row) {
 
 async function submitReset() {
   if (resetForm.password.length < 8) {
-    ElMessage.warning('密码至少 8 位')
+    ElMessage.warning(t('common.passwordMinLength'))
     return
   }
   resetting.value = true
   try {
     await updateUser(resetTarget.value.id, { password: resetForm.password })
-    ElMessage.success('密码已重置')
+    ElMessage.success(t('users.passwordReset'))
     resetVisible.value = false
   } finally {
     resetting.value = false
@@ -156,7 +160,7 @@ async function submitReset() {
 
 async function remove(row) {
   await deleteUser(row.id)
-  ElMessage.success('已删除')
+  ElMessage.success(t('users.deleted'))
   await load()
 }
 

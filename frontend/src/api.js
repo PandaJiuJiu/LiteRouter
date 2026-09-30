@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from './router'
+import { translate } from './i18n'
 
 const api = axios.create({ baseURL: '/api' })
 
@@ -20,7 +21,7 @@ api.interceptors.response.use(
     // backend errors: {error: "message"} / {error: {message}} / OpenAI style
     const e = err.response?.data?.error
     const msg = typeof e === 'string' ? e : e?.message
-    ElMessage.error(msg || err.message || '请求失败')
+    ElMessage.error(msg || err.message || translate('common.requestFailed'))
     return Promise.reject(err)
   },
 )
@@ -103,6 +104,10 @@ export const deleteMapping = (id) => api.delete(`/mappings/${id}`)
 export const getDebugLogging = () => api.get('/settings/debug-logging').then((r) => r.data.enabled)
 export const setDebugLogging = (enabled) =>
   api.put('/settings/debug-logging', { enabled }).then((r) => r.data.enabled)
+// Global UI language. Any signed-in user may set it; the login/setup pages
+// read the same value from /setup-status since they have no session yet.
+export const setLanguage = (language) =>
+  api.put('/settings/language', { language }).then((r) => r.data.language)
 
 // ---------- circuit breaker ----------
 export const getBreakerConfig = () =>

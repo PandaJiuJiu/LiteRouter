@@ -1,39 +1,39 @@
 <template>
   <el-card v-loading="loading">
     <div class="toolbar">
-      <span>{{ channelId ? `配置渠道「${channelName}」的模型` : '从上游获取模型列表后勾选该渠道对外提供的模型' }}</span>
+      <span>{{ channelId ? t('models.headerForChannel', { name: channelName }) : t('models.headerAll') }}</span>
       <div>
-        <el-button v-if="channelId" @click="back">返回渠道列表</el-button>
-        <el-button v-else @click="load">刷新</el-button>
+        <el-button v-if="channelId" @click="back">{{ t('models.backToChannels') }}</el-button>
+        <el-button v-else @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
-    <el-empty v-if="!channels.length && !loading" description="还没有渠道，请先在渠道管理中添加" />
+    <el-empty v-if="!channels.length && !loading" :description="t('models.emptyNoChannels')" />
 
     <el-card v-for="ch in channels" :key="ch.id" class="channel-card" shadow="never">
       <div class="channel-head">
         <div>
           <span class="channel-name">{{ ch.name }}</span>
-          <el-tag v-if="ch.enabled" type="success" size="small">启用</el-tag>
-          <el-tag v-else type="danger" size="small">禁用</el-tag>
+          <el-tag v-if="ch.enabled" type="success" size="small">{{ t('common.enabled') }}</el-tag>
+          <el-tag v-else type="danger" size="small">{{ t('common.disabled') }}</el-tag>
           <el-tag v-if="ch.base_url" size="small">OpenAI</el-tag>
           <el-tag v-if="ch.base_url_anthropic" size="small">Anthropic</el-tag>
         </div>
         <div>
           <el-button size="small" :loading="ch._testingAll"
             :disabled="!modelList(ch).length" @click="testAll(ch)">
-            全部测试
+            {{ t('models.testAll') }}
           </el-button>
           <el-button size="small" :loading="ch._fetching"
             :disabled="!ch.base_url && !ch.base_url_anthropic" @click="fetchList(ch)">
-            获取模型列表
+            {{ t('models.fetchList') }}
           </el-button>
-          <el-button size="small" @click="openManual(ch)">手动添加</el-button>
+          <el-button size="small" @click="openManual(ch)">{{ t('models.manualAdd') }}</el-button>
         </div>
       </div>
 
       <div v-if="!ch.base_url" class="hint">
-        该渠道只配置了 Anthropic 协议，暂不支持自动获取（可手动添加模型）
+        {{ t('models.anthropicOnlyHint') }}
       </div>
 
       <!-- 模型卡片网格 -->
@@ -50,70 +50,70 @@
             <template v-for="proto in PROTOCOLS" :key="proto">
               <template v-if="ch._testResult?.[m]?.protocols?.[proto]">
                 <el-tooltip v-if="ch._testResult[m].protocols[proto].ok === false"
-                            :content="ch._testResult[m].protocols[proto].error || '不可用'"
+                            :content="ch._testResult[m].protocols[proto].error || t('models.unavailable')"
                             placement="top">
                   <div class="status-line fail">
                     <el-icon class="status-icon"><CircleCloseFilled /></el-icon>
                     <span class="status-proto">{{ proto }}</span>
-                    <span class="status-text">不可用</span>
+                    <span class="status-text">{{ t('models.unavailable') }}</span>
                   </div>
                 </el-tooltip>
                 <div v-else class="status-line ok">
                   <el-icon class="status-icon"><CircleCheckFilled /></el-icon>
                   <span class="status-proto">{{ proto }}</span>
-                  <span class="status-text">可用</span>
+                  <span class="status-text">{{ t('models.available') }}</span>
                 </div>
               </template>
             </template>
-            <div v-if="!hasTestResult(ch, m)" class="status-untested">尚未测试</div>
+            <div v-if="!hasTestResult(ch, m)" class="status-untested">{{ t('models.untested') }}</div>
           </div>
           <div class="model-card-actions">
             <el-button class="action-btn" :loading="ch._testingModel === m"
                        @click="pingModel(ch, m)">
               <el-icon><Refresh /></el-icon>
-              <span>测试</span>
+              <span>{{ t('models.test') }}</span>
             </el-button>
             <el-popconfirm class="action-pop"
-                           :title="`从「${ch.name}」移除「${m}」？该模型的测试结果也会清空`"
-                           confirm-button-text="移除"
-                           cancel-button-text="取消"
+                           :title="t('models.removeConfirm', { channel: ch.name, model: m })"
+                           :confirm-button-text="t('common.remove')"
+                           :cancel-button-text="t('common.cancel')"
                            @confirm="removeModel(ch, m)">
               <template #reference>
                 <el-button class="action-btn" type="danger" plain>
                   <el-icon><Delete /></el-icon>
-                  <span>删除</span>
+                  <span>{{ t('common.delete') }}</span>
                 </el-button>
               </template>
             </el-popconfirm>
           </div>
         </div>
       </div>
-      <span v-else class="hint">尚未配置模型</span>
+      <span v-else class="hint">{{ t('models.noModels') }}</span>
     </el-card>
 
     <!-- 手动添加模型 -->
-    <el-dialog v-model="manualVisible" title="手动添加模型" width="480px">
-      <p class="hint" style="margin-top: 0">逗号分隔，追加到该渠道的模型列表</p>
-      <el-input v-model="manualInput" type="textarea" :rows="4" placeholder="如 gpt-4o,gpt-4o-mini,gpt-3.5-turbo" />
+    <el-dialog v-model="manualVisible" :title="t('models.manualTitle')" width="480px">
+      <p class="hint" style="margin-top: 0">{{ t('models.manualHint') }}</p>
+      <el-input v-model="manualInput" type="textarea" :rows="4" :placeholder="t('models.manualPlaceholder')" />
       <template #footer>
-        <el-button @click="manualVisible = false">取消</el-button>
-        <el-button type="primary" @click="saveManual">保存</el-button>
+        <el-button @click="manualVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" @click="saveManual">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
 
     <!-- 选择要添加的模型 -->
     <el-dialog v-model="selectVisible"
-      :title="`选择要添加到「${selectTarget?.name || ''}」的模型`"
+      :title="t('models.selectTitle', { channel: selectTarget?.name || '' })"
       width="560px" top="6vh" @closed="onSelectClosed">
       <div class="select-toolbar">
-        <span class="hint">已选 {{ selectedArr.length }} / {{ fetchedList.length }}</span>
+        <span class="hint">{{ t('models.selectedCount', { selected: selectedArr.length, total: fetchedList.length }) }}</span>
         <div>
-          <el-button size="small" @click="selectAll">全选</el-button>
-          <el-button size="small" @click="selectNone">全不选</el-button>
-          <el-button size="small" @click="selectInverse">反选</el-button>
+          <el-button size="small" @click="selectAll">{{ t('models.selectAll') }}</el-button>
+          <el-button size="small" @click="selectNone">{{ t('models.selectNone') }}</el-button>
+          <el-button size="small" @click="selectInverse">{{ t('models.selectInverse') }}</el-button>
         </div>
       </div>
-      <el-input v-model="selectFilter" placeholder="过滤模型名（不区分大小写）"
+      <el-input v-model="selectFilter" :placeholder="t('models.filterPlaceholder')"
         clearable class="select-filter" />
       <div class="select-list">
         <el-checkbox-group v-model="selectedArr">
@@ -121,12 +121,12 @@
             <span class="select-name">{{ m }}</span>
           </el-checkbox>
         </el-checkbox-group>
-        <el-empty v-if="!filteredList.length" description="无匹配模型" :image-size="60" />
+        <el-empty v-if="!filteredList.length" :description="t('models.noMatch')" :image-size="60" />
       </div>
       <template #footer>
-        <el-button @click="selectVisible = false">取消</el-button>
+        <el-button @click="selectVisible = false">{{ t('common.cancel') }}</el-button>
         <el-button type="primary" :loading="selectSaving" @click="confirmSelect">
-          添加到渠道
+          {{ t('models.addToChannel') }}
         </el-button>
       </template>
     </el-dialog>
@@ -137,9 +137,11 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { CircleCheckFilled, CircleCloseFilled, Delete, Refresh } from '@element-plus/icons-vue'
 import { listChannels, updateChannelModels, fetchModels, testModel } from '../api'
 
+const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 // 从渠道列表点"模型管理"进入时只看该渠道
@@ -234,7 +236,7 @@ async function fetchList(ch) {
       api_key: ch.api_key,
     })
     if (!models.length) {
-      ElMessage.warning('上游未返回任何模型')
+      ElMessage.warning(t('models.emptyUpstream'))
       return
     }
     // 去重 + 排序，让列表更易扫
@@ -301,7 +303,7 @@ async function confirmSelect() {
   // 没变化就不写库，但弹个提示让用户知道发生了什么
   if (newModels === ch.models && newDisabledStr === ch.disabled_models) {
     selectVisible.value = false
-    ElMessage.info('没有变化，未保存')
+    ElMessage.info(t('models.noChanges'))
     return
   }
   selectSaving.value = true
@@ -317,13 +319,13 @@ async function confirmSelect() {
     const added = selectedArr.value.filter((m) => !oldSet.has(m)).length
     ElMessage.success(
       added > 0
-        ? `已添加 ${added} 个模型到「${ch.name}」`
-        : `「${ch.name}」模型列表已更新`,
+        ? t('models.addedModels', { count: added, channel: ch.name })
+        : t('models.modelsUpdated', { channel: ch.name }),
     )
     selectVisible.value = false
   } catch (e) {
-    const detail = e?.response?.data?.message || e.message || '未知错误'
-    ElMessage.error(`保存失败：${detail}`)
+    const detail = e?.response?.data?.message || e.message || t('common.unknownError')
+    ElMessage.error(t('models.saveFailed', { detail }))
   } finally {
     selectSaving.value = false
   }
@@ -348,7 +350,7 @@ async function toggleModel(ch, m, enabled) {
     ch.models = newModels
     ch.disabled_models = newDisabled
   } catch (e) {
-    ElMessage.error(`更新 ${m} 失败`)
+    ElMessage.error(t('models.updateModelFailed', { model: m }))
   } finally {
     ch._togglingModel = null
   }
@@ -369,8 +371,8 @@ async function removeModel(ch, m) {
       ch.models = newModels
       ch.disabled_models = newDisabled
     } catch (e) {
-      const detail = e?.response?.data?.message || e.message || '未知错误'
-      ElMessage.error(`移除 ${m} 失败：${detail}`)
+      const detail = e?.response?.data?.message || e.message || t('common.unknownError')
+      ElMessage.error(t('models.removeFailed', { model: m, detail }))
       return  // 写库失败就不动 known，避免前端状态和数据库脱钩
     }
   }
@@ -382,7 +384,7 @@ async function removeModel(ch, m) {
   }
   // 3. 清掉残留的测试结果，避免下次同名的卡片（罕见）读到旧状态
   if (ch._testResult) delete ch._testResult[m]
-  ElMessage.success(`已从「${ch.name}」移除 ${m}`)
+  ElMessage.success(t('models.removed', { channel: ch.name, model: m }))
 }
 
 async function pingModel(ch, m) {
@@ -398,12 +400,12 @@ async function pingModel(ch, m) {
     ch._testResult[m] = r
     // toast summary
     const ok = PROTOCOLS.filter((p) => r.protocols?.[p]?.ok)
-    if (r.ok) ElMessage.success(`${m}: ${ok.join(' + ') || '可用'}`)
-    else ElMessage.error(`${m}: 不可用`)
+    if (r.ok) ElMessage.success(t('models.testOk', { model: m, protocols: ok.join(' + ') || t('models.available') }))
+    else ElMessage.error(t('models.testUnavailable', { model: m }))
   } catch (e) {
     if (!ch._testResult) ch._testResult = {}
     ch._testResult[m] = { ok: false, protocols: {} }
-    ElMessage.error(`${m}: 测试失败`)
+    ElMessage.error(t('models.testFailed', { model: m }))
   } finally {
     ch._testingModel = null
   }
@@ -439,8 +441,8 @@ async function testAll(ch) {
         fail++
       }
     }
-    if (fail === 0) ElMessage.success(`${ch.name}：${ok} 个模型全部可用`)
-    else ElMessage.warning(`${ch.name}：${ok} 个可用，${fail} 个不可用`)
+    if (fail === 0) ElMessage.success(t('models.allOk', { channel: ch.name, count: ok }))
+    else ElMessage.warning(t('models.summary', { channel: ch.name, ok, fail }))
   } finally {
     ch._testingModel = null
     ch._testingAll = false
@@ -457,7 +459,7 @@ async function saveManual() {
   const ch = manualTarget.value
   const adds = splitModels(manualInput.value)
   if (!adds.length) {
-    ElMessage.warning('请输入至少一个模型名')
+    ElMessage.warning(t('models.needOneModel'))
     return
   }
   const enabled = [...new Set([...splitModels(ch.models), ...adds])]
@@ -470,7 +472,7 @@ async function saveManual() {
   ch.disabled_models = disabledStr
   rememberModels(ch.id, adds)
   manualVisible.value = false
-  ElMessage.success('已添加')
+  ElMessage.success(t('models.manualAdded', { count: adds.length }))
 }
 
 onMounted(load)

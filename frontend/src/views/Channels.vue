@@ -1,11 +1,11 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>外部渠道：配置上游 API 地址、密钥与支持的模型</span>
-      <el-button type="primary" @click="openDialog()">添加渠道</el-button>
+      <span>{{ t('channels.description') }}</span>
+      <el-button type="primary" @click="openDialog()">{{ t('channels.add') }}</el-button>
     </div>
     <el-table :data="channels" v-loading="loading">
-      <el-table-column prop="name" label="名称" width="160">
+      <el-table-column prop="name" :label="t('channels.col.name')" width="160">
         <template #default="{ row }">
           <a v-if="row.website" :href="row.website" target="_blank" rel="noopener"
             class="name-link">{{ row.name }}<el-icon class="ext-icon"><Link /></el-icon></a>
@@ -18,12 +18,12 @@
           <div v-if="row.base_url_anthropic">Anthropic: {{ row.base_url_anthropic }}</div>
         </template>
       </el-table-column>
-      <el-table-column prop="models" label="模型" min-width="200" show-overflow-tooltip>
+      <el-table-column prop="models" :label="t('channels.col.models')" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
-          {{ row.models === '*' ? '全部模型（*）' : (row.models || '未配置（去"模型管理"页配置）') }}
+          {{ row.models === '*' ? t('channels.allModels') : (row.models || t('channels.notConfigured')) }}
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="90">
+      <el-table-column :label="t('channels.col.status')" width="90">
         <template #default="{ row }">
           <el-switch
             :model-value="!!row.enabled"
@@ -31,45 +31,45 @@
           />
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="230">
+      <el-table-column :label="t('channels.col.actions')" width="230">
         <template #default="{ row }">
-          <el-button size="small" @click="openDialog(row)">编辑</el-button>
-          <el-button size="small" type="primary" plain @click="manageModels(row)">模型管理</el-button>
-          <el-popconfirm title="确认删除该渠道？" @confirm="remove(row.id)">
+          <el-button size="small" @click="openDialog(row)">{{ t('common.edit') }}</el-button>
+          <el-button size="small" type="primary" plain @click="manageModels(row)">{{ t('channels.manageModels') }}</el-button>
+          <el-popconfirm :title="t('channels.deleteConfirm')" @confirm="remove(row.id)">
             <template #reference>
-              <el-button size="small" type="danger">删除</el-button>
+              <el-button size="small" type="danger">{{ t('common.delete') }}</el-button>
             </template>
           </el-popconfirm>
         </template>
       </el-table-column>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑渠道' : '添加渠道'" width="560px">
+    <el-dialog v-model="dialogVisible" :title="editing ? t('channels.editChannel') : t('channels.addChannel')" width="560px">
       <el-form label-width="120px">
-        <el-form-item label="名称">
-          <el-input v-model="form.name" placeholder="渠道名称" />
+        <el-form-item :label="t('channels.form.name')">
+          <el-input v-model="form.name" :placeholder="t('channels.form.namePlaceholder')" />
         </el-form-item>
-        <el-form-item label="官网">
-          <el-input v-model="form.website" placeholder="上游官方网址，例如 https://openai.com" />
+        <el-form-item :label="t('channels.form.website')">
+          <el-input v-model="form.website" :placeholder="t('channels.form.websitePlaceholder')" />
         </el-form-item>
         <el-form-item label="OpenAI URL">
           <el-input v-model="form.base_url"
-            placeholder="兼容 OpenAI 协议的地址（含完整路径，如 https://api.openai.com/v1）" />
+            :placeholder="t('channels.form.openaiUrlPlaceholder')" />
         </el-form-item>
         <el-form-item label="Anthropic URL">
           <el-input v-model="form.base_url_anthropic"
-            placeholder="兼容 Anthropic 协议的地址（含完整路径，如 https://api.anthropic.com/v1）" />
+            :placeholder="t('channels.form.anthropicUrlPlaceholder')" />
         </el-form-item>
         <el-form-item label="API Key">
-          <el-input v-model="form.api_key" placeholder="上游渠道密钥" show-password />
+          <el-input v-model="form.api_key" :placeholder="t('channels.form.apiKeyPlaceholder')" show-password />
         </el-form-item>
-        <el-form-item label="启用">
+        <el-form-item :label="t('channels.form.enabled')">
           <el-switch v-model="form.enabled" />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="save">保存</el-button>
+        <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" @click="save">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -79,8 +79,11 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { Link } from '@element-plus/icons-vue'
 import { listChannels, createChannel, updateChannel, deleteChannel } from '../api'
+
+const { t } = useI18n()
 
 const channels = ref([])
 const loading = ref(false)
@@ -113,11 +116,11 @@ function openDialog(row) {
 
 async function save() {
   if (!form.value.name || !form.value.api_key) {
-    ElMessage.warning('名称、API Key 不能为空')
+    ElMessage.warning(t('channels.nameKeyRequired'))
     return
   }
   if (!form.value.base_url && !form.value.base_url_anthropic) {
-    ElMessage.warning('OpenAI URL 和 Anthropic URL 至少填写一个')
+    ElMessage.warning(t('channels.urlRequired'))
     return
   }
   if (editing.value) {
@@ -142,8 +145,8 @@ async function toggleEnabled(row, val) {
     await updateChannel(row.id, { ...row, enabled: val })
   } catch (e) {
     row.enabled = prev        // revert on failure
-    const detail = e?.response?.data?.message || e.message || '未知错误'
-    ElMessage.error(`切换失败：${detail}`)
+    const detail = e?.response?.data?.message || e.message || t('common.unknownError')
+    ElMessage.error(t('channels.toggleFailed', { detail }))
   }
 }
 

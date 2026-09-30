@@ -1,17 +1,17 @@
 <template>
   <el-card v-loading="loading">
     <div class="toolbar">
-      <span>Token 用量与请求统计</span>
+      <span>{{ t('usage.description') }}</span>
       <el-radio-group v-model="range" @change="load">
-        <el-radio-button :value="1">今日</el-radio-button>
-        <el-radio-button :value="7">7 天</el-radio-button>
-        <el-radio-button :value="30">30 天</el-radio-button>
+        <el-radio-button :value="1">{{ t('usage.range.today') }}</el-radio-button>
+        <el-radio-button :value="7">{{ t('usage.range.days7') }}</el-radio-button>
+        <el-radio-button :value="30">{{ t('usage.range.days30') }}</el-radio-button>
       </el-radio-group>
     </div>
 
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-label">总请求数</div>
+        <div class="stat-label">{{ t('usage.totalRequests') }}</div>
         <div class="stat-value">{{ fmtNum(totes.requests) }}</div>
       </div>
       <div class="stat-card">
@@ -29,39 +29,39 @@
     </div>
 
     <el-tabs v-model="activeTab">
-      <el-tab-pane label="按 Token" name="token">
+      <el-tab-pane :label="t('usage.tab.token')" name="token">
         <el-table :data="by_token" stripe>
-          <el-table-column prop="key" label="内部 token" min-width="160" />
-          <el-table-column prop="requests" label="请求数" width="120" sortable />
+          <el-table-column prop="key" :label="t('usage.col.internalToken')" min-width="160" />
+          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
           <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
           <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
           <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
         </el-table>
       </el-tab-pane>
-      <el-tab-pane label="按 Model" name="model">
+      <el-tab-pane :label="t('usage.tab.model')" name="model">
         <el-table :data="by_model" stripe>
-          <el-table-column prop="key" label="模型" min-width="200" />
-          <el-table-column prop="requests" label="请求数" width="120" sortable />
+          <el-table-column prop="key" :label="t('usage.col.model')" min-width="200" />
+          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
           <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
           <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
           <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
         </el-table>
       </el-tab-pane>
-      <el-tab-pane label="按 Channel" name="channel">
+      <el-tab-pane :label="t('usage.tab.channel')" name="channel">
         <el-table :data="by_channel" stripe>
-          <el-table-column prop="key" label="上游渠道" min-width="160" />
-          <el-table-column prop="requests" label="请求数" width="120" sortable />
+          <el-table-column prop="key" :label="t('usage.col.channel')" min-width="160" />
+          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
           <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
           <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
           <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
         </el-table>
       </el-tab-pane>
-      <el-tab-pane label="按日" name="day">
+      <el-tab-pane :label="t('usage.tab.day')" name="day">
         <el-table :data="by_day" stripe>
-          <el-table-column label="日期" min-width="160">
+          <el-table-column :label="t('usage.col.date')" min-width="160">
             <template #default="{ row }">{{ fmtDate(row.day) }}</template>
           </el-table-column>
-          <el-table-column prop="requests" label="请求数" width="120" sortable />
+          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
           <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
           <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
           <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
@@ -69,13 +69,16 @@
       </el-tab-pane>
     </el-tabs>
 
-    <p class="hint">注：流式（stream）响应不在统计范围内——上游的 usage 在最后一个 SSE chunk 里，需要特殊解析。后续增强。</p>
+    <p class="hint">{{ t('usage.footnote') }}</p>
   </el-card>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { fetchUsage } from '../api'
+
+const { t } = useI18n()
 
 const range = ref(7)
 const loading = ref(false)

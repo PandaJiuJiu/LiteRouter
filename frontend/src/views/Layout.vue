@@ -6,12 +6,12 @@
     >
       <div class="logo"><img src="/logo-wordmark.svg" alt="LiteRouter" /></div>
       <el-menu :default-active="$route.path" router class="menu">
-        <el-menu-item v-if="isAdmin" index="/channels">渠道管理</el-menu-item>
-        <el-menu-item index="/tokens">令牌管理</el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/mappings">模型路由</el-menu-item>
-        <el-menu-item index="/usage">用量统计</el-menu-item>
-        <el-menu-item index="/logs">调用日志</el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/users">用户管理</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/channels">{{ t('nav.channels') }}</el-menu-item>
+        <el-menu-item index="/tokens">{{ t('nav.tokens') }}</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/mappings">{{ t('nav.mappings') }}</el-menu-item>
+        <el-menu-item index="/usage">{{ t('nav.usage') }}</el-menu-item>
+        <el-menu-item index="/logs">{{ t('nav.logs') }}</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/users">{{ t('nav.users') }}</el-menu-item>
       </el-menu>
       <div class="user-wrap">
         <el-dropdown trigger="click" placement="top-end" @command="onUserCommand">
@@ -34,10 +34,22 @@
                       d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
                     />
                   </svg>
-                </el-icon>项目 GitHub
+                </el-icon>{{ t('nav.github') }}
               </el-dropdown-item>
-              <el-dropdown-item command="logout">
-                <el-icon><SwitchButton /></el-icon>退出登录
+              <!-- el-dropdown 不支持嵌套下拉，语言选项平铺成两项，
+                   当前语言打勾。选项文案恒用各自母语。 -->
+              <el-dropdown-item command="lang:zh-CN" divided
+                :class="{ 'lang-active': locale === 'zh-CN' }">
+                <span>{{ LANGUAGES[0].label }}</span>
+                <el-icon v-if="locale === 'zh-CN'" class="lang-check"><Select /></el-icon>
+              </el-dropdown-item>
+              <el-dropdown-item command="lang:en-US"
+                :class="{ 'lang-active': locale === 'en-US' }">
+                <span>{{ LANGUAGES[1].label }}</span>
+                <el-icon v-if="locale === 'en-US'" class="lang-check"><Select /></el-icon>
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" divided>
+                <el-icon><SwitchButton /></el-icon>{{ t('nav.logout') }}
               </el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -53,10 +65,14 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ArrowRight, SwitchButton } from '@element-plus/icons-vue'
-import { logout, me } from '../api'
+import { useI18n } from 'vue-i18n'
+import { ArrowRight, Select, SwitchButton } from '@element-plus/icons-vue'
+import { LANGUAGES, i18n, setLocale } from '../i18n'
+import { logout, me, setLanguage } from '../api'
 
+const { t } = useI18n()
 const router = useRouter()
+const locale = computed(() => i18n.global.locale.value)
 const username = ref('')
 const isAdmin = ref(false)
 
@@ -78,6 +94,19 @@ async function loadMe() {
 function onUserCommand(cmd) {
   if (cmd === 'logout') return doLogout()
   if (cmd === 'github') window.open(repoUrl, '_blank', 'noopener,noreferrer')
+  if (cmd?.startsWith('lang:')) return switchLanguage(cmd.slice(5))
+}
+
+// 先本地切换、立刻可见，再写库。语言是纯展示设置，不值得为它转圈；
+// 万一写库失败，下次加载会回到 DB 里的旧值，行为可预期。
+async function switchLanguage(lang) {
+  if (lang === locale.value) return
+  setLocale(lang)
+  try {
+    await setLanguage(lang)
+  } catch (_) {
+    // 拦截器已经弹过提示了；本地状态保持用户刚选的，不回滚
+  }
 }
 
 async function doLogout() {
@@ -169,5 +198,14 @@ onMounted(loadMe)
 }
 .dd-user {
   margin-right: 6px;
+}
+/* Language rows: label left, checkmark right — the check is what tells you
+   which one is live now. */
+:deep(.el-dropdown-menu__item.lang-active) {
+  color: #409eff;
+}
+.lang-check {
+  margin-left: 12px;
+  font-size: 12px;
 }
 </style>

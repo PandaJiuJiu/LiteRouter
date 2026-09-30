@@ -1,52 +1,52 @@
 <template>
   <el-card>
     <div class="toolbar">
-      <span>内部令牌：内部服务使用这些 key 访问统一 API</span>
-      <el-button type="primary" @click="openCreate">创建令牌</el-button>
+      <span>{{ t('tokens.description') }}</span>
+      <el-button type="primary" @click="openCreate">{{ t('tokens.create') }}</el-button>
     </div>
     <el-table :data="tokens" v-loading="loading">
-      <el-table-column prop="name" label="名称" width="160" />
-      <el-table-column v-if="isAdmin" label="归属" width="120">
+      <el-table-column prop="name" :label="t('tokens.col.name')" width="160" />
+      <el-table-column v-if="isAdmin" :label="t('tokens.col.owner')" width="120">
         <template #default="{ row }">
           <span v-if="row.owner">{{ row.owner }}</span>
-          <span v-else class="hint">未分配</span>
+          <span v-else class="hint">{{ t('tokens.unassigned') }}</span>
         </template>
       </el-table-column>
       <el-table-column label="Key" min-width="280">
         <template #default="{ row }">
           <span class="mono">{{ row.key }}</span>
-          <el-button size="small" text @click="copyKey(row.key)">复制</el-button>
+          <el-button size="small" text @click="copyKey(row.key)">{{ t('tokens.copy') }}</el-button>
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="80">
+      <el-table-column :label="t('tokens.col.status')" width="80">
         <template #default="{ row }">
           <el-switch :model-value="!!row.enabled"
             @change="(v) => save(row, { enabled: v })" />
         </template>
       </el-table-column>
-      <el-table-column label="RPM 限制" width="110">
+      <el-table-column :label="t('tokens.col.rpm')" width="110">
         <template #default="{ row }">
-          <span v-if="row.rpm_limit > 0">{{ row.rpm_limit }} / 分钟</span>
-          <span v-else class="hint">不限</span>
+          <span v-if="row.rpm_limit > 0">{{ row.rpm_limit }} {{ t('common.minutes') }}</span>
+          <span v-else class="hint">{{ t('common.unlimited') }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="日 Token 配额" width="130">
+      <el-table-column :label="t('tokens.col.dailyQuota')" width="130">
         <template #default="{ row }">
-          <span v-if="row.daily_token_limit > 0">{{ fmt(row.daily_token_limit) }} / 天</span>
-          <span v-else class="hint">不限</span>
+          <span v-if="row.daily_token_limit > 0">{{ fmt(row.daily_token_limit) }} {{ t('common.days') }}</span>
+          <span v-else class="hint">{{ t('common.unlimited') }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="最近使用" width="170">
+      <el-table-column :label="t('tokens.col.lastUsed')" width="170">
         <template #default="{ row }">
           {{ row.accessed_at ? new Date(row.accessed_at * 1000).toLocaleString() : '-' }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="160">
+      <el-table-column :label="t('tokens.col.actions')" width="160">
         <template #default="{ row }">
-          <el-button size="small" @click="openEdit(row)">配额</el-button>
-          <el-popconfirm title="确认删除该令牌？" @confirm="remove(row.id)">
+          <el-button size="small" @click="openEdit(row)">{{ t('tokens.quota') }}</el-button>
+          <el-popconfirm :title="t('tokens.deleteConfirm')" @confirm="remove(row.id)">
             <template #reference>
-              <el-button size="small" type="danger">删除</el-button>
+              <el-button size="small" type="danger">{{ t('common.delete') }}</el-button>
             </template>
           </el-popconfirm>
         </template>
@@ -54,35 +54,35 @@
     </el-table>
 
     <el-dialog v-model="dialogVisible"
-      :title="editing ? '编辑配额' : '创建令牌'"
+      :title="editing ? t('tokens.editQuota') : t('tokens.create')"
       width="460px"
       @closed="resetForm">
       <el-form :model="form" label-width="120px">
-        <el-form-item label="名称">
-          <el-input v-model="form.name" :disabled="editing" placeholder="内部服务名 / 用途" />
+        <el-form-item :label="t('tokens.col.name')">
+          <el-input v-model="form.name" :disabled="editing" :placeholder="t('tokens.namePlaceholder')" />
         </el-form-item>
-        <el-form-item v-if="!editing && isAdmin" label="归属用户">
-          <el-select v-model="form.user_id" placeholder="默认归属自己" clearable style="width: 220px">
+        <el-form-item v-if="!editing && isAdmin" :label="t('tokens.ownerLabel')">
+          <el-select v-model="form.user_id" :placeholder="t('tokens.ownerPlaceholder')" clearable style="width: 220px">
             <el-option v-for="u in users" :key="u.id"
-              :label="u.username + (u.is_admin ? ' (管理员)' : '')"
+              :label="u.username + (u.is_admin ? t('tokens.adminSuffix') : '')"
               :value="u.id" />
           </el-select>
         </el-form-item>
-        <el-form-item label="启用">
+        <el-form-item :label="t('channels.form.enabled')">
           <el-switch v-model="form.enabled" />
         </el-form-item>
-        <el-form-item label="RPM 限制">
+        <el-form-item :label="t('tokens.col.rpm')">
           <el-input-number v-model="form.rpm_limit" :min="0" :step="10" style="width: 180px" />
-          <span class="hint"> 次 / 分钟（0 = 不限）</span>
+          <span class="hint">{{ t('tokens.rpmHint') }}</span>
         </el-form-item>
-        <el-form-item label="日 Token 配额">
+        <el-form-item :label="t('tokens.col.dailyQuota')">
           <el-input-number v-model="form.daily_token_limit" :min="0" :step="10000" style="width: 180px" />
-          <span class="hint"> tokens / UTC 日（0 = 不限）</span>
+          <span class="hint">{{ t('tokens.dailyHint') }}</span>
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="submit">{{ editing ? '保存' : '创建' }}</el-button>
+        <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="saving" @click="submit">{{ editing ? t('common.save') : t('common.create') }}</el-button>
       </template>
     </el-dialog>
   </el-card>
@@ -91,7 +91,10 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { createToken, deleteToken, listTokens, listUsers, me, updateToken } from '../api'
+
+const { t } = useI18n()
 
 const tokens = ref([])
 const users = ref([])
@@ -147,7 +150,7 @@ function openEdit(row) {
 
 async function submit() {
   if (!form.value.name.trim()) {
-    ElMessage.warning('请输入名称')
+    ElMessage.warning(t('tokens.nameRequired'))
     return
   }
   saving.value = true
@@ -158,7 +161,7 @@ async function submit() {
         rpm_limit: Math.max(0, form.value.rpm_limit || 0),
         daily_token_limit: Math.max(0, form.value.daily_token_limit || 0),
       })
-      ElMessage.success('已保存')
+      ElMessage.success(t('common.saved'))
     } else {
       const payload = {
         name: form.value.name.trim(),
@@ -170,7 +173,7 @@ async function submit() {
         payload.user_id = form.value.user_id
       }
       await createToken(payload)
-      ElMessage.success('已创建')
+      ElMessage.success(t('tokens.created'))
     }
     dialogVisible.value = false
     await load()
@@ -195,7 +198,7 @@ async function remove(id) {
 
 function copyKey(key) {
   navigator.clipboard.writeText(key)
-  ElMessage.success('已复制')
+  ElMessage.success(t('tokens.copied'))
 }
 
 function fmt(n) {

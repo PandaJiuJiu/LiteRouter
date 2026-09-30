@@ -3,22 +3,36 @@
     <el-card class="setup-card">
       <img src="/logo-icon.svg" alt="LiteRouter" class="brand" />
       <h2 class="brand-name">LiteRouter</h2>
-      <p class="hint">首次使用，请创建管理员账号</p>
+      <p class="hint">{{ t('setup.hint') }}</p>
+
+      <div class="lang-row">
+        <span class="lang-label">{{ t('setup.languageLabel') }}</span>
+        <!-- 选项文案恒用各自母语，不跟随当前语言 —— 否则选了英文之后
+             就没法认出哪个是"中文"了。 -->
+        <el-radio-group v-model="form.language" size="small">
+          <el-radio-button v-for="l in LANGUAGES" :key="l.value" :value="l.value">
+            {{ l.label }}
+          </el-radio-button>
+        </el-radio-group>
+      </div>
+
       <el-form :model="form" label-position="top">
-        <el-form-item label="用户名">
-          <el-input v-model="form.username" placeholder="管理员用户名" autocomplete="username"
+        <el-form-item :label="t('setup.username')">
+          <el-input v-model="form.username" :placeholder="t('setup.usernamePlaceholder')"
+            autocomplete="username" @keyup.enter="submit" />
+        </el-form-item>
+        <el-form-item :label="t('setup.password')">
+          <el-input v-model="form.password" type="password" show-password
+            :placeholder="t('setup.passwordPlaceholder')" autocomplete="new-password"
             @keyup.enter="submit" />
         </el-form-item>
-        <el-form-item label="密码（至少 8 位）">
-          <el-input v-model="form.password" type="password" show-password
-            placeholder="密码" autocomplete="new-password" @keyup.enter="submit" />
-        </el-form-item>
-        <el-form-item label="确认密码">
+        <el-form-item :label="t('setup.confirmPassword')">
           <el-input v-model="form.passwordConfirm" type="password" show-password
-            placeholder="再输入一次" autocomplete="new-password" @keyup.enter="submit" />
+            :placeholder="t('setup.confirmPasswordPlaceholder')" autocomplete="new-password"
+            @keyup.enter="submit" />
         </el-form-item>
         <el-button type="primary" style="width: 100%" :loading="loading"
-          @click="submit">创建管理员并进入</el-button>
+          @click="submit">{{ t('setup.submit') }}</el-button>
       </el-form>
     </el-card>
   </div>
@@ -28,30 +42,40 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
+import { LANGUAGES, i18n, setLocale } from '../i18n'
 import { setup } from '../api'
 
+const { t } = useI18n()
 const router = useRouter()
 const loading = ref(false)
-const form = reactive({ username: '', password: '', passwordConfirm: '' })
+// 语言先切到用户选的那个，向导本身才能立刻用他们看得懂的文案提示校验错误。
+const form = reactive({
+  username: '',
+  password: '',
+  passwordConfirm: '',
+  language: i18n.global.locale.value,
+})
 
 async function submit() {
   const username = form.username.trim()
   if (!username) {
-    ElMessage.warning('请输入用户名')
+    ElMessage.warning(t('common.usernameRequired'))
     return
   }
   if (form.password.length < 8) {
-    ElMessage.warning('密码至少 8 位')
+    ElMessage.warning(t('common.passwordMinLength'))
     return
   }
   if (form.password !== form.passwordConfirm) {
-    ElMessage.warning('两次密码不一致')
+    ElMessage.warning(t('setup.passwordMismatch'))
     return
   }
   loading.value = true
   try {
-    await setup({ username, password: form.password })
-    ElMessage.success('已创建，正在进入控制台')
+    await setup({ username, password: form.password, language: form.language })
+    setLocale(form.language)
+    ElMessage.success(t('setup.created'))
     router.push('/channels')
   } finally {
     loading.value = false
@@ -90,5 +114,20 @@ async function submit() {
   font-size: 13px;
   text-align: center;
   margin: 0 0 18px;
+}
+.lang-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 18px;
+  background: #fafafa;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+}
+.lang-label {
+  font-size: 13px;
+  color: #606266;
 }
 </style>

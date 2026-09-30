@@ -1,8 +1,8 @@
 <template>
   <el-card v-loading="loading">
     <div class="header">
-      <el-button text @click="back">‹ 返回日志列表</el-button>
-      <span class="title">调用详情 #{{ log?.id }}</span>
+      <el-button text @click="back">{{ t('logDetail.back') }}</el-button>
+      <span class="title">{{ t('logDetail.title', { id: log?.id }) }}</span>
     </div>
 
     <template v-if="log">
@@ -11,14 +11,14 @@
         <el-tag :type="ok ? 'success' : 'danger'" size="large">{{ log.status_code }}</el-tag>
         <span class="latency" v-if="log.latency_ms > 0">
           {{ log.latency_ms.toLocaleString() }} ms
-          <span class="hint">（上游响应耗时）</span>
+          <span class="hint">{{ t('logDetail.latencyHint') }}</span>
         </span>
         <el-tag v-if="log.stream" size="small" type="info">stream</el-tag>
         <el-tag v-if="log.convert && log.convert !== 'none'" size="small" type="warning">
-          协议转换 {{ log.convert }}
+          {{ t('logDetail.convert', { convert: log.convert }) }}
         </el-tag>
         <el-tag v-if="log.failed_count > 0" size="small" type="warning" effect="plain">
-          失败 {{ log.failed_count }} 次后成功
+          {{ t('logDetail.failedThenOk', { count: log.failed_count }) }}
         </el-tag>
       </div>
 
@@ -26,13 +26,13 @@
 
       <!-- 基本信息 -->
       <section>
-        <h3>请求</h3>
+        <h3>{{ t('logDetail.sectionRequest') }}</h3>
         <el-descriptions :column="1" border>
-          <el-descriptions-item label="令牌">{{ log.token_name }}</el-descriptions-item>
-          <el-descriptions-item label="客户端协议">{{ log.protocol || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="客户端 IP">{{ log.client_ip || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="时间">{{ formatTime(log.created_at) }}</el-descriptions-item>
-          <el-descriptions-item label="请求模型 → 转发模型">
+          <el-descriptions-item :label="t('logDetail.field.token')">{{ log.token_name }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.protocol')">{{ log.protocol || '—' }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.clientIp')">{{ log.client_ip || '—' }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.time')">{{ formatTime(log.created_at) }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.modelRoute')">
             {{ log.request_model || '—' }} → {{ log.upstream_model || log.request_model || '—' }}
           </el-descriptions-item>
           <el-descriptions-item label="User-Agent">
@@ -45,35 +45,35 @@
       <!-- 转发链路：一次请求 = 一行日志，内部的每一次上游尝试在这里按顺序展开 -->
       <section v-if="log.attempts && log.attempts.length">
         <h3>
-          转发链路
+          {{ t('logDetail.sectionChain') }}
           <span class="hint">
-            共 {{ attemptSummary }}
+            {{ attemptSummary }}
           </span>
         </h3>
         <el-table :data="log.attempts" size="small" border :row-class-name="attemptRowClass">
           <el-table-column label="#" width="46">
             <template #default="{ row }">{{ row.seq + 1 }}</template>
           </el-table-column>
-          <el-table-column prop="upstream_model" label="上游模型" min-width="170" show-overflow-tooltip />
-          <el-table-column label="渠道" min-width="130">
+          <el-table-column prop="upstream_model" :label="t('logDetail.col.upstreamModel')" min-width="170" show-overflow-tooltip />
+          <el-table-column :label="t('logDetail.col.channel')" min-width="130">
             <template #default="{ row }">{{ row.channel_name || '—' }}</template>
           </el-table-column>
-          <el-table-column label="结果" width="110">
+          <el-table-column :label="t('logDetail.col.result')" width="110">
             <template #default="{ row }">
-              <el-tag v-if="row.skipped" type="info" size="small" effect="plain">跳过</el-tag>
+              <el-tag v-if="row.skipped" type="info" size="small" effect="plain">{{ t('logDetail.skipped') }}</el-tag>
               <el-tag v-else :type="row.ok ? 'success' : 'danger'" size="small">
-                {{ row.ok ? '成功' : row.status_code === -1 ? '连接失败' : row.status_code }}
+                {{ row.ok ? t('logDetail.ok') : row.status_code === -1 ? t('logDetail.connFailed') : row.status_code }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="耗时" width="90">
+          <el-table-column :label="t('logDetail.col.latency')" width="90">
             <template #default="{ row }">
               <span class="num" :class="{ muted: row.skipped }">
                 {{ row.latency_ms.toLocaleString() }} ms
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="错误" min-width="180" show-overflow-tooltip>
+          <el-table-column :label="t('logDetail.col.error')" min-width="180" show-overflow-tooltip>
             <template #default="{ row }">
               <span v-if="row.error" class="err" :class="{ muted: row.skipped }">{{ row.error }}</span>
               <span v-else class="hint">—</span>
@@ -81,28 +81,28 @@
           </el-table-column>
         </el-table>
         <p class="hint note">
-          耗时为从请求进入网关到该次尝试结束的累计值，因此后面的尝试会更大。
+          {{ t('logDetail.latencyNote') }}
         </p>
       </section>
 
       <!-- Token 明细：cache 段只在该次请求非零时显示 -->
       <section>
-        <h3>Token 消耗</h3>
+        <h3>{{ t('logDetail.sectionTokens') }}</h3>
         <el-descriptions :column="1" border>
-          <el-descriptions-item label="合计">{{ log.total_tokens.toLocaleString() }}</el-descriptions-item>
-          <el-descriptions-item label="输入（prompt / input）">{{ log.prompt_tokens.toLocaleString() }}</el-descriptions-item>
-          <el-descriptions-item label="输出（completion / output）">{{ log.completion_tokens.toLocaleString() }}</el-descriptions-item>
-          <el-descriptions-item v-if="log.cache_read_tokens > 0" label="缓存命中（cache_read）">
+          <el-descriptions-item :label="t('logDetail.field.total')">{{ log.total_tokens.toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.input')">{{ log.prompt_tokens.toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.output')">{{ log.completion_tokens.toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item v-if="log.cache_read_tokens > 0" :label="t('logDetail.field.cacheRead')">
             {{ log.cache_read_tokens.toLocaleString() }}
-            <span class="hint">—— 按 ~0.1 倍计费</span>
+            <span class="hint">{{ t('logDetail.cacheReadHint') }}</span>
           </el-descriptions-item>
-          <el-descriptions-item v-if="log.cache_creation_tokens > 0" label="缓存写入（cache_creation）">
+          <el-descriptions-item v-if="log.cache_creation_tokens > 0" :label="t('logDetail.field.cacheWrite')">
             {{ log.cache_creation_tokens.toLocaleString() }}
-            <span class="hint">—— 按 ~1.25 倍计费</span>
+            <span class="hint">{{ t('logDetail.cacheWriteHint') }}</span>
           </el-descriptions-item>
-          <el-descriptions-item v-if="log.reasoning_tokens > 0" label="推理（reasoning）">
+          <el-descriptions-item v-if="log.reasoning_tokens > 0" :label="t('logDetail.field.reasoning')">
             {{ log.reasoning_tokens.toLocaleString() }}
-            <span class="hint">—— 已含在输出中</span>
+            <span class="hint">{{ t('logDetail.reasoningHint') }}</span>
           </el-descriptions-item>
         </el-descriptions>
       </section>
@@ -113,8 +113,11 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { i18n } from '../i18n'
 import { getLog } from '../api'
 
+const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const log = ref(null)
@@ -142,10 +145,10 @@ const attemptSummary = computed(() => {
   const atts = log.value?.attempts ?? []
   const skipped = atts.filter((a) => a.skipped).length
   const failed = log.value?.failed_count ?? 0
-  const parts = [`共 ${atts.length} 次尝试`]
-  if (skipped > 0) parts.push(`跳过 ${skipped} 次`)
-  if (failed > 0) parts.push(`失败 ${failed} 次`)
-  return parts.join('，')
+  const parts = [t('logDetail.attemptTotal', { n: atts.length })]
+  if (skipped > 0) parts.push(t('logDetail.attemptSkipped', { n: skipped }))
+  if (failed > 0) parts.push(t('logDetail.attemptFailed', { n: failed }))
+  return parts.join(i18n.global.locale.value === 'en-US' ? ', ' : '，')
 })
 
 function attemptRowClass({ row }) {
