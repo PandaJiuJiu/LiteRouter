@@ -5,7 +5,13 @@
       <el-button type="primary" @click="openDialog()">添加渠道</el-button>
     </div>
     <el-table :data="channels" v-loading="loading">
-      <el-table-column prop="name" label="名称" width="160" />
+      <el-table-column prop="name" label="名称" width="160">
+        <template #default="{ row }">
+          <a v-if="row.website" :href="row.website" target="_blank" rel="noopener"
+            class="name-link">{{ row.name }}<el-icon class="ext-icon"><Link /></el-icon></a>
+          <span v-else>{{ row.name }}</span>
+        </template>
+      </el-table-column>
       <el-table-column label="Base URL" min-width="240" show-overflow-tooltip>
         <template #default="{ row }">
           <div>OpenAI: {{ row.base_url || '-' }}</div>
@@ -73,6 +79,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Link } from '@element-plus/icons-vue'
 import { listChannels, createChannel, updateChannel, deleteChannel } from '../api'
 
 const channels = ref([])
@@ -151,5 +158,19 @@ onMounted(load)
   margin-bottom: 12px;
   color: #606266;
   font-size: 13px;
+}
+.name-link {
+  color: var(--el-color-primary);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.name-link:hover {
+  text-decoration: underline;
+}
+.ext-icon {
+  font-size: 12px;
+  opacity: 0.6;
 }
 </style>
