@@ -43,6 +43,9 @@
         <el-form-item label="名称">
           <el-input v-model="form.name" placeholder="渠道名称" />
         </el-form-item>
+        <el-form-item label="官网">
+          <el-input v-model="form.website" placeholder="上游官方网址，例如 https://openai.com" />
+        </el-form-item>
         <el-form-item label="OpenAI URL">
           <el-input v-model="form.base_url"
             placeholder="兼容 OpenAI 协议的地址（含完整路径，如 https://api.openai.com/v1）" />
@@ -76,7 +79,7 @@ const channels = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
-const form = ref({ name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true })
+const form = ref({ name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true })
 
 async function load() {
   loading.value = true
@@ -96,8 +99,8 @@ function manageModels(row) {
 function openDialog(row) {
   editing.value = row || null
   form.value = row
-    ? { name: row.name, base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled }
-    : { name: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true }
+    ? { name: row.name, website: row.website || '', base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled }
+    : { name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true }
   dialogVisible.value = true
 }
 

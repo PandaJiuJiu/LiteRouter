@@ -13,6 +13,7 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
         "id": row.get::<i64, _>("id"),
         "name": row.get::<String, _>("name"),
+        "website": row.get::<String, _>("website"),
         "base_url": row.get::<String, _>("base_url"),
         "base_url_anthropic": row.get::<String, _>("base_url_anthropic"),
         "api_key": row.get::<String, _>("api_key"),
@@ -97,6 +98,10 @@ pub async fn list_channel_models(
 #[derive(Deserialize)]
 pub struct ChannelReq {
     pub name: String,
+    /// Optional upstream's official website, shown read-only in the UI.
+    /// Never used for routing; purely informational.
+    #[serde(default)]
+    pub website: String,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
@@ -155,8 +160,9 @@ pub async fn create_channel(
     if req.base_url.trim().is_empty() && req.base_url_anthropic.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    sqlx::query("INSERT INTO channels (name, base_url, base_url_anthropic, api_key, models, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO channels (name, website, base_url, base_url_anthropic, api_key, models, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&req.name)
+        .bind(req.website.trim())
         .bind(req.base_url.trim_end_matches('/'))
         .bind(req.base_url_anthropic.trim_end_matches('/'))
         .bind(&req.api_key)
@@ -190,8 +196,9 @@ pub async fn update_channel(
             .map(|r| r.get::<String, _>("models"))
             .unwrap_or_default(),
     };
-    sqlx::query("UPDATE channels SET name=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=? WHERE id=?")
+    sqlx::query("UPDATE channels SET name=?, website=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=? WHERE id=?")
         .bind(&req.name)
+        .bind(req.website.trim())
         .bind(req.base_url.trim_end_matches('/'))
         .bind(req.base_url_anthropic.trim_end_matches('/'))
         .bind(&req.api_key)
