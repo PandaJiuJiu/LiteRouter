@@ -38,12 +38,11 @@
       </section>
 
       <!-- 转发链路：一次请求 = 一行日志，内部的每一次上游尝试在这里按顺序展开 -->
-      <section v-if="log.attempts && log.attempts.length > 1">
+      <section v-if="log.attempts && log.attempts.length">
         <h3>
           转发链路
           <span class="hint">
-            共 {{ log.attempts.length }} 次尝试，其中
-            {{ log.failed_count }} 次失败
+            共 {{ log.attempts.length }} 次尝试{{ log.failed_count > 0 ? `，其中 ${log.failed_count} 次失败` : '' }}
           </span>
         </h3>
         <el-table :data="log.attempts" size="small" border>
