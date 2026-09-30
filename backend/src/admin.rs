@@ -741,12 +741,20 @@ pub struct PageQuery {
     pub page: i64,
     #[serde(default = "default_size")]
     pub size: i64,
+    /// Time window in hours. Default 1h — the log list is a debugging view,
+    /// and "what just happened" is the overwhelmingly common question.
+    /// `0` means no window (show everything).
+    #[serde(default = "default_range_hours")]
+    pub range: i64,
 }
 fn default_page() -> i64 {
     1
 }
 fn default_size() -> i64 {
     50
+}
+fn default_range_hours() -> i64 {
+    1
 }
 
 pub async fn list_logs(
@@ -757,59 +765,74 @@ pub async fn list_logs(
     let user = check_auth(&state, &headers)?;
     let offset = (q.page - 1).max(0) * q.size;
     let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
-    // Count must run under the same visibility rules as the page query, or
-    // the total leaks the existence of other users' logs.
-    let total: i64 = if !user.is_admin && allowed.is_empty() {
-        0
-    } else if user.is_admin {
-        sqlx::query_scalar("SELECT COUNT(*) FROM logs")
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+
+    // One visibility clause, shared by the count and the page query — if they
+    // ever diverge the total stops matching the rows (and for non-admins, a
+    // mismatched count leaks the existence of other users' logs). The time
+    // window belongs in that same clause: the total in the pager has to be the
+    // total *within the selected range*.
+    let since = if q.range > 0 {
+        Some(crate::db::now() - q.range.min(24 * 365) * 3600)
     } else {
-        let placeholders = std::iter::repeat("?")
-            .take(allowed.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT COUNT(*) FROM logs WHERE token_name IN ({})",
-            placeholders
-        );
-        let mut query = sqlx::query_scalar(&sql);
-        for n in &allowed {
-            query = query.bind(n);
+        None
+    };
+    // Admin sees every log; a non-admin is limited to their own tokens. An
+    // empty `allowed` collapses to `1=0` because `token IN ()` is a syntax
+    // error in SQLite.
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut token_binds: Vec<String> = Vec::new();
+    if !user.is_admin {
+        if allowed.is_empty() {
+            where_parts.push("1=0".to_string());
+        } else {
+            let ph = std::iter::repeat("?")
+                .take(allowed.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            where_parts.push(format!("token_name IN ({ph})"));
+            token_binds.extend(allowed.iter().cloned());
+        }
+    }
+    if since.is_some() {
+        where_parts.push("created_at >= ?".to_string());
+    }
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+
+    // Binds are spelled out per query instead of collected into one vec: token
+    // names are TEXT and the window bound is INTEGER, so a single homogeneous
+    // vec can't carry both. Clause and binds are built together, so they can't
+    // get out of step.
+    let count_sql = format!("SELECT COUNT(*) FROM logs{where_sql}");
+    let total: i64 = {
+        let mut query = sqlx::query_scalar(&count_sql);
+        for t in &token_binds {
+            query = query.bind(t);
+        }
+        if let Some(s) = since {
+            query = query.bind(s);
         }
         query
             .fetch_one(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
-    // If a non-admin has no tokens at all, skip the IN clause with a 1=0
-    // guard — empty `token IN ()` is invalid SQL in SQLite.
-    let rows = if !user.is_admin && allowed.is_empty() {
-        Vec::new()
-    } else if user.is_admin {
-        sqlx::query("SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?")
+
+    let page_sql = format!("SELECT * FROM logs{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?");
+    let rows = {
+        let mut query = sqlx::query(&page_sql);
+        for t in &token_binds {
+            query = query.bind(t);
+        }
+        if let Some(s) = since {
+            query = query.bind(s);
+        }
+        query
             .bind(q.size)
             .bind(offset)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    } else {
-        let placeholders = std::iter::repeat("?")
-            .take(allowed.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT * FROM logs WHERE token_name IN ({}) ORDER BY id DESC LIMIT ? OFFSET ?",
-            placeholders
-        );
-        let mut query = sqlx::query(&sql);
-        for n in &allowed {
-            query = query.bind(n);
-        }
-        query = query.bind(q.size).bind(offset);
-        query
             .fetch_all(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

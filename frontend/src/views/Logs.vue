@@ -2,7 +2,15 @@
   <el-card>
     <div class="toolbar">
       <span>调用日志</span>
-      <el-button @click="load">刷新</el-button>
+      <div class="filters">
+        <el-radio-group v-model="range" @change="reload">
+          <el-radio-button :value="1">一小时</el-radio-button>
+          <el-radio-button :value="24">当日</el-radio-button>
+          <el-radio-button :value="168">一周</el-radio-button>
+          <el-radio-button :value="0">全部</el-radio-button>
+        </el-radio-group>
+        <el-button @click="load">刷新</el-button>
+      </div>
     </div>
     <el-table :data="logs" v-loading="loading" @row-click="open">
       <el-table-column label="请求时间" min-width="180">
@@ -61,11 +69,20 @@ const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const size = ref(50)
+// Window in hours; 0 = all time. Default 1h to match the backend default.
+const range = ref(1)
+
+// Switching the window invalidates the current page number — page 4 of the
+// old window is meaningless in the new one.
+function reload() {
+  page.value = 1
+  load()
+}
 
 async function load() {
   loading.value = true
   try {
-    const data = await listLogs(page.value, size.value)
+    const data = await listLogs(page.value, size.value, range.value)
     logs.value = data.logs
     total.value = data.total
     // A stale page (e.g. after deletions) can leave us past the last page.
@@ -97,6 +114,11 @@ onMounted(load)
   margin-bottom: 12px;
   color: #606266;
   font-size: 13px;
+}
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .hint {
   color: #909399;
