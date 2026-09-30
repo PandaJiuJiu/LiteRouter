@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
+import './styles.css'
 import App from './App.vue'
 import router from './router'
 import i18n, { setLocale } from './i18n'
