@@ -837,21 +837,51 @@ pub async fn list_logs(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
+    // The list shows a "failed N times" badge whose tooltip lists the failed
+    // hops. Fetch every attempt for the visible page in one query and group in
+    // Rust — a per-row lookup would be N+1 on the hottest endpoint.
+    let ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut failed_by_log: std::collections::HashMap<i64, Vec<Value>> =
+        std::collections::HashMap::new();
+    if !ids.is_empty() {
+        let ph = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT log_id, upstream_model, channel_name, status_code, error \
+             FROM log_attempts WHERE ok=0 AND log_id IN ({ph}) ORDER BY seq ASC"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        let attempt_rows = query
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for a in attempt_rows {
+            failed_by_log
+                .entry(a.get::<i64, _>("log_id"))
+                .or_default()
+                .push(json!({
+                    "upstream_model": a.get::<String, _>("upstream_model"),
+                    "channel_name": a.get::<String, _>("channel_name"),
+                    "status_code": a.get::<i64, _>("status_code"),
+                    "error": a.get::<String, _>("error"),
+                }));
+        }
+    }
     let logs: Vec<Value> = rows
         .iter()
         .map(|r| {
-            // `upstream_model` is empty on rows written before 0014; `model`
-            // has always held the post-mapping name, so fall back to it.
-            let upstream_model = {
-                let m = r.get::<String, _>("upstream_model");
-                if m.is_empty() {
-                    r.get::<String, _>("model")
-                } else {
-                    m
-                }
+            let upstream_model = r.get::<String, _>("upstream_model");
+            let upstream_model = if upstream_model.is_empty() {
+                r.get::<String, _>("model")
+            } else {
+                upstream_model
             };
+            let id = r.get::<i64, _>("id");
+            let failed_count: i64 = r.try_get("failed_count").unwrap_or(0);
             json!({
-                "id": r.get::<i64, _>("id"),
+                "id": id,
                 "token_name": r.get::<String, _>("token_name"),
                 "request_model": r.get::<String, _>("request_model"),
                 "upstream_model": upstream_model,
@@ -860,6 +890,8 @@ pub async fn list_logs(
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "total_tokens": r.get::<i64, _>("total_tokens"),
+                "failed_count": failed_count,
+                "failed_attempts": failed_by_log.get(&id).cloned().unwrap_or_default(),
                 "created_at": r.get::<i64, _>("created_at"),
             })
         })
@@ -905,6 +937,31 @@ pub async fn get_log(
             m
         }
     };
+    // The relay chain behind this request. One row per upstream attempt, in
+    // the order they happened — empty for logs written before 0015.
+    let attempt_rows = sqlx::query(
+        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok \
+         FROM log_attempts WHERE log_id=? ORDER BY seq ASC",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let attempts: Vec<Value> = attempt_rows
+        .iter()
+        .map(|a| {
+            json!({
+                "seq": a.get::<i64, _>("seq"),
+                "upstream_model": a.get::<String, _>("upstream_model"),
+                "channel_name": a.get::<String, _>("channel_name"),
+                "status_code": a.get::<i64, _>("status_code"),
+                "error": a.get::<String, _>("error"),
+                "latency_ms": a.get::<i64, _>("latency_ms"),
+                "convert": a.get::<String, _>("convert"),
+                "ok": a.get::<i64, _>("ok") != 0,
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "log": {
             "id": row.get::<i64, _>("id"),
@@ -924,6 +981,8 @@ pub async fn get_log(
             "protocol": row.get::<String, _>("protocol"),
             "convert": row.get::<String, _>("convert"),
             "error": row.get::<String, _>("error"),
+            "failed_count": row.try_get("failed_count").unwrap_or(0),
+            "attempts": attempts,
             "created_at": row.get::<i64, _>("created_at"),
         }
     })))
@@ -974,6 +1033,13 @@ pub async fn usage(
     };
 
     // by_day (GROUP BY day bucket)
+    //
+    // Since 0015 a `logs` row is one client request, so `COUNT(*)` is the
+    // request count the page always claimed to show. It used to over-count by
+    // the number of failed hops per request. Token sums are unaffected: only
+    // the winning attempt carries usage, and a failed hop always had none.
+    // The per-channel breakdown likewise now attributes tokens to the channel
+    // that actually served the request rather than to every channel tried.
     let by_day_sql = format!(
         "SELECT (created_at / 86400) * 86400 AS k,
                 COUNT(*) AS reqs,

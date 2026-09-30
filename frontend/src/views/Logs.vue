@@ -24,6 +24,25 @@
         <template #default="{ row }">
           <span>{{ row.upstream_model || row.request_model }}</span>
           <span class="hint">（{{ row.channel_name }}）</span>
+          <el-tooltip
+            v-if="row.failed_attempts?.length"
+            placement="top"
+            :show-after="200"
+          >
+            <template #content>
+              <div class="fail-tip">
+                <div class="fail-tip-title">
+                  前 {{ row.failed_attempts.length }} 次转发失败，已自动切换渠道
+                </div>
+                <div v-for="(f, i) in row.failed_attempts" :key="i" class="fail-tip-row">
+                  {{ f.upstream_model }}（{{ f.channel_name || '无渠道' }}）— {{ f.error || f.status_code }}
+                </div>
+              </div>
+            </template>
+            <el-tag type="warning" size="small" effect="plain" class="fail-badge">
+              失败 {{ row.failed_attempts.length }} 次
+            </el-tag>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column label="状态码" width="90">
@@ -123,6 +142,18 @@ onMounted(load)
 .hint {
   color: #909399;
   font-size: 12px;
+}
+.fail-badge {
+  margin-left: 6px;
+  cursor: default;
+}
+.fail-tip-title {
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.fail-tip-row {
+  font-size: 12px;
+  opacity: 0.9;
 }
 .num {
   font-variant-numeric: tabular-nums;

@@ -273,47 +273,146 @@ async fn pinned_channel(
 /// Deliberately excludes the prompt and the reply text — this is metadata
 /// only (routing, timing, token breakdown), so nothing user-authored lands
 /// in the DB.
-struct LogEntry<'a> {
-    token_name: &'a str,
-    /// The model the client asked for.
-    request_model: &'a str,
+/// One upstream attempt inside a single client request. The client sees one
+/// request and one log row; every channel we tried along the way is one of
+/// these, including the one that finally won.
+#[derive(Clone)]
+struct Attempt {
     /// The model actually sent upstream, after mappings rewriting.
-    upstream_model: &'a str,
-    channel_name: &'a str,
+    upstream_model: String,
+    channel_name: String,
     status: i64,
-    protocol: &'a str,
-    convert: ConvertMode,
-    streaming: bool,
+    error: String,
+    /// Elapsed from the start of the request to this attempt's outcome. For
+    /// failures this is cumulative (it includes the hops before it), matching
+    /// what the old per-hop rows reported.
     latency_ms: i64,
-    error: &'a str,
+    convert: ConvertMode,
+    /// True when this attempt's response was the one returned to the client.
+    ok: bool,
+    /// Token breakdown. Only ever set on the winning attempt — a failed hop
+    /// produced no usable response to read usage from, and a non-retriable 4xx
+    /// has none either.
     usage: Option<convert::Usage>,
 }
 
-async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry<'_>) {
-    let u = e.usage.unwrap_or_default();
-    let _ = sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+impl Attempt {
+    fn new(
+        upstream_model: &str,
+        cand: &Candidate,
+        status: i64,
+        error: &str,
+        latency_ms: i64,
+        ok: bool,
+    ) -> Self {
+        Self {
+            upstream_model: upstream_model.to_string(),
+            channel_name: cand.name.clone(),
+            status,
+            error: error.to_string(),
+            latency_ms,
+            convert: cand.convert,
+            ok,
+            usage: None,
+        }
+    }
+
+    fn with_usage(mut self, usage: Option<convert::Usage>) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    fn with_error(mut self, error: String) -> Self {
+        self.error = error;
+        // The attempt failed — it was surfaced as a 502 to the client, so it
+        // is not the "winning" hop, even though it was the last one tried.
+        self.ok = false;
+        self
+    }
+
+    fn usage_or_zero(&self) -> convert::Usage {
+        self.usage.unwrap_or_default()
+    }
+}
+
+/// The result of a client request, in the shape the `logs` row needs. Written
+/// exactly once per request — by the streaming path from `Drop`, by the
+/// buffered path inline.
+struct LogEntry {
+    token_name: String,
+    /// The model the client asked for.
+    request_model: String,
+    protocol: String,
+    streaming: bool,
+    /// The attempt whose response reached the client. The parent row's model /
+    /// channel / status / tokens all come from here, so the list page shows
+    /// what the user actually got rather than the first thing we tried.
+    winner: Option<Attempt>,
+    /// Every attempt, in order, `winner` included. Parent + children go in
+    /// one transaction so the list can never show a row whose children are
+    /// missing.
+    attempts: Vec<Attempt>,
+}
+
+/// Write the `logs` row plus one `log_attempts` row per hop, atomically.
+/// A no-op when there is no winner AND no attempts (nothing was tried).
+async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) {
+    let Some(winner) = e.winner.as_ref().or_else(|| e.attempts.last()) else {
+        return;
+    };
+    let u = winner.usage_or_zero();
+    let failed_count = e.attempts.iter().filter(|a| !a.ok).count() as i64;
+
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let inserted = sqlx::query(
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(e.token_name)
-    .bind(e.upstream_model)
-    .bind(e.channel_name)
-    .bind(e.status)
+    .bind(&e.token_name)
+    .bind(&winner.upstream_model)
+    .bind(&winner.channel_name)
+    .bind(winner.status)
     .bind(u.prompt)
     .bind(u.completion)
     .bind(u.total)
     .bind(now())
-    .bind(e.request_model)
-    .bind(e.latency_ms)
+    .bind(&e.request_model)
+    .bind(winner.latency_ms)
     .bind(e.streaming as i64)
-    .bind(e.protocol)
-    .bind(convert_label(e.convert))
-    .bind(e.upstream_model)
-    .bind(&e.error)
+    .bind(&e.protocol)
+    .bind(convert_label(winner.convert))
+    .bind(&winner.upstream_model)
+    .bind(&winner.error)
     .bind(u.cache_read)
     .bind(u.cache_creation)
     .bind(u.reasoning)
-    .execute(pool)
+    .bind(failed_count)
+    .execute(&mut *tx)
     .await;
+    let log_id = match inserted {
+        Ok(r) => r.last_insert_rowid(),
+        Err(_) => return,
+    };
+
+    for (seq, a) in e.attempts.iter().enumerate() {
+        let _ = sqlx::query(
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(log_id)
+        .bind(seq as i64)
+        .bind(&a.upstream_model)
+        .bind(&a.channel_name)
+        .bind(a.status)
+        .bind(&a.error)
+        .bind(a.latency_ms)
+        .bind(convert_label(a.convert))
+        .bind(a.ok as i64)
+        .execute(&mut *tx)
+        .await;
+    }
+    let _ = tx.commit().await;
 }
 
 fn convert_label(mode: ConvertMode) -> &'static str {
@@ -322,26 +421,6 @@ fn convert_label(mode: ConvertMode) -> &'static str {
         ConvertMode::ToOpenAI => "to_openai",
         ConvertMode::ToAnthropic => "to_anthropic",
     }
-}
-
-/// Same as `log_request` but takes an owned `OwnedLogEntry`. Used by the
-/// failover loop, where the row needs to live across an `await` and may
-/// not borrow from the relay loop.
-async fn log_request_owned(pool: &sqlx::SqlitePool, o: &OwnedLogEntry, usage: Option<convert::Usage>) {
-    let e = LogEntry {
-        token_name: &o.token_name,
-        request_model: &o.request_model,
-        upstream_model: &o.upstream_model,
-        channel_name: &o.channel_name,
-        status: o.status,
-        protocol: &o.protocol,
-        convert: o.convert,
-        streaming: o.streaming,
-        latency_ms: o.latency_ms,
-        error: &o.error,
-        usage,
-    };
-    log_request(pool, &e).await;
 }
 
 /// Extract the token breakdown from an upstream JSON body (non-streaming).
@@ -419,44 +498,20 @@ fn build_request(
 /// the captured usage. This lets the response body be streamed straight to
 /// the client (no buffering) while still recording the eventual token count.
 ///
-/// `LogEntry` borrows, so the streaming path needs an owned clone to move
-/// into the spawned task.
+/// `LogEntry` is already fully owned, so it moves into the spawned task as-is.
 struct StreamLog {
     pool: sqlx::SqlitePool,
-    entry: OwnedLogEntry,
-}
-
-/// Owned counterpart of `LogEntry` — same fields, no lifetimes, so it can
-/// cross a `tokio::spawn` boundary.
-struct OwnedLogEntry {
-    token_name: String,
-    request_model: String,
-    upstream_model: String,
-    channel_name: String,
-    status: i64,
-    protocol: String,
-    convert: ConvertMode,
-    streaming: bool,
-    latency_ms: i64,
-    error: String,
+    entry: LogEntry,
 }
 
 impl StreamLog {
-    async fn spawn_inline(self, usage: Option<convert::Usage>) {
-        let e = LogEntry {
-            token_name: &self.entry.token_name,
-            request_model: &self.entry.request_model,
-            upstream_model: &self.entry.upstream_model,
-            channel_name: &self.entry.channel_name,
-            status: self.entry.status,
-            protocol: &self.entry.protocol,
-            convert: self.entry.convert,
-            streaming: self.entry.streaming,
-            latency_ms: self.entry.latency_ms,
-            error: &self.entry.error,
-            usage,
-        };
-        log_request(&self.pool, &e).await;
+    /// Record the token count the stream ended up producing. Taken by
+    /// `mut self` because usage is only known once the body has been consumed.
+    async fn spawn_inline(mut self, usage: Option<convert::Usage>) {
+        if let Some(winner) = self.entry.winner.as_mut() {
+            winner.usage = usage;
+        }
+        log_request(&self.pool, &self.entry).await;
     }
 }
 
@@ -673,13 +728,17 @@ fn converted_stream(
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
 
-/// Convert a successful upstream response into the client response, logging
-/// the outcome against `channel_name`. Streaming requests pass through
-/// unchanged; non-streaming responses are buffered so we can extract usage.
-/// `convert` says which protocol translation this hop needs.
-/// `start` is when the relay started, so we can record how long the upstream
-/// took to first respond (TTFB); on stream replay it's frozen at the
-/// transition.
+/// Convert an upstream response into the client response, returning the
+/// `Attempt` that produced it so the caller can record it as the winning hop
+/// of this request. This function does not log — logging is the caller's job,
+/// because only the caller knows about the hops that failed before this one.
+///
+/// Streaming requests pass through unchanged; non-streaming responses are
+/// buffered so we can extract usage. `convert` says which protocol
+/// translation this hop needs. `start` is when the relay started, so we can
+/// record how long the upstream took to first respond (TTFB); on stream replay
+/// it's frozen at the transition.
+#[allow(clippy::too_many_arguments)]
 async fn respond_from_upstream(
     state: &AppState,
     token_name: &str,
@@ -691,75 +750,60 @@ async fn respond_from_upstream(
     protocol: &str,
     streaming: bool,
     start: Instant,
-) -> Response {
-    let channel_name = cand.name.as_str();
+    attempts: Vec<Attempt>,
+) -> (Response, Attempt) {
     let status =
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let convert = cand.convert;
     // Latency up to "we got the upstream's response headers". For streams
     // this is the TTFB, which is what people usually want; for buffered
     // responses this is the whole round-trip.
     let latency_ms = start.elapsed().as_millis() as i64;
+    // This hop ends the request either way — the client gets its response
+    // here, whether it succeeded or was a non-retriable error.
+    let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true);
 
     if !is_streaming {
         let content_type = resp.headers().get("content-type").cloned();
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                log_request_owned(
-                    &state.pool,
-                    &OwnedLogEntry {
-                        token_name: token_name.to_string(),
-                        request_model: request_model.to_string(),
-                        upstream_model: model.to_string(),
-                        channel_name: channel_name.to_string(),
-                        status: status.as_u16() as i64,
-                        protocol: protocol.to_string(),
-                        convert,
-                        streaming,
-                        latency_ms,
-                        error: format!("upstream body read failed: {}", e),
-                    },
-                    None,
-                )
-                .await;
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream body read failed: {}", e),
-                    None,
+                let attempt = attempt.with_error(format!("upstream body read failed: {}", e));
+                let entry = LogEntry {
+                    token_name: token_name.to_string(),
+                    request_model: request_model.to_string(),
+                    protocol: protocol.to_string(),
+                    streaming,
+                    winner: Some(attempt.clone()),
+                    attempts: push(attempts, attempt.clone()),
+                };
+                log_request(&state.pool, &entry).await;
+                return (
+                    error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("upstream body read failed: {}", e),
+                        None,
+                    ),
+                    attempt,
                 );
             }
         };
-        let usage = parse_usage(&bytes);
-        log_request_owned(
-            &state.pool,
-            &OwnedLogEntry {
-                token_name: token_name.to_string(),
-                request_model: request_model.to_string(),
-                upstream_model: model.to_string(),
-                channel_name: channel_name.to_string(),
-                status: status.as_u16() as i64,
-                protocol: protocol.to_string(),
-                convert,
-                streaming,
-                latency_ms,
-                error: String::new(),
-            },
-            usage,
-        )
-        .await;
+        let attempt = attempt.with_usage(parse_usage(&bytes));
         // translate the buffered body when converting
-        let out_bytes = if convert != ConvertMode::None {
+        let out_bytes = if cand.convert != ConvertMode::None {
             match serde_json::from_slice::<Value>(&bytes) {
                 Ok(v) => {
                     let converted = if status.is_success() {
-                        match convert {
-                            ConvertMode::ToOpenAI => convert::openai_resp_to_anthropic(&v, model),
-                            ConvertMode::ToAnthropic => convert::anthropic_resp_to_openai(&v, model),
+                        match cand.convert {
+                            ConvertMode::ToOpenAI => {
+                                convert::openai_resp_to_anthropic(&v, model)
+                            }
+                            ConvertMode::ToAnthropic => {
+                                convert::anthropic_resp_to_openai(&v, model)
+                            }
                             ConvertMode::None => unreachable!(),
                         }
                     } else {
-                        match convert {
+                        match cand.convert {
                             ConvertMode::ToOpenAI => convert::openai_err_to_anthropic(&v),
                             ConvertMode::ToAnthropic => convert::anthropic_err_to_openai(&v),
                             ConvertMode::None => unreachable!(),
@@ -772,36 +816,43 @@ async fn respond_from_upstream(
         } else {
             bytes.to_vec()
         };
+        let entry = LogEntry {
+            token_name: token_name.to_string(),
+            request_model: request_model.to_string(),
+            protocol: protocol.to_string(),
+            streaming,
+            winner: Some(attempt.clone()),
+            attempts: push(attempts, attempt.clone()),
+        };
+        log_request(&state.pool, &entry).await;
         let mut builder = Response::builder().status(status);
         if let Some(ct) = content_type {
             if let Some(h) = builder.headers_mut() {
                 h.insert(axum::http::header::CONTENT_TYPE, ct);
             }
         }
-        return builder
+        let resp = builder
             .body(Body::from(out_bytes))
             .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
+        return (resp, attempt);
     }
 
-    // Streaming: forward to the client. The stream wrapper spawns the
-    // log_request task when the body stream is dropped (i.e., when the
-    // upstream ends, the client finishes, or the client disconnects).
+    // Streaming: forward to the client. The stream wrapper owns the log row
+    // and writes it when the body stream is dropped (i.e., when the upstream
+    // ends, the client finishes, or the client disconnects). It carries the
+    // preceding failed hops so the detail page can show the whole chain.
     let log = StreamLog {
         pool: state.pool.clone(),
-        entry: OwnedLogEntry {
+        entry: LogEntry {
             token_name: token_name.to_string(),
             request_model: request_model.to_string(),
-            upstream_model: model.to_string(),
-            channel_name: channel_name.to_string(),
-            status: status.as_u16() as i64,
             protocol: protocol.to_string(),
-            convert,
             streaming,
-            latency_ms,
-            error: String::new(),
+            winner: Some(attempt.clone()),
+            attempts: push(attempts, attempt.clone()),
         },
     };
-    match convert {
+    let resp = match cand.convert {
         ConvertMode::None => {
             let content_type = resp.headers().get("content-type").cloned();
             passthrough_stream(resp, status, content_type, log)
@@ -814,7 +865,15 @@ async fn respond_from_upstream(
             let conv = convert::AnthropicToOpenAiStream::new(model);
             converted_stream(resp, Box::new(conv), log)
         }
-    }
+    };
+    (resp, attempt)
+}
+
+/// Append one hop to the chain, returning the new vector. Cheaper to read at
+/// the call sites than `let mut v = attempts; v.push(a); v`.
+fn push(mut attempts: Vec<Attempt>, a: Attempt) -> Vec<Attempt> {
+    attempts.push(a);
+    attempts
 }
 
 /// Common relay: auth -> route -> forward with multi-channel failover.
@@ -867,6 +926,10 @@ async fn relay(
     let mut attempted = 0usize;
     let mut retriable_429_count = 0usize;
     let mut transport_err_count = 0usize;
+    // Every upstream attempt so far, in order. Recorded as child rows of the
+    // single `logs` row this request produces. A hop that ends the request
+    // (success or non-retriable error) is pushed by `respond_from_upstream`.
+    let mut attempts: Vec<Attempt> = Vec::new();
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
@@ -929,8 +992,10 @@ async fn relay(
                             protocol,
                             is_streaming,
                             relay_start,
+                            attempts,
                         )
-                        .await;
+                        .await
+                        .0;
                     }
                     if !is_retriable_status(code) {
                         // non-retriable: surface upstream's response as-is
@@ -945,10 +1010,13 @@ async fn relay(
                             protocol,
                             is_streaming,
                             relay_start,
+                            attempts,
                         )
-                        .await;
+                        .await
+                        .0;
                     }
-                    // retriable: capture Retry-After (first one wins), log, try next
+                    // retriable: capture Retry-After (first one wins), record
+                    // the hop, try the next candidate
                     if retry_after.is_none() {
                         if let Some(v) = resp.headers().get(reqwest::header::RETRY_AFTER) {
                             if let Ok(s) = v.to_str() {
@@ -957,23 +1025,14 @@ async fn relay(
                         }
                     }
                     let err_msg = format!("HTTP {}", code);
-                    log_request_owned(
-                        &state.pool,
-                        &OwnedLogEntry {
-                            token_name: token_name.clone(),
-                            request_model: model.clone(),
-                            upstream_model: target_model.clone(),
-                            channel_name: cand.name.clone(),
-                            status: code as i64,
-                            protocol: protocol.to_string(),
-                            convert: cand.convert,
-                            streaming: is_streaming,
-                            latency_ms: relay_start.elapsed().as_millis() as i64,
-                            error: err_msg.clone(),
-                        },
-                        None,
-                    )
-                    .await;
+                    attempts.push(Attempt::new(
+                        target_model,
+                        cand,
+                        code as i64,
+                        &err_msg,
+                        relay_start.elapsed().as_millis() as i64,
+                        false,
+                    ));
                     all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
                     if code == 429 {
                         retriable_429_count += 1;
@@ -981,23 +1040,14 @@ async fn relay(
                 }
                 Err(e) => {
                     let err_msg = format!("transport: {}", e);
-                    log_request_owned(
-                        &state.pool,
-                        &OwnedLogEntry {
-                            token_name: token_name.clone(),
-                            request_model: model.clone(),
-                            upstream_model: target_model.clone(),
-                            channel_name: cand.name.clone(),
-                            status: -1,
-                            protocol: protocol.to_string(),
-                            convert: cand.convert,
-                            streaming: is_streaming,
-                            latency_ms: relay_start.elapsed().as_millis() as i64,
-                            error: err_msg.clone(),
-                        },
-                        None,
-                    )
-                    .await;
+                    attempts.push(Attempt::new(
+                        target_model,
+                        cand,
+                        -1,
+                        &err_msg,
+                        relay_start.elapsed().as_millis() as i64,
+                        false,
+                    ));
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, e));
                     transport_err_count += 1;
                 }
@@ -1019,15 +1069,37 @@ async fn relay(
                 }
             })
             .collect();
-        return error_response(
-            StatusCode::NOT_FOUND,
-            &format!(
-                "no enabled channel provides `{}` on the {} protocol",
-                wanted.join("`, `"),
-                protocol
-            ),
-            None,
+        let err = format!(
+            "no enabled channel provides `{}` on the {} protocol",
+            wanted.join("`, `"),
+            protocol
         );
+        // Still a client request worth a log row: "this model isn't served
+        // anywhere" is exactly the question the log page answers. No upstream
+        // was contacted, so the single attempt carries the routing failure
+        // rather than an HTTP response.
+        let entry = LogEntry {
+            token_name: token_name.clone(),
+            request_model: model.clone(),
+            protocol: protocol.to_string(),
+            streaming: is_streaming,
+            winner: Some(Attempt {
+                upstream_model: targets
+                    .first()
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_default(),
+                channel_name: String::new(),
+                status: StatusCode::NOT_FOUND.as_u16() as i64,
+                error: err.clone(),
+                latency_ms: relay_start.elapsed().as_millis() as i64,
+                convert: ConvertMode::None,
+                ok: false,
+                usage: None,
+            }),
+            attempts: Vec::new(),
+        };
+        log_request(&state.pool, &entry).await;
+        return error_response(StatusCode::NOT_FOUND, &err, None);
     }
     // Pick the most informative status code:
     //   - all retriable failures were 429 -> 429 (so SDKs that honor 429's
@@ -1043,13 +1115,25 @@ async fn relay(
     } else {
         StatusCode::BAD_GATEWAY
     };
+    let err = format!(
+        "all {} candidate(s) failed:\n  - {}",
+        attempted,
+        all_errors.join("\n  - ")
+    );
+    // Every attempt failed, so there is no winner — the last one stands in as
+    // the row's headline outcome, with the full chain in the detail page.
+    let entry = LogEntry {
+        token_name,
+        request_model: model,
+        protocol: protocol.to_string(),
+        streaming: is_streaming,
+        winner: None,
+        attempts,
+    };
+    log_request(&state.pool, &entry).await;
     error_response(
         final_status,
-        &format!(
-            "all {} candidate(s) failed:\n  - {}",
-            attempted,
-            all_errors.join("\n  - ")
-        ),
+        &err,
         retry_after.as_deref(),
     )
 }
