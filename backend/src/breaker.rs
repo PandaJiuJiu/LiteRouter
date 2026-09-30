@@ -463,4 +463,145 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].channel, "ch2");
     }
+
+    #[tokio::test]
+    async fn a_key_is_scoped_to_both_channel_and_model() {
+        // The same model failing on one channel says nothing about another
+        // channel's health for that model.
+        let b = Breaker::new(cfg());
+        let a = breaker_key("ch1", "gpt-4o");
+        let c = breaker_key("ch2", "gpt-4o");
+        let d = breaker_key("ch1", "claude-x");
+        b.record(&a, Outcome::Failure).await;
+        assert!(!b.allow(&a).await);
+        assert!(b.allow(&c).await);
+        assert!(b.allow(&d).await);
+    }
+
+    #[tokio::test]
+    async fn a_channel_or_model_containing_the_separator_still_round_trips() {
+        // Keys are `channel|model` and `split_key_owned` splits on the first
+        // `|`. A model name containing `|` must not make the snapshot report
+        // the wrong channel.
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "weird|model|name");
+        b.record(&key, Outcome::Failure).await;
+        let snap = b.snapshot().await;
+        assert_eq!(snap[0].channel, "ch");
+        assert_eq!(snap[0].target_model, "weird|model|name");
+    }
+
+    #[tokio::test]
+    async fn the_backoff_ladder_is_capped_at_max_delay() {
+        // base 1s, max 5s: 1, 2, 4, 5, 5...
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            b.record(&key, Outcome::Failure).await;
+            seen.push(b.inner.read().await.get(&key).unwrap().current_backoff.as_secs());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 5, 5, 5]);
+    }
+
+    #[tokio::test]
+    async fn replacing_the_config_takes_effect_without_a_restart() {
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+        b.record(&key, Outcome::Failure).await;
+        assert!(!b.allow(&key).await);
+
+        let mut next = cfg();
+        next.base_delay = Duration::from_secs(30);
+        b.replace_config(next).await;
+        assert_eq!(b.config_snapshot().await.base_delay, Duration::from_secs(30));
+        // An already-open key keeps doubling from where its own ladder left
+        // off — the new base applies to the *first* failure of a fresh entry,
+        // not retroactively to a key that is already up the ladder.
+        assert!(!b.allow(&key).await);
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(
+            b.inner.read().await.get(&key).unwrap().current_backoff,
+            Duration::from_secs(2)
+        );
+
+        // Once the key clears, the next trip starts from the new base_delay.
+        b.record(&key, Outcome::Success).await;
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(
+            b.inner.read().await.get(&key).unwrap().current_backoff,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_the_breaker_mid_flight_stops_short_circuiting() {
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+        b.record(&key, Outcome::Failure).await;
+        assert!(!b.allow(&key).await);
+
+        let mut next = cfg();
+        next.enabled = false;
+        b.replace_config(next).await;
+        assert!(b.allow(&key).await, "turning the breaker off must unblock traffic");
+    }
+
+    #[tokio::test]
+    async fn expired_keys_reports_each_key_as_its_own_pair() {
+        let b = Breaker::new(cfg());
+        b.record(&breaker_key("ch1", "m1"), Outcome::Failure).await;
+        b.record(&breaker_key("ch2", "m2"), Outcome::Failure).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut due = b.expired_keys(Instant::now()).await;
+        due.sort();
+        assert_eq!(due, vec![("ch1".into(), "m1".into()), ("ch2".into(), "m2".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_key_reset_only_drops_the_named_channel_model_pair() {
+        // The probe task calls this when a channel disappears; the same model
+        // on a different channel must be unaffected.
+        let b = Breaker::new(cfg());
+        let a = breaker_key("ch1", "m");
+        let c = breaker_key("ch2", "m");
+        b.record(&a, Outcome::Failure).await;
+        b.record(&c, Outcome::Failure).await;
+        b.reset_key(&a).await;
+        assert!(b.allow(&a).await);
+        assert!(!b.allow(&c).await);
+    }
+
+    #[tokio::test]
+    async fn a_successful_probe_does_not_allow_a_user_request_to_re_enable_the_key() {
+        // Recovery is owned by the background probe task. If a user request
+        // arriving after cooldown could re-enable the key on its own, a
+        // persistently broken upstream would get hammered by exactly the
+        // traffic that should be spared.
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+        b.record(&key, Outcome::Failure).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!b.allow(&key).await, "cooldown alone must not restore traffic");
+        b.record(&key, Outcome::Success).await; // the probe
+        assert!(b.allow(&key).await);
+    }
+
+    #[tokio::test]
+    async fn the_cooldown_counts_down_in_the_snapshot() {
+        // The admin snapshot shows whole seconds remaining, so the config needs
+        // a delay long enough that truncation doesn't floor the first reading
+        // at zero.
+        let mut c = cfg();
+        c.base_delay = Duration::from_secs(30);
+        let b = Breaker::new(c);
+        b.record(&breaker_key("ch", "m"), Outcome::Failure).await;
+        let first = b.snapshot().await[0].cooldown_remaining_secs;
+        // Truncated to whole seconds, so a few microseconds of elapsed time
+        // can already have knocked it down by one.
+        assert!((29..=30).contains(&first), "unexpected initial cooldown: {first}");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let second = b.snapshot().await[0].cooldown_remaining_secs;
+        assert!(second < first, "expected the countdown to advance: {first} -> {second}");
+    }
 }

@@ -87,6 +87,13 @@ pub fn verify_password(plain: &str, hash_hex: &str, salt_hex: &str) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
+    // An empty expected digest would make the comparison loop below vacuous:
+    // `diff` stays 0 and the function would return true for *any* password,
+    // turning a corrupted row into an authentication bypass. Refuse it
+    // explicitly.
+    if expected.is_empty() {
+        return false;
+    }
     let mut out = vec![0u8; expected.len()];
     pbkdf2::pbkdf2_hmac::<Sha256>(plain.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut out);
     if out.len() != expected.len() {

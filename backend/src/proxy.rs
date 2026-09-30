@@ -1517,3 +1517,211 @@ pub async fn list_models(
         .collect();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
+// ---- tests ----------------------------------------------------------------
+//
+// These cover the private request-entry helpers. They live in-file rather
+// than in `tests/` because the whole point is to pin behaviour that the
+// public HTTP surface can only reach indirectly, and because `extract_token`
+// in particular is the single place every `/v1/*` call gets its credential
+// from — a regression there is a gateway-wide auth failure, not a
+// single-endpoint bug.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        m
+    }
+
+    // ---------- extract_token ----------
+
+    #[test]
+    fn an_openai_style_bearer_token_is_extracted() {
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Bearer sk-abc")])),
+            Some("sk-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn an_anthropic_style_api_key_is_extracted() {
+        assert_eq!(
+            extract_token(&headers(&[("x-api-key", "sk-abc")])),
+            Some("sk-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn x_api_key_is_the_fallback_when_authorization_is_absent() {
+        // Claude Code and friends send `x-api-key` and may set an unrelated
+        // Authorization; the explicit x-api-key must not be shadowed.
+        assert_eq!(
+            extract_token(&headers(&[
+                ("authorization", "Bearer other"),
+                ("x-api-key", "sk-abc")
+            ])),
+            Some("other".to_string())
+        );
+    }
+
+    #[test]
+    fn the_bearer_prefix_match_is_case_sensitive() {
+        // RFC 7235 says the scheme is case-insensitive, so a client sending
+        // `bearer` today gets no credential and a 401. Pinned so that
+        // accepting the lowercase form later is a deliberate, visible change.
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "bearer sk-abc")])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_credential_yields_none() {
+        assert_eq!(extract_token(&headers(&[])), None);
+    }
+
+    #[test]
+    fn a_bearer_with_an_empty_token_is_still_returned_and_rejected_downstream() {
+        // Better to hand the empty string to the DB lookup (which rejects it)
+        // than to skip the auth path entirely.
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Bearer ")])),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn a_non_bearer_authorization_is_ignored() {
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Basic dXNlcjpwYXNz")])),
+            None
+        );
+    }
+
+    // ---------- extract_client_info ----------
+
+    #[test]
+    fn the_first_forwarded_for_hop_is_the_client() {
+        // `X-Forwarded-For: client, proxy1, proxy2` — the leftmost entry is
+        // the original client.
+        let info = extract_client_info(
+            &headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.1, 10.0.0.2")]),
+            Some("10.0.0.9:1234".parse().unwrap()),
+        );
+        assert_eq!(info.ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn the_direct_peer_is_used_when_there_is_no_proxy_header() {
+        let info = extract_client_info(
+            &headers(&[]),
+            Some("192.0.2.5:1234".parse().unwrap()),
+        );
+        assert_eq!(info.ip, "192.0.2.5");
+    }
+
+    #[test]
+    fn the_forwarded_header_wins_over_the_direct_peer() {
+        let info = extract_client_info(
+            &headers(&[("x-forwarded-for", "203.0.113.7")]),
+            Some("10.0.0.9:1234".parse().unwrap()),
+        );
+        assert_eq!(info.ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn an_empty_forwarded_header_falls_through_to_the_peer() {
+        let info = extract_client_info(
+            &headers(&[("x-forwarded-for", "  ")]),
+            Some("192.0.2.5:1234".parse().unwrap()),
+        );
+        assert_eq!(info.ip, "192.0.2.5");
+    }
+
+    #[test]
+    fn a_missing_ip_is_recorded_as_empty_rather_than_failing() {
+        // Happens for every in-process request and whenever the router is
+        // mounted without connect-info. The log row must still be written.
+        let info = extract_client_info(&headers(&[]), None);
+        assert_eq!(info.ip, "");
+    }
+
+    #[test]
+    fn the_user_agent_is_captured_verbatim() {
+        let info = extract_client_info(
+            &headers(&[("user-agent", "claude-cli/1.2.3")]),
+            None,
+        );
+        assert_eq!(info.user_agent, "claude-cli/1.2.3");
+    }
+
+    #[test]
+    fn a_missing_user_agent_is_recorded_as_empty() {
+        assert_eq!(extract_client_info(&headers(&[]), None).user_agent, "");
+    }
+
+    // ---------- parse_usage ----------
+
+    #[test]
+    fn usage_is_read_from_a_buffered_openai_response() {
+        let u = parse_usage(br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
+        assert_eq!((u.prompt, u.completion), (5, 2));
+    }
+
+    #[test]
+    fn usage_is_read_from_a_buffered_anthropic_response() {
+        let u = parse_usage(br#"{"usage":{"input_tokens":5,"output_tokens":2}}"#).unwrap();
+        assert_eq!((u.prompt, u.completion), (5, 2));
+    }
+
+    #[test]
+    fn a_response_without_usage_yields_none() {
+        assert!(parse_usage(br#"{"choices":[]}"#).is_none());
+    }
+
+    #[test]
+    fn a_non_json_body_yields_none_rather_than_panicking() {
+        assert!(parse_usage(b"<html>gateway timeout</html>").is_none());
+    }
+
+    #[test]
+    fn a_zeroed_usage_block_yields_none() {
+        assert!(parse_usage(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none());
+    }
+
+    // ---------- push (attempt ordering) ----------
+
+    #[test]
+    fn attempts_are_kept_in_call_order() {
+        // The log detail page renders the relay chain in the order it happened,
+        // so `push` has to append rather than replace.
+        let mut v = Vec::new();
+        for i in 0..4 {
+            v = push(
+                v,
+                Attempt {
+                    upstream_model: format!("m{i}"),
+                    channel_name: format!("c{i}"),
+                    status: i,
+                    error: String::new(),
+                    latency_ms: 0,
+                    convert: ConvertMode::None,
+                    ok: false,
+                    skipped: false,
+                    usage: None,
+                },
+            );
+        }
+        let models: Vec<&str> = v.iter().map(|a| a.upstream_model.as_str()).collect();
+        assert_eq!(models, vec!["m0", "m1", "m2", "m3"]);
+    }
+}
