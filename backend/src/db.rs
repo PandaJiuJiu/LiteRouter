@@ -1,5 +1,13 @@
+use pbkdf2::pbkdf2_hmac;
+use rand::RngCore;
+use sha2::Sha256;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
+
+/// PBKDF2-HMAC-SHA256, 100k iterations (OWASP 2023 minimum), 32-byte output.
+const PBKDF2_ITERATIONS: u32 = 100_000;
+const PBKDF2_OUTPUT_LEN: usize = 32;
+const SALT_LEN: usize = 16;
 
 pub async fn init_pool(path: &str) -> SqlitePool {
     let url = format!("sqlite:{}?mode=rwc", path);
@@ -59,6 +67,11 @@ pub async fn init_pool(path: &str) -> SqlitePool {
         .execute(&pool)
         .await;
     }
+    // migrate: add per-user ownership for multi-account isolation. NULL =
+    // legacy / orphaned token, visible only to admins.
+    let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN user_id INTEGER")
+        .execute(&pool)
+        .await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS logs (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +138,87 @@ pub async fn init_pool(path: &str) -> SqlitePool {
     .execute(&pool)
     .await
     .expect("migrate model_mappings targets");
+
+    // ---------- multi-account: users table + one-time migrations ----------
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            is_admin      INTEGER NOT NULL DEFAULT 0,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );",
+    )
+    .execute(&pool)
+    .await
+    .expect("create users table");
+
+    // First-boot bootstrap: if no users exist, either seed from the legacy
+    // ADMIN_PASSWORD env var (existing deployments) or leave the table empty
+    // and let the web setup wizard create the first admin (new deployments).
+    let user_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+    if user_count == 0 {
+        if let Ok(env_pw) = std::env::var("ADMIN_PASSWORD") {
+            if !env_pw.trim().is_empty() {
+                let (hash, salt) = hash_password(&env_pw);
+                let ts = now();
+                sqlx::query(
+                    "INSERT INTO users (username, password_hash, password_salt, is_admin, created_at, updated_at)
+                     VALUES (?, ?, ?, 1, ?, ?)",
+                )
+                .bind("admin")
+                .bind(&hash)
+                .bind(&salt)
+                .bind(ts)
+                .bind(ts)
+                .execute(&pool)
+                .await
+                .expect("bootstrap admin from env");
+                eprintln!(
+                    "literouter: bootstrapped default admin from ADMIN_PASSWORD env (username: admin)"
+                );
+            } else {
+                eprintln!(
+                    "literouter: no users exist; visit the web UI to run the setup wizard"
+                );
+            }
+        } else {
+            eprintln!(
+                "literouter: no users exist; visit the web UI to run the setup wizard"
+            );
+        }
+    }
+
+    // Adopt orphaned (legacy) tokens into the first admin's account so they
+    // remain manageable. Only runs after at least one user exists.
+    let orphan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tokens WHERE user_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    if orphan_count > 0 {
+        let first_admin: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+        if let Some(admin_id) = first_admin {
+            sqlx::query("UPDATE tokens SET user_id = ? WHERE user_id IS NULL")
+                .bind(admin_id)
+                .execute(&pool)
+                .await
+                .expect("adopt orphan tokens");
+        }
+    }
+
     pool
 }
 
@@ -133,6 +227,41 @@ pub fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// Hash a plaintext password. Returns (hex_hash, hex_salt). Caller persists
+/// both columns; verification needs them together.
+pub fn hash_password(plain: &str) -> (String, String) {
+    let mut salt = [0u8; SALT_LEN];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let mut out = [0u8; PBKDF2_OUTPUT_LEN];
+    pbkdf2_hmac::<Sha256>(plain.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut out);
+    (hex::encode(out), hex::encode(salt))
+}
+
+/// Constant-time verification. Computes the hash with the same salt+rounds,
+/// then compares in constant time. Returns false on any decode error rather
+/// than panicking — wrong-format hashes are an authentication failure, not
+/// a server bug.
+pub fn verify_password(plain: &str, hash_hex: &str, salt_hex: &str) -> bool {
+    let salt = match hex::decode(salt_hex) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let expected = match hex::decode(hash_hex) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut out = vec![0u8; expected.len()];
+    pbkdf2::pbkdf2_hmac::<Sha256>(plain.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut out);
+    if out.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in out.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 /// Delete log rows older than `retention_days` days. Returns the number of

@@ -32,17 +32,35 @@
 ```bash
 git clone https://github.com/qihangkong/LiteRouter.git
 cd LiteRouter
-ADMIN_PASSWORD=your-password docker compose up -d --build
+docker compose up -d --build
 ```
 
-启动后访问 `http://your-host:3000` 进入管理后台（默认密码 `admin123`，通过 `ADMIN_PASSWORD` 环境变量修改）。
+启动后访问 `http://your-host:3000`，系统会引导你创建第一个管理员账号。
 
 说明：
 
 - 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，无外部依赖
 - SQLite 数据持久化在 `./data` 目录
-- `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用；`ADMIN_PASSWORD` 未设置时使用默认值
+- `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用
 - 老版本 Docker 用 `docker-compose`（带连字符）代替 `docker compose`
+
+### 账号体系
+
+- 首次访问会自动跳转到 **初始化向导**，创建管理员账号（密码至少 8 位）
+- 管理员可在「用户管理」中创建普通用户、重置密码、提升/降级角色、删除账号
+- **渠道** 与 **模型路由** 是后台基础设施，由管理员统一管理，对所有账号共享
+- **令牌** 每个用户独立创建和管理；管理员可见全部并可代建
+- **调用日志** 与 **用量统计** 按用户自动过滤，管理员可见全部
+- 至少保留一个管理员账号，防止锁死
+
+### 通过环境变量预设初始管理员（可选）
+
+如果不想走网页初始化向导，可以设置 `ADMIN_PASSWORD`，首次启动时会自动创建一个名为 `admin` 的管理员账号；后续修改密码请直接在网页上操作。
+
+```bash
+ADMIN_PASSWORD=your-password docker compose up -d --build
+# 然后用 admin / your-password 登录
+```
 
 ### 修改端口
 
@@ -65,7 +83,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PORT` | `3000` | 监听端口 |
-| `ADMIN_PASSWORD` | `admin123` | 管理后台密码 |
+| `ADMIN_PASSWORD` | （空） | 可选：首次启动时自动创建 `admin` 账号并使用该密码；不设置则走网页初始化向导 |
 | `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径（compose 已指向持久卷 `/app/data/literouter.db`） |
 
 ## 使用流程

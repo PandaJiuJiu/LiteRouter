@@ -15,6 +15,10 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 futures-util = "0.3"
 bytes = "1"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 
 [profile.release]
 opt-level = 2

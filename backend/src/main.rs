@@ -4,6 +4,7 @@ mod auth;
 mod db;
 mod proxy;
 mod state;
+mod users;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -41,8 +42,14 @@ async fn main() {
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/messages", post(proxy::anthropic_messages))
         .route("/v1/models", get(proxy::list_models))
-        // admin endpoints
+        // auth / setup
+        .route("/api/setup-status", get(auth::setup_status))
+        .route("/api/setup", post(auth::setup))
         .route("/api/login", post(auth::login))
+        .route("/api/logout", post(auth::logout))
+        .route("/api/me", get(auth::me))
+        .route("/api/password", post(auth::change_password))
+        // admin endpoints
         .route("/api/models", get(admin::list_channel_models))
         .route("/api/channels", get(admin::list_channels).post(admin::create_channel))
         .route("/api/channels/fetch-models", post(admin::fetch_models))
@@ -66,6 +73,12 @@ async fn main() {
             "/api/mappings/:id",
             axum::routing::put(admin::update_mapping)
                 .delete(admin::delete_mapping),
+        )
+        // user management
+        .route("/api/users", get(users::list_users).post(users::create_user))
+        .route(
+            "/api/users/:id",
+            axum::routing::put(users::update_user).delete(users::delete_user),
         )
         .layer(CorsLayer::permissive())
         .with_state(state.clone());

@@ -1,9 +1,8 @@
-use crate::auth::check_admin;
+use crate::auth::{check_auth, require_admin, AuthUser};
 use crate::db::now;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,7 +22,7 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
     })
 }
 
-fn row_token(row: &sqlx::sqlite::SqliteRow, show_key: bool) -> Value {
+fn row_token(row: &sqlx::sqlite::SqliteRow, show_key: bool, owner: Option<&str>) -> Value {
     let mut v = json!({
         "id": row.get::<i64, _>("id"),
         "name": row.get::<String, _>("name"),
@@ -32,20 +31,45 @@ fn row_token(row: &sqlx::sqlite::SqliteRow, show_key: bool) -> Value {
         "accessed_at": row.get::<i64, _>("accessed_at"),
         "rpm_limit": row.get::<i64, _>("rpm_limit"),
         "daily_token_limit": row.get::<i64, _>("daily_token_limit"),
+        "user_id": row.get::<Option<i64>, _>("user_id"),
     });
+    if let Some(o) = owner {
+        v["owner"] = json!(o);
+    }
     if show_key {
         v["key"] = json!(row.get::<String, _>("key"));
     }
     v
 }
 
-/// GET /api/models — every enabled channel's model list, grouped by channel,
-/// so the routing UI can offer a picker instead of free-text input.
+/// All token-name values that belong to the given user, plus a sentinel when
+/// the user is admin (we use a special flag in the SQL instead so the
+/// query stays a single roundtrip — this helper exists only for log/usage
+/// filtering where the SQL needs an explicit list).
+async fn token_names_for_user(
+    pool: &sqlx::SqlitePool,
+    user_id: i64,
+    include_orphans: bool,
+) -> Vec<String> {
+    let q = if include_orphans {
+        "SELECT name FROM tokens WHERE user_id = ? OR user_id IS NULL"
+    } else {
+        "SELECT name FROM tokens WHERE user_id = ?"
+    };
+    sqlx::query_scalar(q)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+}
+
+/// GET /api/models — every enabled channel's model list, grouped by channel.
+/// Admin-only: the channel view exposes infrastructure details.
 pub async fn list_channel_models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let rows = sqlx::query(
         "SELECT name, models FROM channels WHERE enabled=1 ORDER BY id ASC",
     )
@@ -112,7 +136,7 @@ pub async fn list_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let rows = sqlx::query("SELECT * FROM channels ORDER BY id DESC")
         .fetch_all(&state.pool)
         .await
@@ -127,7 +151,7 @@ pub async fn create_channel(
     headers: HeaderMap,
     Json(req): Json<ChannelReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     if req.base_url.trim().is_empty() && req.base_url_anthropic.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -151,7 +175,7 @@ pub async fn update_channel(
     Path(id): Path<i64>,
     Json(req): Json<ChannelReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     if req.base_url.trim().is_empty() && req.base_url_anthropic.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -185,7 +209,7 @@ pub async fn delete_channel(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     sqlx::query("DELETE FROM channels WHERE id=?")
         .bind(id)
         .execute(&state.pool)
@@ -201,7 +225,7 @@ pub async fn fetch_models(
     headers: HeaderMap,
     Json(req): Json<FetchModelsReq>,
 ) -> axum::response::Response {
-    if let Err(s) = check_admin(&state, &headers) {
+    if let Err(s) = require_admin(&state, &headers) {
         return (s, Json(json!({ "error": "unauthorized" }))).into_response();
     }
     // try each configured base URL: OpenAI style (Bearer) then Anthropic
@@ -266,7 +290,7 @@ pub async fn fetch_models(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": "上游返回的不是有效 JSON" })),
             )
-                .into_response()
+            .into_response()
         }
     };
     let models: Vec<String> = body
@@ -291,7 +315,7 @@ pub async fn test_model(
     headers: HeaderMap,
     Json(req): Json<TestModelReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     if req.model.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -382,6 +406,9 @@ pub struct TokenReq {
     /// total tokens per UTC day; 0 = unlimited
     #[serde(default)]
     pub daily_token_limit: i64,
+    /// admin-only: assign to a specific user instead of the caller
+    #[serde(default)]
+    pub user_id: Option<i64>,
 }
 
 /// PATCH-able fields for an existing token (everything except name + key)
@@ -395,18 +422,56 @@ pub struct TokenUpdateReq {
     pub daily_token_limit: i64,
 }
 
+/// Verify the caller is allowed to manage this token. Admins can manage any;
+/// regular users only their own.
+async fn authorize_token(state: &AppState, user: AuthUser, token_id: i64) -> Result<i64, StatusCode> {
+    let owner: Option<i64> = sqlx::query_scalar("SELECT user_id FROM tokens WHERE id = ?")
+        .bind(token_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .flatten();
+    match owner {
+        None => Err(StatusCode::NOT_FOUND),
+        Some(uid) if user.is_admin || uid == user.id => Ok(uid),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 pub async fn list_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
-    let rows = sqlx::query("SELECT * FROM tokens ORDER BY id DESC")
+    let user = check_auth(&state, &headers)?;
+    let rows = if user.is_admin {
+        sqlx::query(
+            "SELECT t.*, u.username AS owner_name
+             FROM tokens t LEFT JOIN users u ON t.user_id = u.id
+             ORDER BY t.id DESC",
+        )
         .fetch_all(&state.pool)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(json!({
-        "tokens": rows.iter().map(|r| row_token(r, true)).collect::<Vec<_>>()
-    })))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        sqlx::query(
+            "SELECT t.*, u.username AS owner_name
+             FROM tokens t LEFT JOIN users u ON t.user_id = u.id
+             WHERE t.user_id = ?
+             ORDER BY t.id DESC",
+        )
+        .bind(user.id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+    let tokens: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let owner = r.try_get::<Option<String>, _>("owner_name").ok().flatten();
+            row_token(r, true, owner.as_deref())
+        })
+        .collect();
+    Ok(Json(json!({ "tokens": tokens })))
 }
 
 pub async fn create_token(
@@ -414,24 +479,38 @@ pub async fn create_token(
     headers: HeaderMap,
     Json(req): Json<TokenReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    let user = check_auth(&state, &headers)?;
+    let owner_id = if let Some(uid) = req.user_id {
+        if !user.is_admin {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        uid
+    } else {
+        user.id
+    };
     let key = format!("sk-{}", uuid::Uuid::new_v4().simple());
-    sqlx::query("INSERT INTO tokens (name, key, enabled, created_at, rpm_limit, daily_token_limit) VALUES (?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO tokens (name, key, enabled, created_at, rpm_limit, daily_token_limit, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(&req.name)
         .bind(&key)
         .bind(req.enabled as i64)
         .bind(now())
         .bind(req.rpm_limit.max(0))
         .bind(req.daily_token_limit.max(0))
+        .bind(owner_id)
         .execute(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let row = sqlx::query("SELECT * FROM tokens WHERE key=?")
-        .bind(&key)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(row_token(&row, true)))
+    let row = sqlx::query(
+        "SELECT t.*, u.username AS owner_name
+         FROM tokens t LEFT JOIN users u ON t.user_id = u.id
+         WHERE t.key = ?",
+    )
+    .bind(&key)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let owner = row.try_get::<Option<String>, _>("owner_name").ok().flatten();
+    Ok(Json(row_token(&row, true, owner.as_deref())))
 }
 
 pub async fn toggle_token(
@@ -440,7 +519,8 @@ pub async fn toggle_token(
     Path(id): Path<i64>,
     Json(req): Json<TokenUpdateReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    let user = check_auth(&state, &headers)?;
+    authorize_token(&state, user, id).await?;
     sqlx::query(
         "UPDATE tokens SET enabled=?, rpm_limit=?, daily_token_limit=? WHERE id=?",
     )
@@ -459,7 +539,8 @@ pub async fn delete_token(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    let user = check_auth(&state, &headers)?;
+    authorize_token(&state, user, id).await?;
     sqlx::query("DELETE FROM tokens WHERE id=?")
         .bind(id)
         .execute(&state.pool)
@@ -549,7 +630,7 @@ pub async fn list_mappings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let rows = sqlx::query("SELECT * FROM model_mappings ORDER BY id ASC")
         .fetch_all(&state.pool)
         .await
@@ -577,7 +658,7 @@ pub async fn create_mapping(
     headers: HeaderMap,
     Json(req): Json<MappingReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let targets = clean_targets(&req.targets);
     if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -608,7 +689,7 @@ pub async fn update_mapping(
     Path(id): Path<i64>,
     Json(req): Json<MappingReq>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let targets = clean_targets(&req.targets);
     if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -636,7 +717,7 @@ pub async fn delete_mapping(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    require_admin(&state, &headers)?;
     sqlx::query("DELETE FROM model_mappings WHERE id=?")
         .bind(id)
         .execute(&state.pool)
@@ -666,14 +747,39 @@ pub async fn list_logs(
     headers: HeaderMap,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    let user = check_auth(&state, &headers)?;
     let offset = (q.page - 1).max(0) * q.size;
-    let rows = sqlx::query("SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?")
-        .bind(q.size)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
+    // If a non-admin has no tokens at all, skip the IN clause with a 1=0
+    // guard — empty `token IN ()` is invalid SQL in SQLite.
+    let rows = if !user.is_admin && allowed.is_empty() {
+        Vec::new()
+    } else if user.is_admin {
+        sqlx::query("SELECT * FROM logs ORDER BY id DESC LIMIT ? OFFSET ?")
+            .bind(q.size)
+            .bind(offset)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        let placeholders = std::iter::repeat("?")
+            .take(allowed.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM logs WHERE token_name IN ({}) ORDER BY id DESC LIMIT ? OFFSET ?",
+            placeholders
+        );
+        let mut query = sqlx::query(&sql);
+        for n in &allowed {
+            query = query.bind(n);
+        }
+        query = query.bind(q.size).bind(offset);
+        query
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
     let logs: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -709,62 +815,102 @@ pub async fn usage(
     headers: HeaderMap,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_admin(&state, &headers)?;
+    let user = check_auth(&state, &headers)?;
     let days = q.range.max(1).min(90);
     let since = crate::db::now() - days * 86400;
+    let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
 
-    // by day
-    let day_rows = sqlx::query(
-        "SELECT
-            (created_at / 86400) * 86400 AS k,
-            COUNT(*) AS reqs,
-            SUM(prompt_tokens) AS p,
-            SUM(completion_tokens) AS c,
-            SUM(total_tokens) AS t
-         FROM logs WHERE created_at >= ? GROUP BY k ORDER BY k",
-    )
-    .bind(since)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // A predicate that limits to the caller's tokens, or empty when admin.
+    // Empty `allowed` for non-admin collapses to no rows.
+    fn restrict_clause(allowed: &[String]) -> String {
+        if allowed.is_empty() {
+            return " WHERE 1=0".to_string();
+        }
+        let ph = std::iter::repeat("?")
+            .take(allowed.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" WHERE token_name IN ({})", ph)
+    }
+    let clause = if user.is_admin {
+        String::new()
+    } else {
+        restrict_clause(&allowed)
+    };
+    let user_binds = if user.is_admin {
+        Vec::new()
+    } else {
+        allowed
+    };
 
-    // by token / model / channel: separate queries (SQLite has no GROUPING SETS)
-    let group_q = |col: &str| {
+    // by_day (GROUP BY day bucket)
+    let by_day_sql = format!(
+        "SELECT (created_at / 86400) * 86400 AS k,
+                COUNT(*) AS reqs,
+                SUM(prompt_tokens) AS p,
+                SUM(completion_tokens) AS c,
+                SUM(total_tokens) AS t
+         FROM logs{0}{1} created_at >= ? GROUP BY k ORDER BY k",
+        clause,
+        if clause.is_empty() { " WHERE" } else { " AND" }
+    );
+    let mut day_query = sqlx::query(&by_day_sql);
+    for n in &user_binds {
+        day_query = day_query.bind(n);
+    }
+    day_query = day_query.bind(since);
+    let day_rows = day_query
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // by token / model / channel — separate queries (SQLite has no GROUPING SETS)
+    let group_sql = |col: &str| -> String {
         format!(
             "SELECT {0} AS k, COUNT(*) AS reqs,
                 SUM(prompt_tokens) AS p,
                 SUM(completion_tokens) AS c,
                 SUM(total_tokens) AS t
-             FROM logs WHERE created_at >= ? GROUP BY {0} ORDER BY t DESC",
-            col
+             FROM logs{1}{2} created_at >= ? GROUP BY {0} ORDER BY t DESC",
+            col,
+            clause,
+            if clause.is_empty() { " WHERE" } else { " AND" }
         )
     };
-    let token_rows = sqlx::query(&group_q("token_name"))
-        .bind(since)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let model_rows = sqlx::query(&group_q("model"))
-        .bind(since)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let channel_rows = sqlx::query(&group_q("channel_name"))
-        .bind(since)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sql = group_sql("token_name");
+    let mut q = sqlx::query(&sql);
+    for n in &user_binds { q = q.bind(n); }
+    q = q.bind(since);
+    let token_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sql = group_sql("model");
+    let mut q = sqlx::query(&sql);
+    for n in &user_binds { q = q.bind(n); }
+    q = q.bind(since);
+    let model_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sql = group_sql("channel_name");
+    let mut q = sqlx::query(&sql);
+    for n in &user_binds { q = q.bind(n); }
+    q = q.bind(since);
+    let channel_rows = q.fetch_all(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let totals = sqlx::query(
+    // totals
+    let totals_sql = format!(
         "SELECT COUNT(*) AS reqs, COALESCE(SUM(prompt_tokens),0) AS p,
                 COALESCE(SUM(completion_tokens),0) AS c,
                 COALESCE(SUM(total_tokens),0) AS t
-         FROM logs WHERE created_at >= ?",
-    )
-    .bind(since)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+         FROM logs{0}{1} created_at >= ?",
+        clause,
+        if clause.is_empty() { " WHERE" } else { " AND" }
+    );
+    let mut totals_query = sqlx::query(&totals_sql);
+    for n in &user_binds {
+        totals_query = totals_query.bind(n);
+    }
+    totals_query = totals_query.bind(since);
+    let totals = totals_query
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     fn map_group(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Value> {
         rows.into_iter()
@@ -808,3 +954,7 @@ pub async fn usage(
         "by_channel": map_group(channel_rows),
     })))
 }
+
+// `into_response` is brought in scope for fetch_models above; using a
+// qualified import keeps the helper file narrower.
+use axum::response::IntoResponse;

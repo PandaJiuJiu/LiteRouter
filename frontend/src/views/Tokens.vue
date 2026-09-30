@@ -6,6 +6,12 @@
     </div>
     <el-table :data="tokens" v-loading="loading">
       <el-table-column prop="name" label="名称" width="160" />
+      <el-table-column v-if="isAdmin" label="归属" width="120">
+        <template #default="{ row }">
+          <span v-if="row.owner">{{ row.owner }}</span>
+          <span v-else class="hint">未分配</span>
+        </template>
+      </el-table-column>
       <el-table-column label="Key" min-width="280">
         <template #default="{ row }">
           <span class="mono">{{ row.key }}</span>
@@ -55,6 +61,13 @@
         <el-form-item label="名称">
           <el-input v-model="form.name" :disabled="editing" placeholder="内部服务名 / 用途" />
         </el-form-item>
+        <el-form-item v-if="!editing && isAdmin" label="归属用户">
+          <el-select v-model="form.user_id" placeholder="默认归属自己" clearable style="width: 220px">
+            <el-option v-for="u in users" :key="u.id"
+              :label="u.username + (u.is_admin ? ' (管理员)' : '')"
+              :value="u.id" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
@@ -78,19 +91,22 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { listTokens, createToken, updateToken, deleteToken } from '../api'
+import { createToken, deleteToken, listTokens, listUsers, me, updateToken } from '../api'
 
 const tokens = ref([])
+const users = ref([])
 const loading = ref(false)
 const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
+const isAdmin = ref(false)
 
 const emptyForm = () => ({
   name: '',
   enabled: true,
   rpm_limit: 0,
   daily_token_limit: 0,
+  user_id: null,
 })
 const form = ref(emptyForm())
 
@@ -98,9 +114,17 @@ async function load() {
   loading.value = true
   try {
     tokens.value = await listTokens()
+    if (isAdmin.value) users.value = await listUsers()
   } finally {
     loading.value = false
   }
+}
+
+async function loadMe() {
+  try {
+    const u = await me()
+    isAdmin.value = !!u.is_admin
+  } catch (_) {}
 }
 
 function openCreate() {
@@ -116,6 +140,7 @@ function openEdit(row) {
     enabled: !!row.enabled,
     rpm_limit: row.rpm_limit || 0,
     daily_token_limit: row.daily_token_limit || 0,
+    user_id: row.user_id || null,
   }
   dialogVisible.value = true
 }
@@ -135,12 +160,16 @@ async function submit() {
       })
       ElMessage.success('已保存')
     } else {
-      await createToken({
+      const payload = {
         name: form.value.name.trim(),
         enabled: form.value.enabled,
         rpm_limit: Math.max(0, form.value.rpm_limit || 0),
         daily_token_limit: Math.max(0, form.value.daily_token_limit || 0),
-      })
+      }
+      if (isAdmin.value && form.value.user_id) {
+        payload.user_id = form.value.user_id
+      }
+      await createToken(payload)
       ElMessage.success('已创建')
     }
     dialogVisible.value = false
@@ -178,7 +207,10 @@ function resetForm() {
   editing.value = null
 }
 
-onMounted(load)
+onMounted(async () => {
+  await loadMe()
+  await load()
+})
 </script>
 
 <style scoped>

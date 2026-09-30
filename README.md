@@ -32,17 +32,35 @@ One-command deployment with Docker Compose:
 ```bash
 git clone https://github.com/qihangkong/LiteRouter.git
 cd LiteRouter
-ADMIN_PASSWORD=your-password docker compose up -d --build
+docker compose up -d --build
 ```
 
-After startup, visit `http://your-host:3000` for the admin UI (default password `admin123`, change it via the `ADMIN_PASSWORD` environment variable).
+After startup, visit `http://your-host:3000` — the system will walk you through creating the first admin account.
 
 Notes:
 
 - The image is a three-stage build (frontend → backend → runtime), final stage based on `alpine:3.20`, no external dependencies
 - SQLite data is persisted in the `./data` directory
-- `docker-compose.yml` depends on the `Dockerfile` in the same directory; both work without modification. `ADMIN_PASSWORD` falls back to the default when unset
+- `docker-compose.yml` depends on the `Dockerfile` in the same directory; both work without modification
 - On older Docker versions, use `docker-compose` (with hyphen) instead of `docker compose`
+
+### Account model
+
+- First visit redirects to an **initialization wizard** that creates the first admin account (password ≥ 8 chars)
+- Admins manage users from the **Users** page: create, reset password, promote/demote, delete
+- **Channels** and **mappings** are shared infrastructure managed by admins; visible to all logged-in accounts but only writable by admins
+- **Tokens** are per-user. Each user creates and manages their own; admins see all and can create tokens on behalf of others
+- **Logs** and **usage** are auto-scoped per user; admins see everything
+- At least one admin must always remain to prevent lockout
+
+### Pre-seeding the first admin via env (optional)
+
+If you'd rather skip the web wizard on first boot, set `ADMIN_PASSWORD`; the server will create a `admin` account with that password on startup. Change it later from the UI.
+
+```bash
+ADMIN_PASSWORD=your-password docker compose up -d --build
+# then log in with admin / your-password
+```
 
 ### Changing the port
 
@@ -65,7 +83,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `3000` | Listen port |
-| `ADMIN_PASSWORD` | `admin123` | Admin UI password |
+| `ADMIN_PASSWORD` | (empty) | Optional: on first boot, create an `admin` account with this password. Unset = walk through the web setup wizard |
 | `LITEROUTER_DB` | `literouter.db` | SQLite database path (compose points it at the persistent volume `/app/data/literouter.db`) |
 
 ## Usage
