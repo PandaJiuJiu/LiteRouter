@@ -13,13 +13,12 @@
       </div>
     </div>
     <el-table :data="logs" v-loading="loading" @row-click="open">
-      <el-table-column label="请求时间" min-width="180">
+      <el-table-column label="请求时间" width="165" show-overflow-tooltip>
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
         </template>
       </el-table-column>
-      <el-table-column prop="token_name" label="令牌" width="160" />
-      <el-table-column label="来源" width="220">
+      <el-table-column label="来源" width="290">
         <template #default="{ row }">
           <el-tooltip
             v-if="row.client_ip || row.user_agent"
@@ -27,7 +26,7 @@
             :show-after="200"
             :content="[row.client_ip, row.user_agent].filter(Boolean).join(' · ')"
           >
-            <span>
+            <span class="src">
               <span v-if="row.client_ip" class="ip">{{ row.client_ip }}</span>
               <span v-if="row.client_ip && row.user_agent"> · </span>
               <span v-if="row.user_agent" class="ua">{{ shortUa(row.user_agent) }}</span>
@@ -36,7 +35,8 @@
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="request_model" label="请求模型" min-width="180" show-overflow-tooltip />
+      <el-table-column prop="token_name" label="令牌" width="120" show-overflow-tooltip />
+      <el-table-column prop="request_model" label="请求模型" min-width="150" show-overflow-tooltip />
       <el-table-column label="转发模型" min-width="200" show-overflow-tooltip>
         <template #default="{ row }">
           <span>{{ row.upstream_model || row.request_model }}</span>
@@ -180,6 +180,16 @@ onMounted(load)
 .ua {
   font-size: 11px;
   color: #909399;
+}
+/* Without this the cell wraps to two lines once the content exceeds the
+   column width; the ellipsis + tooltip path is easier to read. */
+.src {
+  display: inline-block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
 }
 .fail-badge {
   margin-left: 6px;

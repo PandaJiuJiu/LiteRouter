@@ -27,12 +27,17 @@
       <!-- 基本信息 -->
       <section>
         <h3>请求</h3>
-        <el-descriptions :column="2" border>
+        <el-descriptions :column="1" border>
           <el-descriptions-item label="令牌">{{ log.token_name }}</el-descriptions-item>
           <el-descriptions-item label="客户端协议">{{ log.protocol || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="客户端 IP">{{ log.client_ip || '—' }}</el-descriptions-item>
           <el-descriptions-item label="时间">{{ formatTime(log.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="请求模型 → 转发模型">
             {{ log.request_model || '—' }} → {{ log.upstream_model || log.request_model || '—' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="User-Agent">
+            <span v-if="log.user_agent" class="ua-full">{{ log.user_agent }}</span>
+            <span v-else class="hint">—</span>
           </el-descriptions-item>
         </el-descriptions>
       </section>
@@ -160,6 +165,18 @@ onMounted(load)
 }
 .err {
   color: #f56c6c;
+}
+/* Browser UAs run long. Let it wrap instead of clipping — this is the page
+   where the full string is the point (the list page truncates instead). */
+.ua-full {
+  font-size: 12px;
+  color: #606266;
+  word-break: break-all;
+}
+/* Fix the label column so the long "请求模型 → 转发模型" label doesn't
+   stretch it and leave a canyon of whitespace before each value. */
+:deep(.el-descriptions__label) {
+  width: 168px;
 }
 .num {
   font-variant-numeric: tabular-nums;
