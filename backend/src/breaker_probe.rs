@@ -7,7 +7,7 @@
 //! 1. Asks the breaker for keys whose cooldown has elapsed.
 //! 2. For each, sends a synthetic `max_tokens=1` ping to the channel.
 //! 3. Records the outcome back into the breaker (Success closes it,
-//!    Failure re-opens it with exponential back-off).
+//!    Failure re-opens it with doubled back-off capped at `max_delay`).
 //!
 //! Probes use the channel's own API key directly (no user token is
 //! involved) and the channel's protocol — we read the channel row from the

@@ -4,28 +4,34 @@
 //! ## State machine
 //!
 //! ```text
-//!   Closed ──record(failure)──> Open (next_probe_at = now + base_delay)
-//!      ▲                                  │
-//!      │                       now >= next_probe_at
+//!   (absent) ──record(failure)──> Open   (deadline = now + base_delay)
+//!      ▲                                    │
+//!      │                       now >= deadline
 //!      │                       (background task probes)
-//!      │                                  │
-//!      └────────record(success)──────────┘
+//!      │                                    │
+//!      │                       record(failure) doubles backoff
+//!      │                       (capped at max_delay)
+//!      │                                    │
+//!      └────────record(success)─────────────┘  (entry removed)
 //! ```
 //!
 //! Two writers feed `record()`: the relay (after a user-driven upstream
-//! attempt) and the probe task (after a synthetic recovery probe). Both
-//! paths collapse to the same two operations — set a 30s skip-timer on
-//! failure, clear it on success.
+//! attempt) and the probe task (after a synthetic recovery probe). The
+//! backoff grows geometrically — first trip uses `base_delay`, every
+//! subsequent probe failure doubles the wait, capped at `max_delay`.
+//! On `Success` the entry is removed from the map entirely; the next
+//! failure, if it happens, starts a fresh ladder at `base_delay`.
 //!
 //! ## Recovery
 //!
-//! Recovery is **never** triggered by user requests. When `next_probe_at`
+//! Recovery is **never** triggered by user requests. When the deadline
 //! elapses the breaker stays Open; only the background probe task, which
 //! ticks every `probe_interval`, observes the deadline and sends a
 //! synthetic probe. This keeps recovery independent of user traffic —
 //! a healthy upstream recovers at the next probe tick after its cooldown,
 //! not whenever someone happens to request the model again.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,13 +51,16 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct BreakerConfig {
     pub enabled: bool,
-    /// Skip window applied after every failure. After a probe also fails,
-    /// the breaker re-arms the same skip window — no exponential back-off,
-    /// no consecutive-failure counter, no cap. The background probe task
-    /// keeps retrying at `probe_interval` cadence until it sees a 2xx.
+    /// Backoff applied on the first failure (or after a success resets the
+    /// ladder). Each subsequent failure *doubles* the backoff, capped at
+    /// `max_delay` — geometric growth.
     pub base_delay: Duration,
+    /// Cap on the per-key backoff. With base_delay=30s and max_delay=600s
+    /// the ladder is 30 → 60 → 120 → 240 → 480 → 600, then it plateaus at
+    /// 600s until either the upstream recovers or the admin resets.
+    pub max_delay: Duration,
     /// Background probe task interval. The task ticks at this rate, sending
-    /// a synthetic probe for every Open key whose `next_probe_at <= now`.
+    /// a synthetic probe for every Open key whose `deadline <= now`.
     pub probe_interval: Duration,
 }
 
@@ -60,6 +69,7 @@ impl Default for BreakerConfig {
         Self {
             enabled: true,
             base_delay: Duration::from_secs(30),
+            max_delay: Duration::from_secs(600),
             probe_interval: Duration::from_secs(30),
         }
     }
@@ -74,14 +84,16 @@ pub enum Outcome {
     Failure,
 }
 
-/// JSON-friendly view of one key's state for the admin panel.
+/// JSON-friendly view of one key's state for the admin panel. Only
+/// currently-Open keys appear here — Closed keys are dropped from the
+/// breaker entirely (no "ever-touched" history is retained).
 #[derive(Clone, Debug, Serialize)]
 pub struct BreakerSnapshotRow {
     pub key: String,
     pub channel: String,
     pub target_model: String,
-    pub state: String, // "closed" | "open"
-    /// Seconds until the next probe is due. 0 when Closed.
+    pub state: String, // always "open" today — closed keys aren't tracked
+    /// Seconds until the next probe is due.
     pub cooldown_remaining_secs: u64,
 }
 
@@ -90,13 +102,22 @@ pub fn breaker_key(channel: &str, target_model: &str) -> String {
 }
 
 struct BreakerState {
-    /// `None` = Closed. `Some(deadline)` = Open until `deadline`.
-    next_probe_at: Option<Instant>,
+    /// Hard deadline — the breaker must not let this key through until
+    /// `Instant::now() >= deadline`. The background probe task checks
+    /// this against `now` on every tick.
+    deadline: Instant,
+    /// Backoff currently in effect. Doubles on each consecutive failure,
+    /// capped at `max_delay`. A `Success` removes the entry from the map,
+    /// so this field is only meaningful for keys that are currently Open.
+    current_backoff: Duration,
 }
 
 impl BreakerState {
-    fn new() -> Self {
-        Self { next_probe_at: None }
+    fn open(base_delay: Duration, deadline: Instant) -> Self {
+        Self {
+            deadline,
+            current_backoff: base_delay,
+        }
     }
 }
 
@@ -125,8 +146,9 @@ impl Breaker {
     }
 
     /// Decide whether a user-driven request to `key` should proceed.
-    /// **Open keys are always rejected** — the background probe task is
-    /// the only path that can re-enable a key. This keeps recovery
+    /// **Any tracked key is rejected** — Closed keys are absent from the
+    /// map, Open keys have a future deadline. The background probe task
+    /// is the only path that can re-enable a key. This keeps recovery
     /// independent of user traffic.
     pub async fn allow(&self, key: &str) -> bool {
         let cfg = self.cfg.read().await.clone();
@@ -134,10 +156,7 @@ impl Breaker {
             return true;
         }
         let guard = self.inner.read().await;
-        match guard.get(key) {
-            Some(entry) => entry.next_probe_at.is_none(),
-            None => true, // never seen — let the first attempt through
-        }
+        !guard.contains_key(key)
     }
 
     /// Feed one outcome back into the breaker. Called from both the relay
@@ -149,32 +168,50 @@ impl Breaker {
         }
         let now = Instant::now();
         let mut guard = self.inner.write().await;
-        let entry = guard
-            .entry(key.to_owned())
-            .or_insert_with(BreakerState::new);
-
         match outcome {
             Outcome::Success => {
-                entry.next_probe_at = None;
+                // Drop the entry entirely — the next failure, if any,
+                // starts a fresh ladder at `base_delay`.
+                guard.remove(key);
             }
             Outcome::Failure => {
-                entry.next_probe_at =
-                    Some(now.checked_add(cfg.base_delay).unwrap_or(now));
+                let backoff = match guard.entry(key.to_owned()) {
+                    Entry::Occupied(o) => o
+                        .get()
+                        .current_backoff
+                        .saturating_mul(2)
+                        .min(cfg.max_delay),
+                    Entry::Vacant(v) => {
+                        let deadline =
+                            now.checked_add(cfg.base_delay).unwrap_or(now);
+                        v.insert(BreakerState::open(cfg.base_delay, deadline));
+                        cfg.base_delay
+                    }
+                };
+                let entry = guard.get_mut(key).expect("just inserted");
+                if backoff != entry.current_backoff {
+                    entry.current_backoff = backoff;
+                }
+                entry.deadline =
+                    now.checked_add(entry.current_backoff).unwrap_or(now);
             }
         }
     }
 
     /// Keys that the probe task should attempt on the next tick: every
-    /// Open key whose `next_probe_at <= now`. Closed keys (and keys we
-    /// haven't seen) are skipped — we don't proactively probe healthy
-    /// models because that would burn quota for no diagnostic value.
+    /// tracked key whose `deadline <= now`. We don't proactively probe
+    /// healthy models because that would burn quota for no diagnostic
+    /// value — only keys we already know are Open get probed.
     pub async fn expired_keys(&self, now: Instant) -> Vec<(String, String)> {
         let guard = self.inner.read().await;
         guard
             .iter()
-            .filter_map(|(k, e)| match e.next_probe_at {
-                Some(deadline) if deadline <= now => Some(split_key_owned(k)),
-                _ => None,
+            .filter_map(|(k, e)| {
+                if e.deadline <= now {
+                    Some(split_key_owned(k))
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -184,20 +221,14 @@ impl Breaker {
         let now = Instant::now();
         let mut out: Vec<BreakerSnapshotRow> = Vec::new();
         for (key, entry) in guard.iter() {
-            let (state_label, cooldown_remaining_secs) = match entry.next_probe_at {
-                None => ("closed".to_string(), 0),
-                Some(t) => {
-                    let remain = t.saturating_duration_since(now).as_secs();
-                    ("open".to_string(), remain)
-                }
-            };
+            let remain = entry.deadline.saturating_duration_since(now).as_secs();
             let (channel, target_model) = split_key_owned(key);
             out.push(BreakerSnapshotRow {
                 key: key.clone(),
                 channel,
                 target_model,
-                state: state_label,
-                cooldown_remaining_secs,
+                state: "open".to_string(),
+                cooldown_remaining_secs: remain,
             });
         }
         out
@@ -260,8 +291,9 @@ mod tests {
     fn cfg() -> BreakerConfig {
         BreakerConfig {
             enabled: true,
-            base_delay: Duration::from_millis(100),
-            probe_interval: Duration::from_millis(50),
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(5),
+            probe_interval: Duration::from_millis(500),
         }
     }
 
@@ -282,14 +314,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_clears_open_state() {
+    async fn success_removes_entry_from_map() {
+        // On Success the key is dropped entirely, not retained with a
+        // closed marker. `snapshot()` should be empty and `allow()`
+        // should return true again.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
         b.record(&key, Outcome::Failure).await;
         assert!(!b.allow(&key).await);
+        assert_eq!(b.snapshot().await.len(), 1);
+
         b.record(&key, Outcome::Success).await;
         assert!(b.allow(&key).await);
-        assert_eq!(b.snapshot().await[0].state, "closed");
+        assert!(b.snapshot().await.is_empty());
     }
 
     #[tokio::test]
@@ -299,7 +336,7 @@ mod tests {
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
         b.record(&key, Outcome::Failure).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!b.allow(&key).await);
     }
 
@@ -310,35 +347,80 @@ mod tests {
         let key2 = breaker_key("ch2", "m2");
         b.record(&key1, Outcome::Failure).await;
         b.record(&key2, Outcome::Failure).await;
-        // Right after trip: none are due (cooldown = 100ms)
+        // Right after trip: none are due (cooldown = 1s)
         let now = Instant::now();
         assert!(b.expired_keys(now).await.is_empty());
         // After base_delay has elapsed: both are due
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         let now = Instant::now();
         let due = b.expired_keys(now).await;
         assert_eq!(due.len(), 2);
-        // Closed keys (never failed) are never in the list
-        let healthy_key = breaker_key("never-tried", "x");
-        let _ = healthy_key;
     }
 
     #[tokio::test]
-    async fn re_failure_resets_cooldown_to_base() {
-        // Probe fails → next_probe_at is pushed by exactly base_delay
-        // from the failure moment, not from the previous deadline.
+    async fn consecutive_failures_double_backoff() {
+        // First failure: backoff = base_delay (1s)
+        // 2nd failure (still Open from 1st): backoff = 2s
+        // 3rd failure: backoff = 4s
+        // 4th failure: backoff = 5s (= max_delay, doubled 8 → capped)
+        // 5th failure: still 5s (cap holds)
+        //
+        // No sleeps between failures — the 1st record inserts a fresh
+        // entry that uses `base_delay`; every subsequent record enters
+        // the "Occupied" branch and doubles the backoff.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
+
+        async fn backoff(b: &Breaker, key: &str) -> u64 {
+            b.inner.read().await.get(key).unwrap().current_backoff.as_secs()
+        }
+
         b.record(&key, Outcome::Failure).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        // 1st probe failure — push to T+100ms from now
+        assert_eq!(backoff(&b, &key).await, 1);
+
         b.record(&key, Outcome::Failure).await;
-        // Right after: not yet due
-        assert!(b.expired_keys(Instant::now()).await.is_empty());
-        // After base_delay has elapsed again: due
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let now = Instant::now();
-        assert_eq!(b.expired_keys(now).await.len(), 1);
+        assert_eq!(backoff(&b, &key).await, 2);
+
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(backoff(&b, &key).await, 4);
+
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(backoff(&b, &key).await, 5);
+        assert_eq!(b.snapshot().await[0].state, "open");
+
+        // Cap holds for additional failures
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(backoff(&b, &key).await, 5);
+    }
+
+    #[tokio::test]
+    async fn success_resets_backoff_ladder() {
+        // After success the entry is removed; the next failure starts a
+        // fresh ladder at base_delay, not at the previously doubled value.
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "model");
+
+        async fn backoff(b: &Breaker, key: &str) -> Option<u64> {
+            b.inner
+                .read()
+                .await
+                .get(key)
+                .map(|s| s.current_backoff.as_secs())
+        }
+
+        // Fail three times → backoff should have doubled to 4s
+        b.record(&key, Outcome::Failure).await;
+        b.record(&key, Outcome::Failure).await;
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(backoff(&b, &key).await, Some(4));
+
+        // Probe succeeds → entry removed entirely
+        b.record(&key, Outcome::Success).await;
+        assert_eq!(backoff(&b, &key).await, None);
+
+        // Next failure should use base_delay, not 4s
+        b.record(&key, Outcome::Failure).await;
+        assert_eq!(backoff(&b, &key).await, Some(1));
     }
 
     #[tokio::test]

@@ -118,7 +118,7 @@
           <div class="breaker-title">
             <span>熔断器状态</span>
             <span class="hint">
-              {{ openCount }} 个 (渠道, 模型) 熔断中 · {{ snapshot.length }} 监测中
+              {{ openCount }} 个 (渠道, 模型) 熔断中
             </span>
           </div>
         </template>
@@ -128,23 +128,20 @@
         </div>
         <div class="hint breaker-desc">
           熔断中的上游组合会被路由自动跳过，不会消耗请求配额也不会出现在 attempt 链里。
-          任意一次失败（5xx / 4xx / 408 / 429 / 网络错误）即熔断 {{ baseDelaySecs }}s，
+          任意一次失败（5xx / 4xx / 408 / 429 / 网络错误）即熔断 {{ baseDelaySecs }}s；
+          探测再次失败，退避每次翻倍（×2），最多到 {{ maxDelaySecs }}s。
           到点由后台任务独立发探测验证恢复，恢复前不会主动重试用户请求。
           后台任务每 {{ probeIntervalSecs }}s 检查一次所有到期组合。
+          恢复正常后该组合会从此表移除。
         </div>
         <el-table
           :data="snapshot"
           v-loading="breakerLoading"
           size="small"
-          empty-text="暂无熔断记录 — 所有上游组合目前都正常"
+          empty-text="所有上游组合目前都正常"
         >
           <el-table-column prop="channel" label="渠道" width="160" show-overflow-tooltip />
           <el-table-column prop="target_model" label="模型" min-width="180" show-overflow-tooltip />
-          <el-table-column label="状态" width="80">
-            <template #default="{ row }">
-              <el-tag :type="stateTagType(row.state)" size="small">{{ stateLabel(row.state) }}</el-tag>
-            </template>
-          </el-table-column>
           <el-table-column label="下次探测" width="100">
             <template #default="{ row }">
               <span v-if="row.cooldown_remaining_secs">{{ row.cooldown_remaining_secs }}s</span>
@@ -184,18 +181,13 @@ const breakerLoading = ref(false)
 // Thresholds shown in the panel description — read from the server config
 // so the docs in the UI match what's actually enforced.
 const baseDelaySecs = ref(30)
+const maxDelaySecs = ref(600)
 const probeIntervalSecs = ref(30)
 const snapshot = computed(() => breaker.snapshot)
 const openCount = computed(
   () => snapshot.value.filter((r) => r.state === 'open').length,
 )
 
-function stateLabel(s) {
-  return ({ closed: '正常', open: '熔断' })[s] || s
-}
-function stateTagType(s) {
-  return ({ closed: 'success', open: 'danger' })[s] || ''
-}
 async function refreshBreaker() {
   breakerLoading.value = true
   try {
@@ -320,6 +312,7 @@ onMounted(async () => {
     try {
       const cfg = await getBreakerConfig()
       baseDelaySecs.value = cfg.base_delay_secs ?? 30
+      maxDelaySecs.value = cfg.max_delay_secs ?? 600
       probeIntervalSecs.value = cfg.probe_interval_secs ?? 30
     } catch (_) {
       // fall back to the defaults already in the refs

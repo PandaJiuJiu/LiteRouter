@@ -22,8 +22,9 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     /// When true, request/response bodies are written to data/debug_logs/.
     pub debug_logging: bool,
-    /// Per-(channel, model) circuit breaker. In-memory; restarts clear it,
-    /// matching the session-stores-don't-survive-restart stance.
+    /// Per-(channel, model) circuit breaker. In-memory only — process
+    /// restart clears every key, matching the session-stores-don't-
+    /// survive-restart stance. See `breaker.rs` for the state machine.
     pub breaker: Arc<Breaker>,
 }
 

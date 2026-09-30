@@ -70,7 +70,7 @@ async fn read_setting(pool: &sqlx::SqlitePool, key: &str, default: &str) -> Stri
 }
 
 /// Load all breaker settings from the `settings` table at startup. Missing
-/// keys use the `Default` impl — migration 0021 pre-seeds them so a fresh
+/// keys use the `Default` impl — migration 0022 pre-seeds them so a fresh
 /// DB works out of the box.
 pub async fn load_breaker_config(pool: &sqlx::SqlitePool) -> BreakerConfig {
     let enabled = read_setting(pool, "breaker_enabled", "1").await == "1";
@@ -78,6 +78,10 @@ pub async fn load_breaker_config(pool: &sqlx::SqlitePool) -> BreakerConfig {
         .await
         .parse()
         .unwrap_or(30);
+    let max_delay: u64 = read_setting(pool, "breaker_max_delay_secs", "600")
+        .await
+        .parse()
+        .unwrap_or(600);
     let probe_interval: u64 = read_setting(pool, "breaker_probe_interval_secs", "30")
         .await
         .parse()
@@ -85,6 +89,7 @@ pub async fn load_breaker_config(pool: &sqlx::SqlitePool) -> BreakerConfig {
     BreakerConfig {
         enabled,
         base_delay: Duration::from_secs(base_delay),
+        max_delay: Duration::from_secs(max_delay),
         probe_interval: Duration::from_secs(probe_interval),
     }
 }
@@ -100,6 +105,7 @@ pub async fn get_breaker_config(
     Ok(Json(json!({
         "enabled": cfg.enabled,
         "base_delay_secs": cfg.base_delay.as_secs(),
+        "max_delay_secs": cfg.max_delay.as_secs(),
         "probe_interval_secs": cfg.probe_interval.as_secs(),
     })))
 }
@@ -108,11 +114,12 @@ pub async fn get_breaker_config(
 pub struct SetBreakerConfigReq {
     enabled: Option<bool>,
     base_delay_secs: Option<u64>,
+    max_delay_secs: Option<u64>,
     probe_interval_secs: Option<u64>,
 }
 
 /// PUT /api/settings/breaker — admin only. Each field is optional; absent
-/// fields are kept at their current value. Persists all 3 keys to the
+/// fields are kept at their current value. Persists all 4 keys to the
 /// `settings` table (idempotent UPSERT) and hot-swaps the running config.
 pub async fn set_breaker_config(
     State(state): State<Arc<AppState>>,
@@ -127,10 +134,13 @@ pub async fn set_breaker_config(
     if let Some(v) = req.base_delay_secs {
         cfg.base_delay = Duration::from_secs(v);
     }
+    if let Some(v) = req.max_delay_secs {
+        cfg.max_delay = Duration::from_secs(v);
+    }
     if let Some(v) = req.probe_interval_secs {
         cfg.probe_interval = Duration::from_secs(v);
     }
-    let pairs: [(&str, String); 3] = [
+    let pairs: [(&str, String); 4] = [
         (
             "breaker_enabled",
             if cfg.enabled { "1".into() } else { "0".into() },
@@ -138,6 +148,10 @@ pub async fn set_breaker_config(
         (
             "breaker_base_delay_secs",
             cfg.base_delay.as_secs().to_string(),
+        ),
+        (
+            "breaker_max_delay_secs",
+            cfg.max_delay.as_secs().to_string(),
         ),
         (
             "breaker_probe_interval_secs",
@@ -158,6 +172,7 @@ pub async fn set_breaker_config(
     Ok(Json(json!({
         "enabled": cfg.enabled,
         "base_delay_secs": cfg.base_delay.as_secs(),
+        "max_delay_secs": cfg.max_delay.as_secs(),
         "probe_interval_secs": cfg.probe_interval.as_secs(),
     })))
 }

@@ -875,7 +875,7 @@ pub async fn list_logs(
         let ph = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT log_id, upstream_model, channel_name, status_code, error \
-             FROM log_attempts WHERE ok=0 AND log_id IN ({ph}) ORDER BY seq ASC"
+             FROM log_attempts WHERE ok=0 AND skipped=0 AND log_id IN ({ph}) ORDER BY seq ASC"
         );
         let mut query = sqlx::query(&sql);
         for id in &ids {
@@ -970,7 +970,7 @@ pub async fn get_log(
     // The relay chain behind this request. One row per upstream attempt, in
     // the order they happened — empty for logs written before 0015.
     let attempt_rows = sqlx::query(
-        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok \
+        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped \
          FROM log_attempts WHERE log_id=? ORDER BY seq ASC",
     )
     .bind(id)
@@ -989,6 +989,7 @@ pub async fn get_log(
                 "latency_ms": a.get::<i64, _>("latency_ms"),
                 "convert": a.get::<String, _>("convert"),
                 "ok": a.get::<i64, _>("ok") != 0,
+                "skipped": a.get::<i64, _>("skipped") != 0,
             })
         })
         .collect();

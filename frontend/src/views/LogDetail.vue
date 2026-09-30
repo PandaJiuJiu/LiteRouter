@@ -47,10 +47,10 @@
         <h3>
           转发链路
           <span class="hint">
-            共 {{ log.attempts.length }} 次尝试{{ log.failed_count > 0 ? `，其中 ${log.failed_count} 次失败` : '' }}
+            共 {{ attemptSummary }}
           </span>
         </h3>
-        <el-table :data="log.attempts" size="small" border>
+        <el-table :data="log.attempts" size="small" border :row-class-name="attemptRowClass">
           <el-table-column label="#" width="46">
             <template #default="{ row }">{{ row.seq + 1 }}</template>
           </el-table-column>
@@ -60,19 +60,22 @@
           </el-table-column>
           <el-table-column label="结果" width="110">
             <template #default="{ row }">
-              <el-tag :type="row.ok ? 'success' : 'danger'" size="small">
+              <el-tag v-if="row.skipped" type="info" size="small" effect="plain">跳过</el-tag>
+              <el-tag v-else :type="row.ok ? 'success' : 'danger'" size="small">
                 {{ row.ok ? '成功' : row.status_code === -1 ? '连接失败' : row.status_code }}
               </el-tag>
             </template>
           </el-table-column>
           <el-table-column label="耗时" width="90">
             <template #default="{ row }">
-              <span class="num">{{ row.latency_ms.toLocaleString() }} ms</span>
+              <span class="num" :class="{ muted: row.skipped }">
+                {{ row.latency_ms.toLocaleString() }} ms
+              </span>
             </template>
           </el-table-column>
           <el-table-column label="错误" min-width="180" show-overflow-tooltip>
             <template #default="{ row }">
-              <span v-if="row.error" class="err">{{ row.error }}</span>
+              <span v-if="row.error" class="err" :class="{ muted: row.skipped }">{{ row.error }}</span>
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
@@ -108,7 +111,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getLog } from '../api'
 
@@ -130,6 +133,23 @@ async function load() {
 
 function formatTime(ts) {
   return new Date(ts * 1000).toLocaleString()
+}
+
+// Breakdown for the "转发链路" header. Skipped hops are routing decisions,
+// not real attempts — show them in a separate bucket so the headline number
+// matches what actually went over the network.
+const attemptSummary = computed(() => {
+  const atts = log.value?.attempts ?? []
+  const skipped = atts.filter((a) => a.skipped).length
+  const failed = log.value?.failed_count ?? 0
+  const parts = [`共 ${atts.length} 次尝试`]
+  if (skipped > 0) parts.push(`跳过 ${skipped} 次`)
+  if (failed > 0) parts.push(`失败 ${failed} 次`)
+  return parts.join('，')
+})
+
+function attemptRowClass({ row }) {
+  return row.skipped ? 'is-skipped' : ''
 }
 
 function back() {
@@ -191,5 +211,16 @@ h3 {
   margin: 0 0 8px;
   font-size: 14px;
   color: #303133;
+}
+/* Skipped attempts (circuit-breaker open) are deliberately de-emphasized —
+   no HTTP call was made, so the row is bookkeeping rather than a real
+   outcome. Dim the text so the eye skips over them while still showing
+   that the relay considered them. */
+:deep(.el-table .is-skipped td) {
+  color: #c0c4cc;
+  background-color: #fafafa;
+}
+.muted {
+  color: #c0c4cc;
 }
 </style>

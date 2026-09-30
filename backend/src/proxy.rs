@@ -336,6 +336,12 @@ struct Attempt {
     convert: ConvertMode,
     /// True when this attempt's response was the one returned to the client.
     ok: bool,
+    /// True when this hop was skipped because the breaker was open — no HTTP
+    /// call was made, the upstream never saw the request. Kept distinct from
+    /// `ok = false` (a real upstream failure) so the log can separate
+    /// "deliberately didn't try" from "tried and failed". Excluded from
+    /// `failed_count` and from the failed-attempts badge in the UI.
+    skipped: bool,
     /// Token breakdown. Only ever set on the winning attempt — a failed hop
     /// produced no usable response to read usage from, and a non-retriable 4xx
     /// has none either.
@@ -359,8 +365,18 @@ impl Attempt {
             latency_ms,
             convert: cand.convert,
             ok,
+            skipped: false,
             usage: None,
         }
+    }
+
+    /// Mark this hop as a breaker-skipped routing decision — no HTTP call
+    /// was made, so it shouldn't be counted as a "real" failure. Still
+    /// surfaced in the attempts table so the admin can see the relay walked
+    /// past this (channel, model) without trying.
+    fn skipped(mut self) -> Self {
+        self.skipped = true;
+        self
     }
 
     fn with_usage(mut self, usage: Option<convert::Usage>) -> Self {
@@ -438,7 +454,9 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
         return None;
     };
     let u = winner.usage_or_zero();
-    let failed_count = e.attempts.iter().filter(|a| !a.ok).count() as i64;
+    // Skipped hops are breaker decisions, not upstream failures — don't pollute
+    // the visible failure count with "we deliberately didn't try this".
+    let failed_count = e.attempts.iter().filter(|a| !a.ok && !a.skipped).count() as i64;
 
     let mut tx = match pool.begin().await {
         Ok(t) => t,
@@ -478,7 +496,7 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
 
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(log_id)
         .bind(seq as i64)
@@ -489,6 +507,7 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
         .bind(a.latency_ms)
         .bind(convert_label(a.convert))
         .bind(a.ok as i64)
+        .bind(a.skipped as i64)
         .execute(&mut *tx)
         .await;
     }
@@ -532,15 +551,6 @@ fn error_response(status: StatusCode, message: &str, retry_after: Option<&str>) 
         }
     }
     resp
-}
-
-/// Status codes that count as breaker failures. The relay itself treats
-/// *every* non-2xx as a fallback signal now, so this function is only
-/// consulted to decide whether a non-2xx outcome should record a failure
-/// in the breaker; in practice every non-2xx does, so it's effectively a
-/// predicate over "this is non-2xx".
-fn is_retriable_status(code: u16) -> bool {
-    code == 408 || code == 429 || code >= 500
 }
 
 /// Build the upstream request with auth + protocol-appropriate headers. The
@@ -635,12 +645,18 @@ async fn try_upstream(
 
 /// Feed a non-2xx HTTP status into the breaker. 429 increments the
 /// `retriable_429_count` so the final-status decision can choose 429 over
+/// `retriable_429_count` so the final-status decision can choose 429 over
 /// 502 when every failure was a rate-limit. The breaker itself no longer
-/// cares about Retry-After or about distinguishing 4xx from 5xx — every
-/// failure is `Outcome::Failure` and trips at the same threshold.
-/// 400 / 422 are deliberately not recorded: those are request-body bugs
-/// (gateway-side or client-side) and tripping the breaker would hide
+/// cares about Retry-After — every failure is `Outcome::Failure` and
+/// trips at the same threshold.
+///
+/// 400 / 422 are deliberately exempt: those are typically request-body
+/// bugs (gateway-side or client-side) and tripping the breaker would hide
 /// routing errors from the admin instead of surfacing them in logs.
+/// Everything else — 5xx, 408, 429, and every other 4xx (including 402
+/// out-of-credit, 404 model-gone, 405 protocol-mismatch) — is treated
+/// as an upstream health signal and trips the breaker for the next
+/// `base_delay` seconds.
 async fn record_outcome_in_breaker(
     state: &AppState,
     breaker_key: &str,
@@ -648,18 +664,11 @@ async fn record_outcome_in_breaker(
     _retry_after_secs: Option<u64>,
     retriable_429_count: &mut usize,
 ) {
-    match code {
-        429 => {
-            *retriable_429_count += 1;
-            state.breaker.record(breaker_key, Outcome::Failure).await;
-        }
-        c if is_retriable_status(c) => {
-            state.breaker.record(breaker_key, Outcome::Failure).await;
-        }
-        404 | 401 | 403 => {
-            state.breaker.record(breaker_key, Outcome::Failure).await;
-        }
-        _ => {} // 400 / 422 etc. — request-body bug, don't trip the breaker
+    if code == 429 {
+        *retriable_429_count += 1;
+    }
+    if code != 400 && code != 422 {
+        state.breaker.record(breaker_key, Outcome::Failure).await;
     }
 }
 
@@ -1218,14 +1227,17 @@ async fn relay(
             let breaker_key = breaker::breaker_key(&cand.name, target_model);
             if !state.breaker.allow(&breaker_key).await {
                 attempted += 1;
-                attempts.push(Attempt::new(
-                    target_model,
-                    cand,
-                    0,
-                    "circuit breaker open",
-                    relay_start.elapsed().as_millis() as i64,
-                    false,
-                ));
+                attempts.push(
+                    Attempt::new(
+                        target_model,
+                        cand,
+                        0,
+                        "circuit breaker open",
+                        relay_start.elapsed().as_millis() as i64,
+                        false,
+                    )
+                    .skipped(),
+                );
                 continue;
             }
             attempted += 1;
@@ -1349,6 +1361,7 @@ async fn relay(
                 latency_ms: relay_start.elapsed().as_millis() as i64,
                 convert: ConvertMode::None,
                 ok: false,
+                skipped: false,
                 usage: None,
             }),
             attempts: Vec::new(),
@@ -1392,6 +1405,7 @@ async fn relay(
         latency_ms: relay_start.elapsed().as_millis() as i64,
         convert: ConvertMode::None,
         ok: false,
+        skipped: false,
         usage: None,
     };
     let entry = LogEntry {
