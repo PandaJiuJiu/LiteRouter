@@ -1,7 +1,8 @@
 <template>
   <div class="setup-wrap">
     <el-card class="setup-card">
-      <h2>LiteRouter</h2>
+      <img src="/logo-icon.svg" alt="LiteRouter" class="brand" />
+      <h2 class="brand-name">LiteRouter</h2>
       <p class="hint">首次使用，请创建管理员账号</p>
       <el-form :model="form" label-position="top">
         <el-form-item label="用户名">
@@ -72,6 +73,17 @@ async function submit() {
 .setup-card h2 {
   margin: 0 0 4px;
   text-align: center;
+}
+.brand {
+  display: block;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 12px;
+}
+.brand-name {
+  text-align: center;
+  margin: 0 0 4px;
+  font-size: 22px;
 }
 .hint {
   color: #909399;

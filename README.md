@@ -1,5 +1,9 @@
 English | [简体中文](README.zh-CN.md)
 
+<p align="left">
+  <img src="assets/logo.svg" alt="LiteRouter" width="360">
+</p>
+
 # LiteRouter
 
 A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI / Claude / relay stations, etc.) behind a single unified endpoint, issues its own access keys to downstream clients, and provides model routing, multi-channel failover, and usage tracking. Single Rust binary + SQLite, no external dependencies, ready out of the box.

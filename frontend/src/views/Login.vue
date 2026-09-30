@@ -1,7 +1,8 @@
 <template>
   <div class="login-wrap">
     <el-card class="login-card">
-      <h2>LiteRouter</h2>
+      <img src="/logo-icon.svg" alt="LiteRouter" class="brand" />
+      <h2 class="brand-name">LiteRouter</h2>
       <el-input v-model="username" placeholder="用户名" autocomplete="username"
         style="margin-bottom: 12px" @keyup.enter="doLogin" />
       <el-input v-model="password" type="password" placeholder="密码" show-password
@@ -45,5 +46,15 @@ async function doLogin() {
 .login-card {
   width: 360px;
   text-align: center;
+}
+.brand {
+  display: block;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 12px;
+}
+.brand-name {
+  margin: 0 0 20px;
+  font-size: 22px;
 }
 </style>

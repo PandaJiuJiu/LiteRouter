@@ -1,5 +1,9 @@
 简体中文 | [English](README.md)
 
+<p align="left">
+  <img src="assets/logo.svg" alt="LiteRouter" width="360">
+</p>
+
 # LiteRouter
 
 一个轻量级的 LLM API 网关。将多个上游 LLM 服务（OpenAI / Claude / 各类中转站等）聚合为一个统一地址，向下游使用方签发独立的访问密钥，并提供模型路由、多渠道故障转移与用量统计能力。单个 Rust 二进制 + SQLite，无外部依赖，开箱即用。

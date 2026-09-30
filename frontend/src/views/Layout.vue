@@ -1,7 +1,7 @@
 <template>
   <el-container style="height: 100vh">
     <el-aside width="200px" style="border-right: 1px solid #e4e7ed">
-      <div class="logo">LiteRouter</div>
+      <div class="logo"><img src="/logo.svg" alt="LiteRouter" /></div>
       <el-menu :default-active="$route.path" router>
         <el-menu-item v-if="isAdmin" index="/channels">渠道管理</el-menu-item>
         <el-menu-item index="/tokens">令牌管理</el-menu-item>
@@ -112,9 +112,14 @@ onMounted(loadMe)
 
 <style scoped>
 .logo {
-  font-weight: bold;
-  font-size: 18px;
-  padding: 20px 16px;
+  padding: 18px 16px;
+  border-bottom: 1px solid #f1f5f9;
+}
+.logo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 168px;
 }
 .user-box {
   position: absolute;
