@@ -18,6 +18,7 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
         "base_url_anthropic": row.get::<String, _>("base_url_anthropic"),
         "api_key": row.get::<String, _>("api_key"),
         "models": row.get::<String, _>("models"),
+        "disabled_models": row.get::<String, _>("disabled_models"),
         "enabled": row.get::<i64, _>("enabled"),
         "created_at": row.get::<i64, _>("created_at"),
     })
@@ -137,12 +138,15 @@ pub struct TestModelReq {
     pub model: String,
 }
 
-/// Body for `POST /api/channels/:id/models` — set the channel's `models`
-/// list without touching any other column. Used by the models-management
-/// page so it never accidentally clobbers website / base_url / api_key.
+/// Body for `POST /api/channels/:id/models` — set the enabled + disabled
+/// model lists on a single channel without touching any other column.
+/// Used by the models-management page so it never accidentally clobbers
+/// website / base_url / api_key. The proxy only reads `models` for routing;
+/// `disabled_models` is kept around so disabled cards survive a refresh.
 #[derive(Deserialize)]
 pub struct UpdateChannelModelsReq {
     pub models: String,
+    pub disabled_models: String,
 }
 
 pub async fn list_channels(
@@ -244,8 +248,9 @@ pub async fn update_channel_models(
     Json(req): Json<UpdateChannelModelsReq>,
 ) -> Result<Json<Value>, StatusCode> {
     require_admin(&state, &headers)?;
-    sqlx::query("UPDATE channels SET models=? WHERE id=?")
+    sqlx::query("UPDATE channels SET models=?, disabled_models=? WHERE id=?")
         .bind(&req.models)
+        .bind(&req.disabled_models)
         .bind(id)
         .execute(&state.pool)
         .await

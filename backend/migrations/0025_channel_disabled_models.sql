@@ -1,0 +1,14 @@
+-- 渠道的「已停用但仍可见」模型列表。
+--
+-- 之前 `models` 列同时承担了两个语义：路由可见性 + 「我认识这个模型」。
+-- 当用户用 switch 停用某个模型时,前端从 `models` 里删掉,后端确实不再路由
+-- 到它,但「我曾经配过这个模型」这条信息也跟着丢了,刷新后卡片消失,
+-- 只能重新「获取模型列表」或手动添加才能再开回来。
+--
+-- 现在把这两个语义拆开:
+--   * `models`          = 启用集合,proxy 路由时只读它
+--   * `disabled_models` = 停用集合,只在 UI 上保留卡片,不参与路由
+--
+-- 模型卡片在 UI 上始终展示两者并集;开关动作只把模型在两个集合之间挪动。
+-- 旧库 `disabled_models` 默认 '',与历史行为一致,无需 backfill。
+ALTER TABLE channels ADD COLUMN disabled_models TEXT NOT NULL DEFAULT '';

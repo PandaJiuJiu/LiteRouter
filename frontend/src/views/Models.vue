@@ -39,7 +39,7 @@
       <!-- 模型卡片网格 -->
       <div v-if="modelList(ch).length" class="model-grid">
         <div v-for="m in modelList(ch)" :key="m" class="model-card"
-             :class="{ 'is-enabled': isSelected(ch, m), 'is-testing': ch._testingModel === m }">
+             :class="{ 'is-enabled': isSelected(ch, m), 'is-disabled': !isSelected(ch, m), 'is-testing': ch._testingModel === m }">
           <div class="model-card-top">
             <div class="model-name" :title="m">{{ m }}</div>
             <el-switch :model-value="isSelected(ch, m)"
@@ -154,8 +154,9 @@ function back() {
 
 const channels = ref([])
 const loading = ref(false)
-// known[id] = 该渠道出现过的所有模型名（已配置 + 上游拉取 + 手动添加的并集）
-// 切换启用/停用只改 ch.models，不改 known——保证停用的模型不会从卡片列表里消失
+// known[id] = 该渠道出现过的所有模型名（启用 ∪ 停用 ∪ 上游拉取 ∪ 手动添加 的并集）
+// 切换启用/停用把模型在 ch.models 和 ch.disabled_models 之间挪动，不动 known —
+// 刷新页面后，停用的卡片还在，可以再开回来。删除按钮才会从 known 里抹掉。
 const known = reactive({})
 
 const manualVisible = ref(false)
@@ -212,8 +213,13 @@ async function load() {
   try {
     const all = await listChannels()
     channels.value = channelId.value ? all.filter((c) => c.id === channelId.value) : all
-    // seed known list from current config so toggling-off never hides a card
-    for (const ch of channels.value) rememberModels(ch.id, splitModels(ch.models))
+    // seed known list from enabled ∪ disabled so disabled cards survive refresh
+    for (const ch of channels.value) {
+      rememberModels(ch.id, [
+        ...splitModels(ch.models),
+        ...splitModels(ch.disabled_models),
+      ])
+    }
   } finally {
     loading.value = false
   }
@@ -285,18 +291,24 @@ async function confirmSelect() {
   }
   // 拍下旧值快照，后面要算"新增多少"
   const oldModels = splitModels(ch.models)
+  const oldDisabled = splitModels(ch.disabled_models)
   const merged = [...new Set([...oldModels, ...selectedArr.value])]
+  // 这次被勾选上的、本来在 disabled 里的模型 → 移到 enabled,
+  // 从 disabled 集合里抹掉。两个集合保持互斥。
+  const newDisabled = oldDisabled.filter((m) => !merged.includes(m))
   const newModels = merged.join(',')
+  const newDisabledStr = newDisabled.join(',')
   // 没变化就不写库，但弹个提示让用户知道发生了什么
-  if (newModels === ch.models) {
+  if (newModels === ch.models && newDisabledStr === ch.disabled_models) {
     selectVisible.value = false
     ElMessage.info('没有变化，未保存')
     return
   }
   selectSaving.value = true
   try {
-    await updateChannelModels(ch.id, newModels)
+    await updateChannelModels(ch.id, newModels, newDisabledStr)
     ch.models = newModels
+    ch.disabled_models = newDisabledStr
     // 只把"真正要在这个渠道里"的模型加入 known——上游拉到的全部模型只
     // 是候选，未勾选的就不该出现卡片，否则刷新后也没了。
     // rememberModels 自身去重，selectedArr 里已存在的旧模型是 no-op。
@@ -318,15 +330,23 @@ async function confirmSelect() {
 }
 
 async function toggleModel(ch, m, enabled) {
-  const set = new Set(splitModels(ch.models))
-  if (enabled) set.add(m)
-  else set.delete(m)
-  const newModels = [...set].join(',')
-  if (newModels === ch.models) return
+  const enabledSet = new Set(splitModels(ch.models))
+  const disabledSet = new Set(splitModels(ch.disabled_models))
+  if (enabled) {
+    enabledSet.add(m)
+    disabledSet.delete(m)
+  } else {
+    enabledSet.delete(m)
+    disabledSet.add(m)
+  }
+  const newModels = [...enabledSet].join(',')
+  const newDisabled = [...disabledSet].join(',')
+  if (newModels === ch.models && newDisabled === ch.disabled_models) return
   ch._togglingModel = m
   try {
-    await updateChannelModels(ch.id, newModels)
+    await updateChannelModels(ch.id, newModels, newDisabled)
     ch.models = newModels
+    ch.disabled_models = newDisabled
   } catch (e) {
     ElMessage.error(`更新 ${m} 失败`)
   } finally {
@@ -334,17 +354,20 @@ async function toggleModel(ch, m, enabled) {
   }
 }
 
-// 完全删除：从 ch.models 移除并持久化，从 known 移除（卡片消失），
-// 测试结果也清掉。要恢复只能重新获取或手动添加。
+// 完全删除：从 ch.models 和 ch.disabled_models 都移除并持久化，
+// 从 known 移除（卡片消失），测试结果也清掉。要恢复只能重新获取或手动添加。
 async function removeModel(ch, m) {
-  // 1. 持久化 ch.models（如果该模型在其中）
+  // 1. 持久化（如果该模型在任一集合中）
   const cur = splitModels(ch.models)
-  const inSaved = cur.includes(m)
+  const curDisabled = splitModels(ch.disabled_models)
+  const inSaved = cur.includes(m) || curDisabled.includes(m)
   if (inSaved) {
     const newModels = cur.filter((x) => x !== m).join(',')
+    const newDisabled = curDisabled.filter((x) => x !== m).join(',')
     try {
-      await updateChannelModels(ch.id, newModels)
+      await updateChannelModels(ch.id, newModels, newDisabled)
       ch.models = newModels
+      ch.disabled_models = newDisabled
     } catch (e) {
       const detail = e?.response?.data?.message || e.message || '未知错误'
       ElMessage.error(`移除 ${m} 失败：${detail}`)
@@ -437,9 +460,14 @@ async function saveManual() {
     ElMessage.warning('请输入至少一个模型名')
     return
   }
-  const models = [...new Set([...splitModels(ch.models), ...adds])].join(',')
-  await updateChannelModels(ch.id, models)
+  const enabled = [...new Set([...splitModels(ch.models), ...adds])]
+  // 手动添加等于"启用"，所以原来在 disabled 里的同名模型也要挪出来
+  const disabled = splitModels(ch.disabled_models).filter((m) => !enabled.includes(m))
+  const models = enabled.join(',')
+  const disabledStr = disabled.join(',')
+  await updateChannelModels(ch.id, models, disabledStr)
   ch.models = models
+  ch.disabled_models = disabledStr
   rememberModels(ch.id, adds)
   manualVisible.value = false
   ElMessage.success('已添加')
@@ -500,6 +528,25 @@ onMounted(load)
 .model-card.is-enabled:hover {
   box-shadow: 0 4px 14px rgba(64, 158, 255, 0.18);
   border-color: #409eff;
+}
+/* disabled = 基础态的反面：虚线边、淡化背景、灰字、不响应 hover 抬升 */
+.model-card.is-disabled {
+  background: #fafbfc;
+  border-style: dashed;
+  border-color: #dcdfe6;
+  box-shadow: none;
+  opacity: 0.72;
+}
+.model-card.is-disabled:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: #c0c4cc;
+}
+.model-card.is-disabled .model-name {
+  color: #909399;
+}
+.model-card.is-disabled .model-card-status {
+  background: rgba(0, 0, 0, 0.02);
 }
 .model-card.is-testing {
   opacity: 0.65;

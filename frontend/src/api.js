@@ -72,11 +72,12 @@ export const fetchModels = (c) =>
   api.post('/channels/fetch-models', c).then((r) => r.data)
 export const testModel = (c) =>
   api.post('/channels/test-model', c).then((r) => r.data)
-// Set the channel's models list without touching any other column.
-// Use this from the models-management page so website / base_url /
-// api_key can't be clobbered by mistake.
-export const updateChannelModels = (id, models) =>
-  api.post(`/channels/${id}/models`, { models })
+// Set the channel's enabled + disabled model lists without touching any
+// other column. The proxy only reads `models` for routing; `disabled_models`
+// keeps the off-list so the UI can still render and re-enable those cards
+// after a page refresh.
+export const updateChannelModels = (id, models, disabled_models) =>
+  api.post(`/channels/${id}/models`, { models, disabled_models })
 
 // ---------- tokens ----------
 export const listTokens = () => api.get('/tokens').then((r) => r.data.tokens)
