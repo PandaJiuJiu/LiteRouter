@@ -23,6 +23,7 @@ export default {
   },
   nav: {
     channels: '渠道管理',
+    tokens: '令牌管理',
     mappings: '模型路由',
     usage: '用量统计',
     logs: '调用日志',
@@ -117,6 +118,7 @@ export default {
   tokens: {
     description: '内部令牌：内部服务使用这些 key 访问统一 API',
     create: '创建令牌',
+    unassigned: '未分配',
     editQuota: '编辑配额',
     col: {
       name: '名称',

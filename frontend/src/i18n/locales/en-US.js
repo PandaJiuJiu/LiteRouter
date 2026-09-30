@@ -22,6 +22,7 @@ export default {
   },
   nav: {
     channels: 'Channels',
+    tokens: 'Tokens',
     mappings: 'Routing',
     usage: 'Usage',
     logs: 'Logs',
@@ -120,6 +121,7 @@ export default {
   tokens: {
     description: 'Internal tokens — services use these keys to reach the unified API',
     create: 'Create token',
+    unassigned: 'Unassigned',
     editQuota: 'Edit quota',
     col: {
       name: 'Name',
