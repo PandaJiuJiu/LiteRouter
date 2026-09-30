@@ -389,6 +389,14 @@ fn msg_id(id: &str) -> String {
     format!("msg_{}", id.strip_prefix("chatcmpl-").unwrap_or(id))
 }
 
+/// Inverse of [`msg_id`]. Also strips `msg_` so the buffered and streaming
+/// paths produce the same id for the same upstream response — the streaming
+/// converter does this too, and a client that saw `chatcmpl-abc` mid-stream
+/// should not see `chatcmpl-msg_abc` in the final buffered shape.
+fn openai_id(id: &str) -> String {
+    format!("chatcmpl-{}", id.strip_prefix("msg_").unwrap_or(id))
+}
+
 /// OpenAI non-streaming response -> Anthropic `message` shape.
 pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
     let choice = body.get("choices").and_then(|c| c.get(0));
@@ -479,7 +487,7 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     json!({
-        "id": format!("chatcmpl-{}", body.get("id").and_then(|i| i.as_str()).unwrap_or("unknown")),
+        "id": openai_id(body.get("id").and_then(|i| i.as_str()).unwrap_or("unknown")),
         "object": "chat.completion",
         "created": crate::db::now(),
         "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(model),
