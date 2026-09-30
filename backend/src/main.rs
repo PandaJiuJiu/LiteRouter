@@ -113,5 +113,14 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     println!("literouter listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind failed");
-    axum::serve(listener, app).await.unwrap();
+    // `into_make_service_with_connect_info` is what puts the peer address in
+    // scope for handlers that take `ConnectInfo<SocketAddr>` — without it
+    // axum rejects the extractor and the relay can't record a client IP when
+    // there's no reverse proxy setting X-Forwarded-For.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

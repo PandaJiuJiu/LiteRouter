@@ -14,7 +14,7 @@ use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -375,24 +375,24 @@ impl Attempt {
 
 /// Client IP and User-Agent, extracted once at request entry and threaded
 /// through to every LogEntry so the log page can show the call source.
+/// IP is resolved from X-Forwarded-For (reverse proxy) or the direct TCP
+/// connection, preferring the former so proxy setups are respected.
 #[derive(Clone)]
 struct ClientInfo {
     ip: String,
     user_agent: String,
 }
 
-/// Pull the first meaningful IP from X-Forwarded-For (reverse-proxy setup)
-/// or fall back to a direct connection hint. Silently ignores malformed
-/// headers so a bad XFF never breaks relay.
-fn extract_client_info(headers: &HeaderMap) -> ClientInfo {
+fn extract_client_info(headers: &HeaderMap, direct_ip: Option<std::net::SocketAddr>) -> ClientInfo {
     let ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| direct_ip.map(|a| a.ip().to_string()))
+        .unwrap_or_default();
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -1010,6 +1010,7 @@ async fn relay(
     headers: &HeaderMap,
     body: axum::body::Bytes,
     protocol: &str,
+    direct_ip: Option<std::net::SocketAddr>,
 ) -> Response {
     // 1. internal token auth
     let key = match extract_token(headers) {
@@ -1020,7 +1021,7 @@ async fn relay(
         Ok(n) => n,
         Err((s, msg)) => return error_response(s, msg, None),
     };
-    let client_info = extract_client_info(headers);
+    let client_info = extract_client_info(headers, direct_ip);
 
     // 2. parse body to find model + streaming flag
     let req_json: Value = match serde_json::from_slice(&body) {
@@ -1295,18 +1296,20 @@ async fn relay(
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "openai").await
+    relay(&state, &headers, body, "openai", Some(addr)).await
 }
 
 /// POST /v1/messages — Anthropic Messages API relay.
 pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "anthropic").await
+    relay(&state, &headers, body, "anthropic", Some(addr)).await
 }
 
 /// GET /v1/models — list union of all enabled channel models.
