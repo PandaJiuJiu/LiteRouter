@@ -751,7 +751,7 @@ fn default_page() -> i64 {
     1
 }
 fn default_size() -> i64 {
-    50
+    20
 }
 fn default_range_hours() -> i64 {
     1

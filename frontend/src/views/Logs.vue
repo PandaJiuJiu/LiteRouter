@@ -87,7 +87,7 @@ const logs = ref([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
-const size = ref(50)
+const size = ref(20)
 // Window in hours; 0 = all time. Default 1h to match the backend default.
 const range = ref(1)
 

@@ -80,7 +80,7 @@ export const updateToken = (id, t) => api.put(`/tokens/${id}`, t).then((r) => r.
 export const deleteToken = (id) => api.delete(`/tokens/${id}`)
 
 // ---------- logs / usage ----------
-export const listLogs = (page = 1, size = 50, range = 1) =>
+export const listLogs = (page = 1, size = 20, range = 1) =>
   api.get('/logs', { params: { page, size, range } }).then((r) => r.data)
 export const getLog = (id) => api.get(`/logs/${id}`).then((r) => r.data.log)
 export const fetchUsage = (range = 7) =>
