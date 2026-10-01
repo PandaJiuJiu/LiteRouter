@@ -56,8 +56,6 @@
         </el-table>
       </el-tab-pane>
     </el-tabs>
-
-    <p class="hint">{{ t('usage.footnote') }}</p>
   </el-card>
 </template>
 

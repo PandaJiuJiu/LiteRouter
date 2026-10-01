@@ -200,8 +200,6 @@ export default {
       totalTokens: '合计',
       date: '日期',
     },
-    footnote:
-      '注：流式（stream）响应不在统计范围内——上游的 usage 在最后一个 SSE chunk 里，需要特殊解析。后续增强。',
   },
   stream: '流式',
   logs: {

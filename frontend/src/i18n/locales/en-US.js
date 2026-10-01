@@ -208,8 +208,6 @@ export default {
       totalTokens: 'Total',
       date: 'Date',
     },
-    footnote:
-      'Note: streaming responses are not counted — upstream usage arrives in the final SSE chunk and needs special parsing. Coming later.',
   },
   stream: 'Streaming',
   logs: {
