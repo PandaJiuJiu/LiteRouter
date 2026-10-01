@@ -15,15 +15,15 @@
         <div class="stat-value">{{ fmtNum(totes.requests) }}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Prompt tokens</div>
+        <div class="stat-label">{{ t('usage.stat.promptTokens') }}</div>
         <div class="stat-value">{{ fmtNum(totes.prompt_tokens) }}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Completion tokens</div>
+        <div class="stat-label">{{ t('usage.stat.completionTokens') }}</div>
         <div class="stat-value">{{ fmtNum(totes.completion_tokens) }}</div>
       </div>
       <div class="stat-card highlight">
-        <div class="stat-label">Total tokens</div>
+        <div class="stat-label">{{ t('usage.stat.totalTokens') }}</div>
         <div class="stat-value">{{ fmtNum(totes.total_tokens) }}</div>
       </div>
     </div>
@@ -32,28 +32,19 @@
       <el-tab-pane :label="t('usage.tab.token')" name="token">
         <el-table :data="by_token" stripe>
           <el-table-column prop="key" :label="t('usage.col.internalToken')" min-width="160" />
-          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
-          <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
+          <usage-token-columns />
         </el-table>
       </el-tab-pane>
       <el-tab-pane :label="t('usage.tab.model')" name="model">
         <el-table :data="by_model" stripe>
           <el-table-column prop="key" :label="t('usage.col.model')" min-width="200" />
-          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
-          <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
+          <usage-token-columns />
         </el-table>
       </el-tab-pane>
       <el-tab-pane :label="t('usage.tab.channel')" name="channel">
         <el-table :data="by_channel" stripe>
           <el-table-column prop="key" :label="t('usage.col.channel')" min-width="160" />
-          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
-          <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
+          <usage-token-columns />
         </el-table>
       </el-tab-pane>
       <el-tab-pane :label="t('usage.tab.day')" name="day">
@@ -61,10 +52,7 @@
           <el-table-column :label="t('usage.col.date')" min-width="160">
             <template #default="{ row }">{{ fmtDate(row.day) }}</template>
           </el-table-column>
-          <el-table-column prop="requests" :label="t('usage.col.requests')" width="120" sortable />
-          <el-table-column prop="prompt_tokens" label="Prompt" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="completion_tokens" label="Completion" width="140" sortable :formatter="fmt" />
-          <el-table-column prop="total_tokens" label="Total" width="140" sortable :formatter="fmt" />
+          <usage-token-columns />
         </el-table>
       </el-tab-pane>
     </el-tabs>
@@ -76,7 +64,9 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
+import UsageTokenColumns from './UsageTokenColumns.vue'
 import { fetchUsage } from '../api'
+import { fmtDate, fmtNum } from '../format'
 
 const { t } = useI18n()
 
@@ -103,35 +93,12 @@ async function load() {
   }
 }
 
-function fmtNum(n) {
-  return Number(n || 0).toLocaleString()
-}
-
-function fmt(row, col, val) {
-  return Number(val || 0).toLocaleString()
-}
-
-function fmtDate(unixDay) {
-  // unixDay is start-of-day timestamp in seconds
-  if (!unixDay) return ''
-  const d = new Date(unixDay * 1000)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
 onMounted(load)
 </script>
 
 <style scoped>
 .toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
   margin-bottom: 16px;
-  color: #606266;
-  font-size: 13px;
 }
 .stats-grid {
   display: grid;
@@ -163,8 +130,6 @@ onMounted(load)
   color: #409eff;
 }
 .hint {
-  color: #909399;
-  font-size: 12px;
   margin-top: 16px;
 }
 </style>

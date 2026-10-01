@@ -148,7 +148,8 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { translate } from '../i18n'
-import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, me, getBreakerConfig } from '../api'
+import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, getBreakerConfig } from '../api'
+import { loadSession, session } from '../session'
 import { breaker, loadBreakerSnapshot, resetAllBreakers } from '../breaker'
 
 const { t } = useI18n()
@@ -165,7 +166,7 @@ const form = ref({ alias: '', targets: [] })
 // state is the per-(channel, model) health that *directly* determines which
 // routing entries get skipped on the next request; admins editing mappings
 // need to see it in the same view.
-const isAdmin = ref(false)
+const isAdmin = computed(() => session.isAdmin)
 // Default folded: most edits don't need the panel. Admin can expand it;
 // the open/closed state isn't persisted across reloads on purpose — the
 // snapshot itself is what's worth keeping an eye on, not the UI preference.
@@ -302,11 +303,7 @@ function resetForm() {
 }
 
 onMounted(async () => {
-  try {
-    isAdmin.value = !!(await me()).is_admin
-  } catch (_) {
-    // interceptor handles the redirect on 401
-  }
+  await loadSession()
   await load()
   if (isAdmin.value) {
     try {
@@ -323,17 +320,7 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 .hint {
-  color: #909399;
-  font-size: 12px;
   line-height: 1.6;
   margin-top: 8px;
 }

@@ -13,7 +13,7 @@
           {{ log.latency_ms.toLocaleString() }} ms
           <span class="hint">{{ t('logDetail.latencyHint') }}</span>
         </span>
-        <el-tag v-if="log.stream" size="small" type="info">stream</el-tag>
+        <el-tag v-if="log.stream" size="small" type="info">{{ t('logs.stream') }}</el-tag>
         <el-tag v-if="log.convert && log.convert !== 'none'" size="small" type="warning">
           {{ t('logDetail.convert', { convert: log.convert }) }}
         </el-tag>
@@ -182,10 +182,6 @@ onMounted(load)
 .latency {
   font-variant-numeric: tabular-nums;
 }
-.hint {
-  color: #909399;
-  font-size: 12px;
-}
 .err {
   color: #f56c6c;
 }
@@ -200,9 +196,6 @@ onMounted(load)
    stretch it and leave a canyon of whitespace before each value. */
 :deep(.el-descriptions__label) {
   width: 168px;
-}
-.num {
-  font-variant-numeric: tabular-nums;
 }
 .note {
   margin: 6px 0 0;

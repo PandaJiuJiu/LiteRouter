@@ -172,12 +172,4 @@ onMounted(load)
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 </style>

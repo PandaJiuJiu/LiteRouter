@@ -28,6 +28,7 @@ export default {
     logs: 'Logs',
     users: 'Users',
     settings: 'Settings',
+    adminBadge: 'Admin',
     github: 'Project GitHub',
     logout: 'Sign out',
   },
@@ -54,7 +55,13 @@ export default {
     add: 'Add channel',
     editChannel: 'Edit channel',
     addChannel: 'Add channel',
-    col: { name: 'Name', models: 'Models', status: 'Status', actions: 'Actions' },
+    col: {
+      baseUrl: 'Base URL',
+      openaiUrl: 'OpenAI URL',
+      anthropicUrl: 'Anthropic URL',
+      apiKey: 'API Key',
+      name: 'Name',
+      models: 'Models', status: 'Status', actions: 'Actions' },
     allModels: 'All models (*)',
     notConfigured: 'Not configured (set them up on the Models page)',
     manageModels: 'Models',
@@ -125,6 +132,7 @@ export default {
     unassigned: 'Unassigned',
     editQuota: 'Edit quota',
     col: {
+      key: 'Key',
       name: 'Name',
       owner: 'Owner',
       status: 'Status',
@@ -187,6 +195,7 @@ export default {
   usage: {
     description: 'Token usage and request statistics',
     range: { today: 'Today', days7: '7 days', days30: '30 days' },
+    stat: { promptTokens: 'Prompt tokens', completionTokens: 'Completion tokens', totalTokens: 'Total tokens' },
     totalRequests: 'Total requests',
     tab: { token: 'By token', model: 'By model', channel: 'By channel', day: 'By day' },
     col: {
@@ -194,15 +203,20 @@ export default {
       requests: 'Requests',
       model: 'Model',
       channel: 'Upstream channel',
+      promptTokens: 'Prompt',
+      completionTokens: 'Completion',
+      totalTokens: 'Total',
       date: 'Date',
     },
     footnote:
       'Note: streaming responses are not counted — upstream usage arrives in the final SSE chunk and needs special parsing. Coming later.',
   },
+  stream: 'Streaming',
   logs: {
     title: 'Request logs',
     range: { hour: 'Last hour', day: 'Today', week: 'Last week', all: 'All' },
     col: {
+      tokens: 'Tokens',
       time: 'Time',
       source: 'Source',
       token: 'Token',

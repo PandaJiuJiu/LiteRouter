@@ -33,6 +33,10 @@ vi.mock('element-plus', async (orig) => {
 
 const { default: Tokens } = await import('../src/views/Tokens.vue')
 
+// Imported dynamically: session.js pulls in the mocked api, and a static
+// import here would run before the `me` mock exists.
+const { resetSession } = await import('../src/session')
+
 const TOKENS = [
   {
     id: 1,
@@ -78,6 +82,7 @@ const rows = (w) =>
 beforeEach(() => {
   for (const m of [listTokens, createToken, updateToken, deleteToken, listUsers, me]) m.mockReset()
   for (const m of [warning, success]) m.mockReset()
+  resetSession() // the view now reads identity from a module singleton
   setLocale('zh-CN')
   me.mockResolvedValue({ username: 'ada', is_admin: false })
   listTokens.mockResolvedValue(TOKENS)

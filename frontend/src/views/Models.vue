@@ -479,14 +479,6 @@ onMounted(load)
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 .channel-card {
   margin-bottom: 12px;
   border: 1px solid #e4e7ed;
@@ -639,10 +631,6 @@ onMounted(load)
 }
 .model-card-actions .action-pop .action-btn {
   width: 100%;
-}
-.hint {
-  color: #909399;
-  font-size: 12px;
 }
 .select-toolbar {
   display: flex;

@@ -14,3 +14,38 @@ body {
     'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', sans-serif;
 }
+/* ---- Shared page furniture -------------------------------------------
+   Every admin view opens with a title on the left and controls on the
+   right, and sprinkles small grey helper text next to inputs. Those rules
+   were copy-pasted into ten `<style scoped>` blocks, where a tweak had to
+   be applied ten times. Kept here as bare class names: `scoped` would not
+   reach them anyway, and a shared rule has to be global to be shared. */
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  color: #606266;
+  font-size: 13px;
+}
+
+/* Secondary text: unit suffixes, warnings under a field, footnotes. */
+.hint {
+  color: #909399;
+  font-size: 12px;
+}
+
+/* Token counts and latencies line up column-wise only with fixed-width
+   digits — a proportional "1" is narrower than a "0" and the row jitters. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Login and setup pages share a header. */
+.brand {
+  display: block;
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 12px;
+}

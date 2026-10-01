@@ -32,8 +32,6 @@ async function onChange(lang) {
 
 <style scoped>
 .toolbar {
-  color: #606266;
-  font-size: 13px;
   margin-bottom: 16px;
 }
 .section {

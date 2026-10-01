@@ -98,19 +98,12 @@ async function submit() {
   margin: 0 0 4px;
   text-align: center;
 }
-.brand {
-  display: block;
-  width: 64px;
-  height: 64px;
-  margin: 0 auto 12px;
-}
 .brand-name {
   text-align: center;
   margin: 0 0 4px;
   font-size: 22px;
 }
 .hint {
-  color: #909399;
   font-size: 13px;
   text-align: center;
   margin: 0 0 18px;

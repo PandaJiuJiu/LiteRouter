@@ -25,7 +25,7 @@
             <el-dropdown-menu>
               <el-dropdown-item disabled>
                 <span class="dd-user">{{ username }}</span>
-                <el-tag v-if="isAdmin" size="small" type="success" effect="plain">admin</el-tag>
+                <el-tag v-if="isAdmin" size="small" type="success" effect="plain">{{ t('nav.adminBadge') }}</el-tag>
               </el-dropdown-item>
               <el-dropdown-item command="github" divided>
                 <el-icon>
@@ -70,27 +70,18 @@ import { useI18n } from 'vue-i18n'
 import { ArrowRight, Select, SwitchButton } from '@element-plus/icons-vue'
 import { LANGUAGES } from '../i18n'
 import { locale, switchLanguage } from '../language'
-import { logout, me } from '../api'
+import { logout } from '../api'
+import { loadSession, session } from '../session'
 
 const { t } = useI18n()
 const router = useRouter()
-const username = ref('')
-const isAdmin = ref(false)
+const username = computed(() => session.username)
+const isAdmin = computed(() => session.isAdmin)
 
 // Keep in sync with the `origin` remote / README clone URL.
 const repoUrl = 'https://github.com/qihangkong/LiteRouter'
 
 const initial = computed(() => (username.value || '?').charAt(0).toUpperCase())
-
-async function loadMe() {
-  try {
-    const u = await me()
-    username.value = u.username
-    isAdmin.value = !!u.is_admin
-  } catch (_) {
-    // 401 etc — interceptor handles redirect
-  }
-}
 
 function onUserCommand(cmd) {
   if (cmd === 'logout') return doLogout()
@@ -114,7 +105,7 @@ async function doLogout() {
   }
 }
 
-onMounted(loadMe)
+onMounted(loadSession)
 </script>
 
 <style scoped>

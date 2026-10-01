@@ -12,7 +12,7 @@
           <span v-else class="hint">{{ t('tokens.unassigned') }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="Key" min-width="280">
+      <el-table-column :label="t('tokens.col.key')" min-width="280">
         <template #default="{ row }">
           <span class="mono">{{ row.key }}</span>
           <el-button size="small" text @click="copyKey(row.key)">{{ t('tokens.copy') }}</el-button>
@@ -32,7 +32,7 @@
       </el-table-column>
       <el-table-column :label="t('tokens.col.dailyQuota')" width="130">
         <template #default="{ row }">
-          <span v-if="row.daily_token_limit > 0">{{ fmt(row.daily_token_limit) }} {{ t('common.days') }}</span>
+          <span v-if="row.daily_token_limit > 0">{{ fmtNum(row.daily_token_limit) }} {{ t('common.days') }}</span>
           <span v-else class="hint">{{ t('common.unlimited') }}</span>
         </template>
       </el-table-column>
@@ -89,10 +89,12 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import { createToken, deleteToken, listTokens, listUsers, me, updateToken } from '../api'
+import { createToken, deleteToken, listTokens, listUsers, updateToken } from '../api'
+import { loadSession, session } from '../session'
+import { fmtNum } from '../format'
 
 const { t } = useI18n()
 
@@ -102,7 +104,7 @@ const loading = ref(false)
 const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
-const isAdmin = ref(false)
+const isAdmin = computed(() => session.isAdmin)
 
 const emptyForm = () => ({
   name: '',
@@ -121,13 +123,6 @@ async function load() {
   } finally {
     loading.value = false
   }
-}
-
-async function loadMe() {
-  try {
-    const u = await me()
-    isAdmin.value = !!u.is_admin
-  } catch (_) {}
 }
 
 function openCreate() {
@@ -201,37 +196,23 @@ function copyKey(key) {
   ElMessage.success(t('tokens.copied'))
 }
 
-function fmt(n) {
-  return Number(n || 0).toLocaleString()
-}
-
 function resetForm() {
   form.value = emptyForm()
   editing.value = null
 }
 
 onMounted(async () => {
-  await loadMe()
+  await loadSession()
   await load()
 })
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 .mono {
   font-family: monospace;
   font-size: 12px;
 }
 .hint {
-  color: #909399;
-  font-size: 12px;
   margin-left: 8px;
 }
 </style>

@@ -29,6 +29,7 @@ export default {
     logs: '调用日志',
     users: '用户管理',
     settings: '设置',
+    adminBadge: '管理员',
     github: '项目 GitHub',
     logout: '退出登录',
   },
@@ -55,7 +56,13 @@ export default {
     add: '添加渠道',
     editChannel: '编辑渠道',
     addChannel: '添加渠道',
-    col: { name: '名称', models: '模型', status: '状态', actions: '操作' },
+    col: {
+      baseUrl: '基础地址',
+      openaiUrl: 'OpenAI 地址',
+      anthropicUrl: 'Anthropic 地址',
+      apiKey: 'API 密钥',
+      name: '名称',
+      models: '模型', status: '状态', actions: '操作' },
     allModels: '全部模型（*）',
     notConfigured: '未配置（去"模型管理"页配置）',
     manageModels: '模型管理',
@@ -122,6 +129,7 @@ export default {
     unassigned: '未分配',
     editQuota: '编辑配额',
     col: {
+      key: '密钥',
       name: '名称',
       owner: '归属',
       status: '状态',
@@ -179,6 +187,7 @@ export default {
   usage: {
     description: 'Token 用量与请求统计',
     range: { today: '今日', days7: '7 天', days30: '30 天' },
+    stat: { promptTokens: '输入 tokens', completionTokens: '输出 tokens', totalTokens: '总 tokens' },
     totalRequests: '总请求数',
     tab: { token: '按 Token', model: '按 Model', channel: '按 Channel', day: '按日' },
     col: {
@@ -186,15 +195,20 @@ export default {
       requests: '请求数',
       model: '模型',
       channel: '上游渠道',
+      promptTokens: '输入',
+      completionTokens: '输出',
+      totalTokens: '合计',
       date: '日期',
     },
     footnote:
       '注：流式（stream）响应不在统计范围内——上游的 usage 在最后一个 SSE chunk 里，需要特殊解析。后续增强。',
   },
+  stream: '流式',
   logs: {
     title: '调用日志',
     range: { hour: '一小时', day: '当日', week: '一周', all: '全部' },
     col: {
+      tokens: 'tokens',
       time: '请求时间',
       source: '来源',
       token: '令牌',

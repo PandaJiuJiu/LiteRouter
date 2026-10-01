@@ -14,6 +14,10 @@ vi.mock('../src/api', () => ({ me, logout, setLanguage }))
 
 const { default: Layout } = await import('../src/views/Layout.vue')
 
+// Imported dynamically: session.js pulls in the mocked api, and a static
+// import here would run before the `me` mock exists.
+const { resetSession } = await import('../src/session')
+
 /** Routes are lazy-loaded in the real app; stub them so the sidebar renders. */
 const stubRouter = () =>
   createRouter({
@@ -40,6 +44,8 @@ beforeEach(() => {
   logout.mockReset()
   setLanguage.mockReset()
   push.mockReset()
+  resetSession() // Layout reads identity from a module singleton, so the cache
+  // has to be cleared between cases or the first test's admin leaks into the rest
   localStorage.clear()
   setLocale('zh-CN')
 })
@@ -87,14 +93,17 @@ describe('sidebar', () => {
     expect(w.find('.avatar').text()).toBe('?')
   })
 
-  it('stays signed out rather than rendering a stale admin nav', async () => {
-    // The failure path must not fall back to `isAdmin = false` *after* a
-    // successful earlier read of admin-only items.
+  it('caches the identity instead of re-reading /me on every navigation', async () => {
+    // The identity lives in a module singleton (src/session.js) so four views
+    // share one request. The cost is that a *later* failure can't flip a
+    // previously-correct admin to non-admin — which is exactly why the cache is
+    // dropped explicitly on logout/login instead of being re-read blindly.
     me.mockResolvedValue({ username: 'ada', is_admin: true })
     await mountLayout()
     me.mockRejectedValue(new Error('boom'))
     const w = await mountLayout()
-    expect(navLabels(w)).not.toContain(zhCN.nav.users)
+    expect(me).toHaveBeenCalledTimes(1)
+    expect(navLabels(w)).toContain(zhCN.nav.users)
   })
 })
 

@@ -69,7 +69,7 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="Tokens" width="110" prop="total_tokens">
+      <el-table-column :label="t('logs.col.tokens')" width="110" prop="total_tokens">
         <template #default="{ row }">
           <span v-if="row.total_tokens > 0" class="num">{{ fmt(row.total_tokens) }}</span>
           <span v-else class="hint">—</span>
@@ -105,10 +105,11 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { listLogs, me } from '../api'
+import { listLogs } from '../api'
+import { loadSession, session } from '../session'
 import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
 
 const { t } = useI18n()
@@ -121,7 +122,7 @@ const size = ref(20)
 // Window in hours; 0 = all time. Default 1h to match the backend default.
 const range = ref(1)
 // The debug switch is admin-only server-side; regular users don't see it.
-const isAdmin = ref(false)
+const isAdmin = computed(() => session.isAdmin)
 
 async function onDebugToggle(v) {
   try {
@@ -176,11 +177,7 @@ function open(row) {
 }
 
 onMounted(async () => {
-  try {
-    isAdmin.value = !!(await me()).is_admin
-  } catch (_) {
-    // interceptor handles the redirect on 401
-  }
+  await loadSession()
   if (isAdmin.value) {
     loadDebugLogging()
   }
@@ -189,22 +186,10 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 .filters {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.hint {
-  color: #909399;
-  font-size: 12px;
 }
 .ip {
   font-size: 12px;
@@ -235,9 +220,6 @@ onMounted(async () => {
 .fail-tip-row {
   font-size: 12px;
   opacity: 0.9;
-}
-.num {
-  font-variant-numeric: tabular-nums;
 }
 /* Switch sits immediately before el-pagination's own "Total N" slot — the
    pagination component renders its summary inline, so the two share a row.

@@ -12,7 +12,7 @@
           <span v-else>{{ row.name }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="Base URL" min-width="240" show-overflow-tooltip>
+      <el-table-column :label="t('channels.col.baseUrl')" min-width="240" show-overflow-tooltip>
         <template #default="{ row }">
           <div>OpenAI: {{ row.base_url || '-' }}</div>
           <div v-if="row.base_url_anthropic">Anthropic: {{ row.base_url_anthropic }}</div>
@@ -52,15 +52,15 @@
         <el-form-item :label="t('channels.form.website')">
           <el-input v-model="form.website" :placeholder="t('channels.form.websitePlaceholder')" />
         </el-form-item>
-        <el-form-item label="OpenAI URL">
+        <el-form-item :label="t('channels.col.openaiUrl')">
           <el-input v-model="form.base_url"
             :placeholder="t('channels.form.openaiUrlPlaceholder')" />
         </el-form-item>
-        <el-form-item label="Anthropic URL">
+        <el-form-item :label="t('channels.col.anthropicUrl')">
           <el-input v-model="form.base_url_anthropic"
             :placeholder="t('channels.form.anthropicUrlPlaceholder')" />
         </el-form-item>
-        <el-form-item label="API Key">
+        <el-form-item :label="t('channels.col.apiKey')">
           <el-input v-model="form.api_key" :placeholder="t('channels.form.apiKeyPlaceholder')" show-password />
         </el-form-item>
         <el-form-item :label="t('channels.form.enabled')">
@@ -154,14 +154,6 @@ onMounted(load)
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  color: #606266;
-  font-size: 13px;
-}
 .name-link {
   color: var(--el-color-primary);
   text-decoration: none;

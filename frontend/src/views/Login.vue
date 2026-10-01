@@ -18,6 +18,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { login } from '../api'
+import { resetSession } from '../session'
 
 const { t } = useI18n()
 const username = ref('')
@@ -30,6 +31,10 @@ async function doLogin() {
   loading.value = true
   try {
     await login(username.value.trim(), password.value)
+    // The backend hands back a brand-new session id, which may belong to a
+    // different user (or a different admin flag) than the one the shared
+    // identity cache is holding. Drop it so Layout re-reads /me.
+    resetSession()
     router.push('/')
   } finally {
     loading.value = false
@@ -48,12 +53,6 @@ async function doLogin() {
 .login-card {
   width: 360px;
   text-align: center;
-}
-.brand {
-  display: block;
-  width: 64px;
-  height: 64px;
-  margin: 0 auto 12px;
 }
 .brand-name {
   margin: 0 0 20px;
