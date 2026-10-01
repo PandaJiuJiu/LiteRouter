@@ -118,8 +118,7 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
     let cutoff = now() - retention_days * 86400;
 
     // Collect the IDs whose debug files need to be purged before we delete the
-    // rows. Errors here are non-fatal — the background sweeper should not fail
-    // the whole cleanup just because one directory couldn't be removed.
+    // rows. Errors there are non-fatal — see `proxy::delete_debug_log`.
     let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM logs WHERE created_at < ?")
         .bind(cutoff)
         .fetch_all(pool)
@@ -140,12 +139,7 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
     tx.commit().await?;
 
     for id in ids {
-        let dir = format!("data/debug_logs/{id}");
-        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("debug_log cleanup: remove_dir {} failed: {}", dir, e);
-            }
-        }
+        crate::proxy::delete_debug_log(id).await;
     }
 
     Ok(res.rows_affected())

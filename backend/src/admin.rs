@@ -717,7 +717,7 @@ pub async fn create_mapping(
     .await;
     match res {
         Ok(_) => Ok(Json(json!({ "ok": true }))),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
+        Err(ref e) if crate::db::is_unique_violation(e) => {
             // SQLITE_CONSTRAINT_UNIQUE — alias already exists
             Err(StatusCode::CONFLICT)
         }
@@ -746,9 +746,7 @@ pub async fn update_mapping(
             .await;
     match res {
         Ok(_) => Ok(Json(json!({ "ok": true }))),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("20602") => {
-            Err(StatusCode::CONFLICT)
-        }
+        Err(ref e) if crate::db::is_unique_violation(e) => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

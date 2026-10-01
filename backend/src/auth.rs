@@ -273,6 +273,10 @@ pub fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, 
     Ok(user)
 }
 
-fn json_err(msg: &str) -> Json<Value> {
+/// The single error-body shape every `/api/*` handler returns. Kept here
+/// because `auth` is the lowest layer that both `users` and `admin` can
+/// depend on without a cycle; `proxy` builds its own OpenAI/Anthropic-shaped
+/// bodies deliberately, since `/v1/*` has a different contract.
+pub(crate) fn json_err(msg: &str) -> Json<Value> {
     Json(json!({ "error": msg }))
 }

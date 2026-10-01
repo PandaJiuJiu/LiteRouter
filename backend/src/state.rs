@@ -1,4 +1,4 @@
-use crate::breaker::{Breaker, BreakerConfig};
+use crate::breaker::Breaker;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,13 +40,5 @@ impl AppState {
             debug_logging,
             breaker,
         }
-    }
-
-    /// Convenience for tests / hot paths that don't have a Breaker handy.
-    /// Production startup always uses `new(...)`.
-    #[allow(dead_code)]
-    pub fn with_default_breaker(pool: SqlitePool, debug_logging: bool) -> Self {
-        let breaker = Arc::new(Breaker::new(BreakerConfig::default()));
-        Self::new(pool, debug_logging, breaker)
     }
 }

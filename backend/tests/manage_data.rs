@@ -772,3 +772,101 @@ async fn channel_administration_is_refused_to_regular_users() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{m} {uri}");
     }
 }
+
+// ---------- mappings ----------
+//
+// Duplicate aliases are the last remaining site of the SQLite-constraint-code
+// bug: the handlers here compared against the *extended* code "20602" while
+// sqlx reports the primary code "2067", so a conflict degraded to a 500.
+
+mod mappings {
+    use super::*;
+
+    async fn admin(h: &Harness) -> String {
+        support::login(&h.router, "admin").await
+    }
+
+    /// Mapping CRUD is admin-only, so every case starts from a seeded admin.
+    async fn harness() -> Harness {
+        Harness::with_admin().await
+    }
+
+    #[tokio::test]
+    async fn duplicate_alias_on_create_returns_409() {
+        let h = harness().await;
+        let s = admin(&h).await;
+        support::insert_mapping_any(h.pool(), "gpt-4o", "gpt-4o").await;
+
+        let (status, _) = support::call_json(
+            &h.router,
+            "POST",
+            "/api/mappings",
+            Some(json!({ "alias": "gpt-4o", "targets": ["gpt-4o-mini"] })),
+            Some(&s),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "duplicate alias must be a 409, not a 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_alias_on_rename_returns_409() {
+        let h = harness().await;
+        let s = admin(&h).await;
+        support::insert_mapping_any(h.pool(), "a", "gpt-4o").await;
+        let other = support::insert_mapping_any(h.pool(), "b", "gpt-4o").await;
+
+        let (status, _) = support::call_json(
+            &h.router,
+            "PUT",
+            &format!("/api/mappings/{other}"),
+            Some(json!({ "alias": "a", "targets": ["gpt-4o-mini"] })),
+            Some(&s),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "renaming onto a taken alias must be a 409"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_free_alias_is_still_accepted() {
+        // Guards against over-correcting into always-409.
+        let h = harness().await;
+        let s = admin(&h).await;
+
+        let (status, _) = support::call_json(
+            &h.router,
+            "POST",
+            "/api/mappings",
+            Some(json!({ "alias": "fresh", "targets": ["gpt-4o-mini"] })),
+            Some(&s),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_mapping_to_its_own_alias_is_allowed() {
+        // UPDATE ... SET alias = <same value> still trips the UNIQUE index on
+        // SQLite; the client editing only the target list must not be punished.
+        let h = harness().await;
+        let s = admin(&h).await;
+        let id = support::insert_mapping_any(h.pool(), "keep", "gpt-4o").await;
+
+        let (status, _) = support::call_json(
+            &h.router,
+            "PUT",
+            &format!("/api/mappings/{id}"),
+            Some(json!({ "alias": "keep", "targets": ["gpt-4o-mini"] })),
+            Some(&s),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}

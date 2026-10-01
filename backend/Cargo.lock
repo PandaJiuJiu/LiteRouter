@@ -976,7 +976,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "hex",
- "hmac",
  "http-body-util",
  "pbkdf2",
  "rand 0.8.8",

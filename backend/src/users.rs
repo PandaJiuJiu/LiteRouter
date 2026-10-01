@@ -1,4 +1,4 @@
-use crate::auth::require_admin;
+use crate::auth::{json_err, require_admin};
 use crate::db::hash_password;
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -34,10 +34,6 @@ fn row_user(row: &sqlx::sqlite::SqliteRow) -> Value {
         "created_at": row.get::<i64, _>("created_at"),
         "updated_at": row.get::<i64, _>("updated_at"),
     })
-}
-
-fn json_err(msg: &str) -> Json<Value> {
-    Json(json!({ "error": msg }))
 }
 
 /// GET /api/users — admin only.
@@ -247,7 +243,3 @@ pub async fn delete_user(
 
     Ok(Json(json!({ "ok": true })))
 }
-
-/// Returned tokens belong to this id, which we already validated above.
-#[allow(dead_code)]
-fn _silence_unused() {}

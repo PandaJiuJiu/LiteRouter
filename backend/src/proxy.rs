@@ -316,9 +316,8 @@ async fn write_debug_log(log_id: i64, req_body: &[u8], resp_body: &[u8]) {
 }
 
 /// Delete the debug log directory for a given log_id. Idempotent —
-/// directory may not exist. Called during cleanup so orphaned debug files
-/// are removed when the corresponding log row is purged.
-#[allow(dead_code)]
+/// directory may not exist. Called by `db::cleanup_old_logs` so the files
+/// under a purged `logs` row go with it.
 pub async fn delete_debug_log(log_id: i64) {
     let dir = format!("{DEBUG_LOG_DIR}/{log_id}");
     if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
