@@ -31,7 +31,78 @@
 
 ## 部署
 
-使用 Docker Compose 一键部署：
+### 从 GHCR 部署（推荐）
+
+预构建镜像发布在 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/qihangkong/literouter:v0.0.3
+```
+
+可用标签：
+
+- `v0.0.3` — 固定版本，生产环境请用这个
+- `latest` — 指向最新版本
+
+**该包目前为私有**，需要先用一个带 `read:packages` 权限的 GitHub token 登录（classic PAT 勾选该权限，或 fine-grained PAT 授予本包的读权限）：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
+```
+
+然后运行。把下面内容存为 `compose.yml`，放在数据目录旁边：
+
+```yaml
+services:
+  literouter:
+    image: ghcr.io/qihangkong/literouter:v0.0.3
+    container_name: literouter
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # 必须设置，详见下方警告
+      - LITEROUTER_DB=/app/data/literouter.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+```
+
+```bash
+mkdir -p data && docker compose up -d
+```
+
+启动后访问 `http://your-host:3000`，系统会引导你创建第一个管理员账号。
+
+> **警告：用预构建镜像运行时，`LITEROUTER_DB` 必须显式设置。**
+> 不设置时后端默认取 `literouter.db`，相对于工作目录解析为 `/app/literouter.db`，
+> **在挂载卷之外**。数据库会落在容器的可写层里，下次重建容器时被静默删除，
+> 且不会报任何错。本仓库的 `docker-compose.yml` 已经设好了；你自己的 compose 文件也必须设。
+
+说明：
+
+- 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，约 22 MB，无外部依赖
+- **仅提供 linux/amd64**。Apple Silicon / arm64 上要么开启模拟（`podman run --arch amd64`，
+  或 Docker Desktop 默认开启），要么[从源码构建](#从源码构建)
+- SQLite 数据持久化在 `./data` 目录——升级前请先备份，见下
+
+### 升级
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+若要锁定特定版本，先改 `image:` 里的标签。
+
+需要注意：
+
+- **表结构迁移在启动时自动执行**。自 v0.0.2 起所有迁移都是增量式的
+  （往 `settings` 表 `INSERT OR IGNORE`），对既有数据没有影响
+- **迁移不可逆**——不支持降级。升级前请先复制 `./data`
+- **所有人需要重新登录**。会话仅存在于内存中，重启即失效。这是有意为之，
+  本项目没有会话存储
+- **下游 API 令牌（`sk-…`）不受影响**——调用 `/v1/*` 的客户端无需重新签发即可继续使用
+
+### 从源码构建
 
 ```bash
 git clone https://github.com/qihangkong/LiteRouter.git
@@ -39,14 +110,15 @@ cd LiteRouter
 docker compose up -d --build
 ```
 
-启动后访问 `http://your-host:3000`，系统会引导你创建第一个管理员账号。
-
 说明：
 
-- 镜像为三阶段构建（前端 → 后端 → 运行时），最终基于 `alpine:3.20`，无外部依赖
-- SQLite 数据持久化在 `./data` 目录
 - `docker-compose.yml` 依赖同目录的 `Dockerfile`，两者均无需修改即可使用
 - 老版本 Docker 用 `docker-compose`（带连字符）代替 `docker compose`
+- Docker Hub 不可达的网络可通过 build arg 换源：
+
+```bash
+docker compose build --build-arg REGISTRY=docker.io/library
+```
 
 ### 账号体系
 
@@ -59,26 +131,20 @@ docker compose up -d --build
 
 ### 修改端口
 
-宿主端口由 `docker-compose.yml` 的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
+宿主端口由你所用 compose 文件的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
 
 ```bash
-PORT=8080 docker compose up -d --build   # 用 http://your-host:8080 访问
+PORT=8080 docker compose up -d      # 用 http://your-host:8080 访问
 ```
 
 注意这里的 `PORT` 只影响**宿主侧**端口映射；容器内进程监听端口无需修改。改回默认只需去掉 `PORT=` 前缀，重新 `up -d` 即可。
-
-Docker Hub 不可达的网络可通过 build arg 换源：
-
-```bash
-docker compose build --build-arg REGISTRY=docker.io/library
-```
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PORT` | `3000` | 监听端口 |
-| `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径（compose 已指向持久卷 `/app/data/literouter.db`） |
+| `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径。以容器方式运行时**请设为 `/app/data/literouter.db`**——默认值会解析到挂载卷之外的 `/app/literouter.db` |
 
 ## 使用流程
 

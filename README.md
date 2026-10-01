@@ -31,7 +31,77 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 
 ## Deployment
 
-One-command deployment with Docker Compose:
+### Deploy from GHCR (recommended)
+
+Prebuilt images are published to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/qihangkong/literouter:v0.0.3
+```
+
+Tags:
+
+- `v0.0.3` — pinned release, use this in production
+- `latest` — tracks the most recent release
+
+**The package is private**, so log in first with a GitHub token that has the `read:packages` scope (a classic PAT with that scope, or a fine-grained PAT granting read access to this package):
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
+```
+
+Then run it. Save this as `compose.yml` next to your data directory:
+
+```yaml
+services:
+  literouter:
+    image: ghcr.io/qihangkong/literouter:v0.0.3
+    container_name: literouter
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # Required — see the warning below
+      - LITEROUTER_DB=/app/data/literouter.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+```
+
+```bash
+mkdir -p data && docker compose up -d
+```
+
+Visit `http://your-host:3000` — the system will walk you through creating the first admin account.
+
+> **Warning: `LITEROUTER_DB` must be set explicitly when running the prebuilt image.**
+> Without it the backend defaults to `literouter.db`, which resolves to `/app/literouter.db`
+> — *outside* the mounted volume. The database would then live in the container's writable
+> layer and be silently destroyed the next time the container is recreated, with no error.
+> The `docker-compose.yml` in this repository sets it for you; your own compose file must too.
+
+Notes:
+
+- The image is a three-stage build (frontend → backend → runtime), final stage based on `alpine:3.20`, roughly 22 MB, no external dependencies
+- **linux/amd64 only.** On Apple Silicon / arm64, either enable emulation
+  (`podman run --arch amd64` / Docker Desktop's default) or [build from source](#building-from-source)
+- SQLite data is persisted in the `./data` directory — back it up before upgrading, see below
+
+### Upgrading
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Or, to pin a specific version, change the `image:` tag first.
+
+What to expect:
+
+- **Schema migrations run automatically** on startup. Since v0.0.2 the migrations are additive (`INSERT OR IGNORE` into `settings`), so upgrading is a no-op for existing data
+- **Migrations are not reversible** — there is no supported downgrade path. Copy `./data` before upgrading
+- **Everyone must log in again.** Sessions are held in memory only and do not survive a restart. This is intentional; the project has no session store
+- **Downstream API tokens (`sk-…`) are unaffected** — clients calling `/v1/*` keep working without being reissued
+
+### Building from source
 
 ```bash
 git clone https://github.com/qihangkong/LiteRouter.git
@@ -39,14 +109,15 @@ cd LiteRouter
 docker compose up -d --build
 ```
 
-After startup, visit `http://your-host:3000` — the system will walk you through creating the first admin account.
-
 Notes:
 
-- The image is a three-stage build (frontend → backend → runtime), final stage based on `alpine:3.20`, no external dependencies
-- SQLite data is persisted in the `./data` directory
 - `docker-compose.yml` depends on the `Dockerfile` in the same directory; both work without modification
 - On older Docker versions, use `docker-compose` (with hyphen) instead of `docker compose`
+- If Docker Hub is unreachable, switch the registry mirror via a build arg:
+
+```bash
+docker compose build --build-arg REGISTRY=docker.io/library
+```
 
 ### Account model
 
@@ -59,26 +130,20 @@ Notes:
 
 ### Changing the port
 
-The host port is determined by the `ports` mapping in `docker-compose.yml`, overridable via the `PORT` environment variable (the container always listens on 3000):
+The host port is determined by the `ports` mapping in your compose file, overridable via the `PORT` environment variable (the container always listens on 3000):
 
 ```bash
-PORT=8080 docker compose up -d --build   # access at http://your-host:8080
+PORT=8080 docker compose up -d      # access at http://your-host:8080
 ```
 
 Note that `PORT` only affects the **host-side** port mapping; the in-container process port needs no change. To revert to the default, drop the `PORT=` prefix and run `up -d` again.
-
-If Docker Hub is unreachable, you can switch the registry mirror via build args:
-
-```bash
-docker compose build --build-arg REGISTRY=docker.io/library
-```
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `3000` | Listen port |
-| `LITEROUTER_DB` | `literouter.db` | SQLite database path (compose points it at the persistent volume `/app/data/literouter.db`) |
+| `LITEROUTER_DB` | `literouter.db` | SQLite database path. **Set this to `/app/data/literouter.db`** when running the container — the default resolves to `/app/literouter.db`, outside the mounted volume |
 
 ## Usage
 
