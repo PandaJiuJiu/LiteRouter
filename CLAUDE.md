@@ -82,6 +82,8 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │       ├── language.js          # shared language switch (sidebar + Settings)
 │       ├── debug.js             # shared debug-logging flag
 │       ├── breaker.js           # shared breaker snapshot
+│       ├── session.js           # shared identity + isAdmin (resetSession on login)
+│       ├── format.js            # fmtNum / fmtDate, shared by the numeric tables
 │       └── views/
 │           ├── Setup.vue        # first-run wizard
 │           ├── Login.vue
@@ -90,6 +92,7 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │           ├── Tokens.vue / Mappings.vue
 │           ├── Logs.vue / LogDetail.vue
 │           ├── Usage.vue
+│           ├── UsageTokenColumns.vue # the 4 numeric columns all 4 usage tabs share
 │           ├── Users.vue        # admin-only
 │           └── Settings.vue     # language (and growing)
 └── data/literouter.db           # gitignored, SQLite
@@ -193,15 +196,16 @@ cd backend && cargo test --all-targets   # unit + integration
 cd frontend && npm test                  # locale parity + vitest suites (see below)
 ```
 
-**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 8 suites / 110 tests):
+**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 11 suites / 127 tests):
 
 - `npm test` = `check:i18n` then `test:unit`. Both are blocking in CI.
 - `scripts/check-i18n.mjs` is zero-dependency and fails when en-US and zh-CN key sets drift, when a zh-CN value is empty, or when both locales carry the identical string. vue-i18n falls back silently on a missing key, so nothing else would catch it.
 - `src/views/*` and `src/router.js` are loaded with **lazy `import()`**, so a suite that mounts them must `await import(...)` at top level rather than a static `import`. See `tests/layout.spec.js`.
 - `src/router.js` exports a singleton, and vue-router **skips the guard entirely** on a `push` to the path it is already on. Reusing the instance across cases makes any test that revisits the previous test's landing path pass vacuously. `tests/router_guard.spec.js` calls `vi.resetModules()` and re-imports per test.
-- `src/debug.js` and `src/breaker.js` are module-level singletons on purpose (one flag shared across views). Same `vi.resetModules()` treatment; their `vi.mock('../src/api')` factories need `vi.hoisted` for the spies, or hoisting runs before the bindings exist.
+- `src/debug.js`, `src/breaker.js` and `src/session.js` are module-level singletons on purpose (one flag/identity shared across views). Same `vi.resetModules()` treatment; their `vi.mock('../src/api')` factories need `vi.hoisted` for the spies, or hoisting runs before the bindings exist.
 - Element Plus `@closed` fires from the leave transition, which jsdom never runs. Drive such handlers through the setup function directly and say so in a comment, rather than reshaping the component to suit the test.
 - Element Plus components take **no arbitrary props**: a typo like `:loading` on `el-radio-group` silently falls through to the root element as a plain HTML attribute. If a prop "does nothing", check it exists.
+- `src/session.js` caches the identity for the whole app, so a suite that mounts a view reading it must call `resetSession()` in `beforeEach` or the first case's admin leaks into the rest. And because it is cached, `Login.vue` must call `resetSession()` after a successful login — the backend issues a new session id that may belong to a different user. Its import has to be `await import('../src/session')` below the `vi.mock` block for the same hoisting reason as the views.
 - Language switching has two entry points (sidebar dropdown, Settings page), both routed through `src/language.js`. That module is deliberately **not** in `src/i18n/index.js` — `api.js` imports `translate` from there, so adding an API call would close an import cycle.
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` as **blocking**; the tree is clean as of 715035b, so keep it that way rather than adding `#[allow]`s.

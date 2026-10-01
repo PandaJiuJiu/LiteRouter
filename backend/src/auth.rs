@@ -125,7 +125,6 @@ pub async fn setup(
         SessionInfo {
             user_id,
             is_admin: true,
-            created_at: ts,
         },
     );
 
@@ -173,7 +172,6 @@ pub async fn login(
         SessionInfo {
             user_id,
             is_admin: is_admin != 0,
-            created_at: db::now(),
         },
     );
     Ok(Json(json!({
