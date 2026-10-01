@@ -177,7 +177,7 @@ cd backend && cargo test --all-targets   # unit + integration
 cd frontend && npm test                  # locale parity + vitest suites (see below)
 ```
 
-**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 7 suites / 97 tests):
+**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 8 suites / 110 tests):
 
 - `npm test` = `check:i18n` then `test:unit`. Both are blocking in CI.
 - `scripts/check-i18n.mjs` is zero-dependency and fails when en-US and zh-CN key sets drift, when a zh-CN value is empty, or when both locales carry the identical string. vue-i18n falls back silently on a missing key, so nothing else would catch it.
@@ -185,6 +185,8 @@ cd frontend && npm test                  # locale parity + vitest suites (see be
 - `src/router.js` exports a singleton, and vue-router **skips the guard entirely** on a `push` to the path it is already on. Reusing the instance across cases makes any test that revisits the previous test's landing path pass vacuously. `tests/router_guard.spec.js` calls `vi.resetModules()` and re-imports per test.
 - `src/debug.js` and `src/breaker.js` are module-level singletons on purpose (one flag shared across views). Same `vi.resetModules()` treatment; their `vi.mock('../src/api')` factories need `vi.hoisted` for the spies, or hoisting runs before the bindings exist.
 - Element Plus `@closed` fires from the leave transition, which jsdom never runs. Drive such handlers through the setup function directly and say so in a comment, rather than reshaping the component to suit the test.
+- Element Plus components take **no arbitrary props**: a typo like `:loading` on `el-radio-group` silently falls through to the root element as a plain HTML attribute. If a prop "does nothing", check it exists.
+- Language switching has two entry points (sidebar dropdown, Settings page), both routed through `src/language.js`. That module is deliberately **not** in `src/i18n/index.js` — `api.js` imports `translate` from there, so adding an API call would close an import cycle.
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` as **blocking**; the tree is clean as of 715035b, so keep it that way rather than adding `#[allow]`s.
 
