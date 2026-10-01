@@ -120,6 +120,12 @@
         </template>
         <div class="breaker-actions">
           <el-button size="small" @click="refreshBreaker">{{ t('common.refresh') }}</el-button>
+          <el-button
+            size="small"
+            :loading="breakerProbing"
+            :disabled="!snapshot.length"
+            @click="onProbeNow"
+          >{{ t('mappings.breaker.probeNow') }}</el-button>
           <el-button size="small" type="danger" plain @click="onResetBreaker">{{ t('mappings.breaker.reset') }}</el-button>
         </div>
         <div class="hint breaker-desc">{{ t('mappings.breaker.desc', breakerParams) }}</div>
@@ -151,7 +157,7 @@ import { useI18n } from 'vue-i18n'
 import { translate } from '../i18n'
 import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, getBreakerConfig } from '../api'
 import { loadSession, session } from '../session'
-import { breaker, loadBreakerSnapshot, resetAllBreakers } from '../breaker'
+import { breaker, loadBreakerSnapshot, resetAllBreakers, probeBreakersNow } from '../breaker'
 
 const { t } = useI18n()
 
@@ -179,6 +185,7 @@ const baseDelaySecs = ref(30)
 const maxDelaySecs = ref(600)
 const probeIntervalSecs = ref(30)
 const snapshot = computed(() => breaker.snapshot)
+const breakerProbing = computed(() => breaker.probing)
 const openCount = computed(
   () => snapshot.value.filter((r) => r.state === 'open').length,
 )
@@ -200,6 +207,16 @@ async function refreshBreaker() {
 }
 async function onResetBreaker() {
   await resetAllBreakers()
+}
+async function onProbeNow() {
+  // Probing really hits the upstreams, so it can take a while — report what
+  // it found rather than leaving the admin guessing whether the click landed.
+  const { probed, recovered } = await probeBreakersNow()
+  if (!probed) {
+    ElMessage.info(t('mappings.breaker.probeNone'))
+  } else {
+    ElMessage.success(t('mappings.breaker.probeDone', { probed, recovered }))
+  }
 }
 
 function newTarget() {

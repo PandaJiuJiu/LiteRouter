@@ -112,5 +112,9 @@ export const getBreakerSnapshot = () =>
   api.get('/breaker/snapshot').then((r) => r.data.snapshot || [])
 export const resetBreaker = () =>
   api.post('/breaker/reset').then((r) => r.data)
+// Probes every tracked key now, ignoring the cooldown. The response carries
+// the fresh snapshot too, so the caller can re-render without a second call.
+export const probeBreakerNow = () =>
+  api.post('/breaker/probe-now').then((r) => r.data)
 
 export default api

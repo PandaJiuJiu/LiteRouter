@@ -743,6 +743,80 @@ async fn an_unreadable_error_body_leaves_the_reason_as_a_bare_status() {
     assert_eq!(rows[0].reason, "HTTP 503");
 }
 
+#[tokio::test]
+async fn probing_now_clears_a_key_whose_upstream_recovered() {
+    // The whole point of the manual button: an admin fixed the upstream and
+    // doesn't want to wait out the backoff. The key is tripped with the
+    // default 30s cooldown, so a probe at t=0 can only reach it through the
+    // manual path (`tracked_keys`), never the ticker's (`expired_keys`).
+    let a = MockServer::start().await;
+    upstream_ok(&a).await;
+    let h = Harness::with_admin().await;
+    support::insert_channel(h.pool(), "ch", &a.uri(), "", "gpt-4o", true).await;
+    let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
+    h.breaker
+        .record(
+            &bkey,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+        )
+        .await;
+    assert_eq!(h.breaker.snapshot().await.len(), 1, "still open pre-probe");
+
+    let admin = support::login(&h.router, "admin").await;
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/breaker/probe-now",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["probed"], 1);
+    assert_eq!(body["recovered"], 1);
+    // A recovered key drops out of the snapshot entirely — which is why the
+    // response carries a fresh one instead of making the panel re-fetch.
+    assert_eq!(body["snapshot"].as_array().unwrap().len(), 0);
+    assert!(h.breaker.snapshot().await.is_empty());
+}
+
+#[tokio::test]
+async fn probing_now_leaves_a_still_broken_key_open_with_a_fresh_backoff() {
+    // A manual probe of a genuinely sick upstream isn't a free action: it
+    // records another failure and doubles the backoff, exactly as the ticker
+    // would have done moments later.
+    let a = MockServer::start().await;
+    upstream_status(&a, 500).await;
+    let h = Harness::with_admin().await;
+    support::insert_channel(h.pool(), "ch", &a.uri(), "", "gpt-4o", true).await;
+    let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
+    h.breaker
+        .record(
+            &bkey,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+        )
+        .await;
+
+    let admin = support::login(&h.router, "admin").await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/breaker/probe-now",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(body["probed"], 1);
+    assert_eq!(body["recovered"], 0);
+    let snap = body["snapshot"].as_array().unwrap();
+    assert_eq!(snap.len(), 1, "still open");
+    // The reason is refreshed from the probe rather than left stale — including
+    // the upstream's own wording, which `upstream_status` mounts as "boom".
+    assert_eq!(snap[0]["reason"], "HTTP 500: boom");
+    // Doubled from the 30s default.
+    assert_eq!(snap[0]["cooldown_remaining_secs"], 59);
+}
+
 // ===================== protocol conversion =====================
 
 #[tokio::test]

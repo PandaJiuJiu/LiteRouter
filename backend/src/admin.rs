@@ -270,6 +270,10 @@ pub async fn fetch_models(
     // try each configured base URL: OpenAI style (Bearer) then Anthropic
     // style (x-api-key), return the first successful response
     let mut last_err = String::new();
+    // Same budget as the model test below, for the same reason: this is a
+    // click-and-wait admin action, and the shared client's 600s would leave
+    // the dialog spinning for ten minutes if an upstream hangs.
+    let timeout = model_test_timeout(&state.pool).await;
     // upstream definitely has no /models endpoint if either attempt returns
     // 404 (or 405). Some providers (e.g. Volcano Ark) return 401 for unknown
     // paths with valid auth, so 401 alone isn't conclusive — only 404/405 are.
@@ -289,7 +293,7 @@ pub async fn fetch_models(
         } else {
             r = r.header("Authorization", format!("Bearer {}", req.api_key));
         }
-        match r.send().await {
+        match r.timeout(timeout).send().await {
             Ok(resp) if resp.status().is_success() => {
                 success = Some(resp);
                 break;
@@ -300,6 +304,13 @@ pub async fn fetch_models(
                 if status == 404 || status == 405 {
                     unsupported_endpoint = true;
                 }
+            }
+            // Distinguish a timeout from a connect failure: "the upstream is
+            // slow" and "the upstream is unreachable" call for different
+            // admin reactions, and reqwest's `Display` alone doesn't say
+            // which happened.
+            Err(e) if e.is_timeout() => {
+                last_err = format!("{} -> 请求超时（> {}s）", base, timeout.as_secs());
             }
             Err(e) => last_err = format!("{} -> {}", base, e),
         }
@@ -400,7 +411,9 @@ pub async fn test_model(
 /// Fallback when the `model_test_timeout_secs` row is missing or unusable.
 const DEFAULT_TEST_PROBE_TIMEOUT_SECS: u64 = 10;
 
-/// How long a single protocol probe may take before it's called a failure.
+/// How long a single upstream click-and-wait action may take before it's
+/// called a failure. Shared by `test_model` and `fetch_models` — both are
+/// admin-UI actions that block on one upstream, so one setting covers both.
 ///
 /// Read per request rather than baked into a const so a slow upstream can be
 /// given more headroom without a rebuild. The `settings` row is optional and

@@ -184,8 +184,11 @@ export default {
       title: 'Circuit breaker',
       openCount: '{count} (channel, model) pairs open',
       reset: 'Reset all',
+      probeNow: 'Probe now',
+      probeDone: 'Probed {probed} pair(s), {recovered} recovered',
+      probeNone: 'Nothing is open — there is nothing to probe',
       desc:
-        'Open (channel, model) pairs are skipped by the router without a request; the log still records the skip, but it does not count as a failure.\n          Any failure (5xx / 408 / 429 / other 4xx / network error) opens the breaker for {base}s — 400 and 422 excepted, those mean a bad request rather than a sick upstream;\n          if the probe fails again the backoff doubles (×2), capped at {max}s.\n          Recovery relies solely on the background task probing due pairs every {probe}s; user requests are not retried before then. A recovered pair drops out of this table.',
+        'Open (channel, model) pairs are skipped by the router without a request; the log still records the skip, but it does not count as a failure.\n          Any failure (5xx / 408 / 429 / other 4xx / network error) opens the breaker for {base}s — 400 and 422 excepted, those mean a bad request rather than a sick upstream;\n          if the probe fails again the backoff doubles (×2), capped at {max}s.\n          Recovery relies solely on the background task probing due pairs every {probe}s; user requests are not retried before then. A recovered pair drops out of this table.\n          "Probe now" skips the wait and pings every currently open pair right away — no need to sit out the backoff after fixing an upstream.',
       allHealthy: 'All upstream pairs are healthy',
       col: { channel: 'Channel', model: 'Model', reason: 'Reason', nextProbe: 'Next probe' },
     },

@@ -228,6 +228,17 @@ impl Breaker {
         }
     }
 
+    /// Every tracked key, regardless of cooldown. This is what a *manual*
+    /// probe sweep uses — an admin who just fixed an upstream wants to test
+    /// recovery now, not after the remaining backoff elapses.
+    ///
+    /// The background ticker must use [`Self::expired_keys`] instead: probing
+    /// ahead of the deadline would defeat the backoff entirely.
+    pub async fn tracked_keys(&self) -> Vec<(String, String)> {
+        let guard = self.inner.read().await;
+        guard.keys().map(|k| split_key_owned(k)).collect()
+    }
+
     /// Keys that the probe task should attempt on the next tick: every
     /// tracked key whose `deadline <= now`. We don't proactively probe
     /// healthy models because that would burn quota for no diagnostic
@@ -311,6 +322,41 @@ pub async fn http_reset(
     }
     state.breaker.reset().await;
     Json(json!({ "ok": true })).into_response()
+}
+
+/// POST /api/breaker/probe-now — probe every tracked key immediately,
+/// ignoring the remaining cooldown, and report what came back.
+///
+/// The background ticker only probes a key once its backoff has elapsed, so
+/// an admin who has just fixed an upstream would otherwise wait out the
+/// delay to find out whether the fix worked.
+pub async fn http_probe_now(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if require_admin(&state, &headers).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let report = match crate::breaker_probe::probe_now(&state).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("探测失败: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    // Return the fresh snapshot too, so the panel can re-render without a
+    // second round-trip.
+    let snap = state.breaker.snapshot().await;
+    Json(json!({
+        "ok": true,
+        "probed": report.probed,
+        "recovered": report.recovered,
+        "snapshot": snap,
+    }))
+    .into_response()
 }
 
 // ---- tests ----------------------------------------------------------------

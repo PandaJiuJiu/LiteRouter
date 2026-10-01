@@ -97,6 +97,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/breaker/snapshot", get(breaker::http_snapshot))
         .route("/api/breaker/reset", post(breaker::http_reset))
+        .route("/api/breaker/probe-now", post(breaker::http_probe_now))
         .route(
             "/api/mappings",
             get(admin::list_mappings).post(admin::create_mapping),

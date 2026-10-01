@@ -81,21 +81,43 @@ async fn current_probe_interval(state: &AppState) -> Duration {
     state.breaker.config_snapshot().await.probe_interval
 }
 
-/// One full sweep: find due keys, probe each, record outcome. Errors
+/// One full sweep: probe each due key and record its outcome. Errors
 /// against the breaker are logged at info (this is normal recovery noise);
 /// errors in setup (DB query, etc.) bubble out so the caller can log them.
 async fn sweep_once(
     state: &AppState,
     cache: &Arc<RwLock<HashMap<String, CachedModels>>>,
-) -> Result<(), String> {
+) -> Result<ProbeReport, String> {
     let now = Instant::now();
     let due = state.breaker.expired_keys(now).await;
-    if due.is_empty() {
-        return Ok(());
+    sweep(state, cache, due).await
+}
+
+/// What a sweep actually did, so the manual endpoint can report it back
+/// instead of the admin having to eyeball the panel to find out.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ProbeReport {
+    /// Keys that were pinged.
+    pub probed: usize,
+    /// Of those, how many came back healthy and closed the breaker.
+    pub recovered: usize,
+}
+
+/// Probe exactly the given keys — the shared body of the background ticker
+/// and the admin's manual "probe now" button. Splitting it out is what keeps
+/// the two paths from drifting apart.
+async fn sweep(
+    state: &AppState,
+    cache: &Arc<RwLock<HashMap<String, CachedModels>>>,
+    keys: Vec<(String, String)>,
+) -> Result<ProbeReport, String> {
+    let mut report = ProbeReport::default();
+    if keys.is_empty() {
+        return Ok(report);
     }
     // Group keys by channel so we only hit the DB once per channel.
     let mut by_channel: HashMap<String, Vec<String>> = HashMap::new();
-    for (channel_name, model) in due {
+    for (channel_name, model) in keys {
         by_channel.entry(channel_name).or_default().push(model);
     }
     for (channel_name, models) in by_channel {
@@ -135,9 +157,30 @@ async fn sweep_once(
                 )
                 .await;
             log_probe(&channel_name, m, &result);
+            report.probed += 1;
+            if success {
+                report.recovered += 1;
+            }
         }
     }
-    Ok(())
+    Ok(report)
+}
+
+/// Admin-triggered sweep: probe every currently-tracked key right now,
+/// ignoring the cooldown that the background ticker respects.
+///
+/// The point is an admin who has just fixed an upstream (rotated a key,
+/// raised a rate limit) and does not want to wait out a 5-minute backoff
+/// to find out. Probing a key that is still genuinely broken just records
+/// another failure and doubles its backoff — the same thing the ticker
+/// would have done a moment later, just sooner.
+pub async fn probe_now(state: &AppState) -> Result<ProbeReport, String> {
+    // A throwaway cache: a manual sweep shouldn't reuse the ticker's cached
+    // model lists, and it must not be able to poison them either. The cache
+    // only saves a `/v1/models` round-trip for wildcard channels.
+    let cache = Arc::new(RwLock::new(HashMap::new()));
+    let keys = state.breaker.tracked_keys().await;
+    sweep(state, &cache, keys).await
 }
 
 /// Pick the right base URL for the channel: OpenAI style first, fall back

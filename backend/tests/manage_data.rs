@@ -732,6 +732,33 @@ async fn the_breaker_snapshot_endpoint_is_admin_only() {
     let (status, _) =
         support::call_json(&h.router, "POST", "/api/breaker/reset", None, Some(&bob)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/breaker/probe-now",
+        None,
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn probing_now_with_nothing_open_is_a_no_op() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/breaker/probe-now",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["probed"], 0);
+    assert_eq!(body["recovered"], 0);
+    assert_eq!(body["snapshot"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

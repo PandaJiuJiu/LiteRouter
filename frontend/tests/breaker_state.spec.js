@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const getBreakerSnapshot = vi.fn()
 const resetBreaker = vi.fn()
-vi.mock('../src/api', () => ({ getBreakerSnapshot, resetBreaker }))
+const probeBreakerNow = vi.fn()
+vi.mock('../src/api', () => ({ getBreakerSnapshot, resetBreaker, probeBreakerNow }))
 
 /**
  * Like `src/debug.js`, the breaker snapshot lives in a module-level singleton
@@ -16,6 +17,7 @@ async function freshModule() {
 beforeEach(() => {
   getBreakerSnapshot.mockReset()
   resetBreaker.mockReset()
+  probeBreakerNow.mockReset()
 })
 
 describe('loadBreakerSnapshot', () => {
@@ -89,5 +91,47 @@ describe('resetAllBreakers', () => {
     const m = await freshModule()
     m.breaker.snapshot = [{ channel: 'injected' }]
     expect(m.breaker.snapshot).toEqual([])
+  })
+})
+
+describe('probeBreakersNow', () => {
+  it('adopts the snapshot the response carries, saving a re-fetch', async () => {
+    // Recovered keys drop off the server-side list, so the response ships a
+    // fresh one — re-fetching would be a wasted round-trip.
+    const m = await freshModule()
+    getBreakerSnapshot.mockResolvedValue([{ channel: 'a', model: 'b' }])
+    await m.loadBreakerSnapshot()
+    probeBreakerNow.mockResolvedValue({
+      ok: true, probed: 1, recovered: 1, snapshot: [],
+    })
+    const res = await m.probeBreakersNow()
+    expect(res).toEqual({ probed: 1, recovered: 1 })
+    expect(m.breaker.snapshot).toEqual([])
+    expect(getBreakerSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports zeroes for a missing or absent count rather than undefined', async () => {
+    // The panel renders these straight into a message; `undefined` would show
+    // up as literal "undefined" in the toast.
+    const m = await freshModule()
+    probeBreakerNow.mockResolvedValue({ ok: true, snapshot: [] })
+    expect(await m.probeBreakersNow()).toEqual({ probed: 0, recovered: 0 })
+  })
+
+  it('clears the probing flag on failure and rethrows', async () => {
+    const m = await freshModule()
+    probeBreakerNow.mockRejectedValue(new Error('探测失败'))
+    await expect(m.probeBreakersNow()).rejects.toThrow('探测失败')
+    expect(m.breaker.probing).toBe(false)
+  })
+
+  it('keeps probing separate from loading', async () => {
+    // Probing hits upstreams and takes seconds; the refresh button and the
+    // table must not be stuck behind it.
+    const m = await freshModule()
+    probeBreakerNow.mockResolvedValue({ ok: true, probed: 0, recovered: 0, snapshot: [] })
+    await m.probeBreakersNow()
+    expect(m.breaker.probing).toBe(false)
+    expect(m.breaker.loading).toBe(false)
   })
 })

@@ -215,3 +215,87 @@ async fn a_missing_setting_row_still_probes_normally() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["protocols"]["openai"]["ok"], true);
 }
+
+// ---------- fetch-models shares the same budget ----------
+
+/// POST /api/channels/fetch-models — the "获取模型列表" button on the
+/// channel form. It talks to an unsaved upstream, so it hits the network the
+/// same way the probe does and needs the same click-and-wait cap; it used to
+/// inherit the shared client's 600s.
+async fn fetch_models(
+    h: &Harness,
+    session: &str,
+    base_url: &str,
+) -> (StatusCode, serde_json::Value) {
+    support::call_json(
+        &h.router,
+        "POST",
+        "/api/channels/fetch-models",
+        Some(json!({ "base_url": base_url, "base_url_anthropic": "", "api_key": "sk-x" })),
+        Some(session),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fetching_models_from_a_hung_upstream_times_out() {
+    let server = MockServer::start().await;
+    // Both the slow POST (for test-model) and a slow GET /models (for fetch-models)
+    // are needed in this file since they share the same server instance.
+    openai_slow(&server, Duration::from_secs(30)).await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "data": [{ "id": "gpt-4o" }] }))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    let h = Harness::with_admin().await;
+    set_timeout(h.pool(), "1").await;
+    let s = admin(&h).await;
+
+    let (status, body) = fetch_models(&h, &s, &server.uri()).await;
+
+    // 502 rather than a 500: an unreachable upstream is a bad gateway, and
+    // the message must say it was a timeout, not a rejection.
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("超时"), "got {err:?}");
+    assert!(err.contains('1'), "the budget should be named: {err:?}");
+}
+
+#[tokio::test]
+async fn fetching_models_still_works_within_the_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-4o"}, {"id": "gpt-4o-mini"}]
+        })))
+        .mount(&server)
+        .await;
+    let h = Harness::with_admin().await;
+    set_timeout(h.pool(), "10").await;
+    let s = admin(&h).await;
+
+    let (status, body) = fetch_models(&h, &s, &server.uri()).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let models = body["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0], "gpt-4o");
+}
+
+#[tokio::test]
+async fn fetching_models_is_admin_only() {
+    let h = Harness::with_admin().await;
+    let bob_id = support::insert_user(h.pool(), "bob", false).await;
+    let _ = support::insert_token(h.pool(), "bob-token", bob_id).await;
+    let bob = support::login(&h.router, "bob").await;
+
+    let (status, _) = fetch_models(&h, &bob, "https://example.invalid").await;
+    // `require_admin` returns 403 FORBIDDEN, not 401 UNAUTHORIZED.
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
