@@ -1,13 +1,14 @@
 use crate::auth::{check_auth, require_admin, AuthUser};
-use crate::db::now;
+use crate::db::{self, now};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
+use std::time::Duration;
 
 fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
@@ -360,6 +361,7 @@ pub async fn test_model(
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "."}],
     });
+    let timeout = model_test_timeout(&state.pool).await;
 
     let mut protocols = serde_json::Map::new();
 
@@ -371,16 +373,7 @@ pub async fn test_model(
             .post(&url)
             .header("Authorization", format!("Bearer {}", req.api_key))
             .json(&minimal_body);
-        let entry = match r.send().await {
-            Ok(resp) if resp.status().is_success() => json!({ "ok": true }),
-            Ok(resp) => {
-                let st = resp.status().as_u16();
-                let raw = resp.text().await.unwrap_or_default();
-                json!({ "ok": false, "error": format!("HTTP {}: {}", st, extract_error_msg(&raw)) })
-            }
-            Err(e) => json!({ "ok": false, "error": format!("请求失败: {}", e) }),
-        };
-        protocols.insert("openai".to_string(), entry);
+        protocols.insert("openai".to_string(), probe(r, timeout).await);
     }
 
     // Anthropic-compatible attempt
@@ -392,16 +385,7 @@ pub async fn test_model(
             .header("x-api-key", &req.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&minimal_body);
-        let entry = match r.send().await {
-            Ok(resp) if resp.status().is_success() => json!({ "ok": true }),
-            Ok(resp) => {
-                let st = resp.status().as_u16();
-                let raw = resp.text().await.unwrap_or_default();
-                json!({ "ok": false, "error": format!("HTTP {}: {}", st, extract_error_msg(&raw)) })
-            }
-            Err(e) => json!({ "ok": false, "error": format!("请求失败: {}", e) }),
-        };
-        protocols.insert("anthropic".to_string(), entry);
+        protocols.insert("anthropic".to_string(), probe(r, timeout).await);
     }
 
     let any_ok = protocols
@@ -411,6 +395,55 @@ pub async fn test_model(
         "ok": any_ok,
         "protocols": Value::Object(protocols),
     })))
+}
+
+/// Fallback when the `model_test_timeout_secs` row is missing or unusable.
+const DEFAULT_TEST_PROBE_TIMEOUT_SECS: u64 = 10;
+
+/// How long a single protocol probe may take before it's called a failure.
+///
+/// Read per request rather than baked into a const so a slow upstream can be
+/// given more headroom without a rebuild. The `settings` row is optional and
+/// falls back to [`DEFAULT_TEST_PROBE_TIMEOUT_SECS`].
+///
+/// The shared client in `AppState` allows 600s, which is right for a real
+/// relay but useless for a click-and-wait UI: a hung upstream would leave the
+/// card spinning for ten minutes.
+async fn model_test_timeout(pool: &SqlitePool) -> Duration {
+    let secs = db::get_setting(pool, "model_test_timeout_secs")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        // 0 would time out every probe instantly — treat it as "unset"
+        // rather than as a request to disable testing.
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_TEST_PROBE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Fire one minimal request and describe the outcome for the model card:
+/// `{ ok, ms }` on success, `{ ok: false, ms, error }` otherwise.
+///
+/// `ms` is wall-clock from send to response headers read, so the UI can show a
+/// latency next to the checkmark instead of a bare "Available".
+async fn probe(r: reqwest::RequestBuilder, timeout: Duration) -> Value {
+    let started = std::time::Instant::now();
+    let outcome = match r.timeout(timeout).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            let raw = resp.text().await.unwrap_or_default();
+            Err(format!("HTTP {}: {}", st, extract_error_msg(&raw)))
+        }
+        Err(e) if e.is_timeout() => Err(format!("请求超时（> {}s）", timeout.as_secs())),
+        Err(e) => Err(format!("请求失败: {}", e)),
+    };
+    let ms = started.elapsed().as_millis();
+    match outcome {
+        Ok(()) => json!({ "ok": true, "ms": ms }),
+        Err(e) => json!({ "ok": false, "ms": ms, "error": e }),
+    }
 }
 
 /// Pull a human-readable error message out of an upstream's JSON error body,

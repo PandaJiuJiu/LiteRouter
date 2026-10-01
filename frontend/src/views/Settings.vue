@@ -4,15 +4,15 @@
       <span>{{ t('settings.description') }}</span>
     </div>
 
-    <section class="section">
-      <div class="section-title">{{ t('settings.language.title') }}</div>
-      <div class="section-desc">{{ t('settings.language.desc') }}</div>
-      <el-radio-group :model-value="locale" @change="onChange" :disabled="languageSaving">
-        <el-radio v-for="l in LANGUAGES" :key="l.value" :value="l.value" class="lang-option">
-          {{ l.label }}
-        </el-radio>
-      </el-radio-group>
-    </section>
+    <!-- 一个设置一行。以后加设置就往这个列表里追加，布局不用再改。 -->
+    <div class="row">
+      <div class="row-label">{{ t('settings.language.title') }}</div>
+      <el-select :model-value="locale" :disabled="languageSaving"
+                 class="row-control" @change="onChange">
+        <el-option v-for="l in LANGUAGES" :key="l.value" :label="l.label" :value="l.value" />
+      </el-select>
+    </div>
+    <div class="row-desc">{{ t('settings.language.desc') }}</div>
   </el-card>
 </template>
 
@@ -23,7 +23,7 @@ import { languageSaving, locale, switchLanguage } from '../language'
 
 const { t } = useI18n()
 
-// 逻辑在 src/language.js 里，侧边栏下拉走的是同一个函数 —— 两处必须一致。
+// 逻辑在 src/language.js 里 —— 切换语言的地方只有这一个了。
 async function onChange(lang) {
   if (lang === locale.value) return
   await switchLanguage(lang)
@@ -34,22 +34,29 @@ async function onChange(lang) {
 .toolbar {
   margin-bottom: 16px;
 }
-.section {
+/* 设置项两栏：左边标题，右边控件。控件定宽，左边缘对齐，
+   这样加第二行的时候不会因为标签长短而抖动。 */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0;
   border-top: 1px solid #ebeef5;
-  padding-top: 16px;
 }
-.section-title {
+.row-label {
+  width: 160px;
+  flex: none;
   font-size: 14px;
-  font-weight: 600;
   color: #303133;
-  margin-bottom: 4px;
 }
-.section-desc {
+.row-control {
+  width: 200px;
+}
+/* 说明挂在控件下面而不是标题里，一行只放一个设置，标题保持干净。 */
+.row-desc {
+  padding-bottom: 10px;
+  margin-left: 176px;
   font-size: 12px;
   color: #909399;
-  margin-bottom: 12px;
-}
-.lang-option {
-  margin-bottom: 8px;
 }
 </style>

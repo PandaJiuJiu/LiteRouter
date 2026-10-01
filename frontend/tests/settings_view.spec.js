@@ -94,19 +94,31 @@ describe('Settings view', () => {
   })
 
   it('offers exactly the supported languages', async () => {
+    // el-select 只渲染当前值，选项在弹层里（jsdom 也不会自动展开），
+    // 所以这里读 default 插槽里的 vnode，而不是 DOM。
     const w = await mountSettings()
-    const labels = w.findAll('.el-radio').map((r) => r.text())
+    // v-for 生成一个 Fragment，default 插槽返回的是嵌套一层的 vnode 数组；
+    // el-option 的文案在 props 上。
+    const labels = w.findComponent({ name: 'ElSelect' })
+      .vm.$slots.default()
+      .flatMap((f) => f.children)
+      .map((v) => v.props.label)
     expect(labels).toEqual(['中文', 'English'])
   })
 
-  it('checks the current locale', async () => {
+  it('shows the current locale in the control', async () => {
     const w = await mountSettings()
-    const checked = w.findAll('.el-radio').filter((r) => r.classes().includes('is-checked'))
-    expect(checked).toHaveLength(1)
-    expect(checked[0].text()).toBe('中文')
+    expect(w.find('.el-select__placeholder span').text()).toBe('中文')
   })
 
-  it('switches and persists from the radio group', async () => {
+  it('lays each setting out as one row: label left, control right', async () => {
+    const w = await mountSettings()
+    const row = w.find('.row')
+    expect(row.find('.row-label').text()).toBe(zhCN.settings.language.title)
+    expect(row.find('.el-select').exists()).toBe(true)
+  })
+
+  it('switches and persists from the dropdown', async () => {
     setLanguage.mockResolvedValue('en-US')
     const w = await mountSettings()
     await w.vm.onChange('en-US')

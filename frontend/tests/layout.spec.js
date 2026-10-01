@@ -115,61 +115,16 @@ describe('language switching', () => {
     expect(navLabels(w)[0]).toBe(enUS.nav.tokens)
   })
 
-  it('applies the switch locally and persists it', async () => {
-    me.mockResolvedValue({ username: 'ada', is_admin: false })
-    const w = await mountLayout()
-
-    // The dropdown teleports its content, so drive the handler directly.
-    await w.vm.onUserCommand('lang:en-US')
-    await flushPromises()
-
-    expect(i18n.global.locale.value).toBe('en-US')
-    expect(localStorage.getItem('literouter.lang')).toBe('en-US')
-    expect(navLabels(w)[0]).toBe(enUS.nav.tokens)
-  })
-
-  it('persists the choice to the server so other devices follow', async () => {
-    me.mockResolvedValue({ username: 'ada', is_admin: false })
-    const w = await mountLayout()
-    await w.vm.onUserCommand('lang:en-US')
-    await flushPromises()
-    expect(setLanguage).toHaveBeenCalledWith('en-US')
-  })
-
-  it('keeps the local choice when the persist call fails', async () => {
-    // Deliberate, per the component's own comment: a language is cosmetic, and
-    // rolling back to a language the user didn't pick is worse than drifting
-    // from the DB until next load.
-    setLanguage.mockRejectedValue(new Error('数据库错误'))
-    me.mockResolvedValue({ username: 'ada', is_admin: false })
-    const w = await mountLayout()
-
-    await w.vm.onUserCommand('lang:en-US')
-    await flushPromises()
-    expect(i18n.global.locale.value).toBe('en-US')
-  })
-
-  it('no-ops when the chosen language is already active', async () => {
-    setLocale('en-US')
+  it('no longer offers a language switch in the user menu', async () => {
+    // 切换语言只有 Settings 页一个入口了；下拉菜单里再放一份，两处会打架。
     me.mockResolvedValue({ username: 'ada', is_admin: false })
     const w = await mountLayout()
     await w.vm.onUserCommand('lang:en-US')
     expect(setLanguage).not.toHaveBeenCalled()
   })
+})
 
-  it('normalizes an unsupported language instead of persisting it', async () => {
-    // setLocale falls back to the default; persisting the raw string would put
-    // a value the backend rejects into settings, 400-ing every later load.
-    me.mockResolvedValue({ username: 'ada', is_admin: false })
-    const w = await mountLayout()
-
-    await w.vm.onUserCommand('lang:kl-KL')
-    await flushPromises()
-
-    expect(i18n.global.locale.value).toBe('zh-CN')
-    expect(setLanguage).toHaveBeenCalledWith('zh-CN')
-  })
-
+describe('user menu commands', () => {
   it('ignores commands that are not in the dropdown', async () => {
     me.mockResolvedValue({ username: 'ada', is_admin: false })
     const w = await mountLayout()

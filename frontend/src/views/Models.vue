@@ -21,7 +21,7 @@
         </div>
         <div>
           <el-button size="small" :loading="ch._testingAll"
-            :disabled="!modelList(ch).length" @click="testAll(ch)">
+            :disabled="!enabledModelList(ch).length" @click="testAll(ch)">
             {{ t('models.testAll') }}
           </el-button>
           <el-button size="small" :loading="ch._fetching"
@@ -55,13 +55,13 @@
                   <div class="status-line fail">
                     <el-icon class="status-icon"><CircleCloseFilled /></el-icon>
                     <span class="status-proto">{{ proto }}</span>
-                    <span class="status-text">{{ t('models.unavailable') }}</span>
+                    <span class="status-text">{{ statusText(ch, m, proto) }}</span>
                   </div>
                 </el-tooltip>
                 <div v-else class="status-line ok">
                   <el-icon class="status-icon"><CircleCheckFilled /></el-icon>
                   <span class="status-proto">{{ proto }}</span>
-                  <span class="status-text">{{ t('models.available') }}</span>
+                  <span class="status-text">{{ statusText(ch, m, proto) }}</span>
                 </div>
               </template>
             </template>
@@ -195,6 +195,11 @@ function modelList(ch) {
   return known[ch.id] || []
 }
 
+// 只包含启用中的模型 —— 「全部测试」和按钮可用状态都基于它。
+function enabledModelList(ch) {
+  return modelList(ch).filter((m) => isSelected(ch, m))
+}
+
 function splitModels(s) {
   return (s || '').split(',').map((x) => x.trim()).filter((x) => x && x !== '*')
 }
@@ -204,6 +209,14 @@ const PROTOCOLS = ['openai', 'anthropic']
 function hasTestResult(ch, m) {
   const r = ch._testResult?.[m]
   return r && r.protocols && Object.keys(r.protocols).length > 0
+}
+
+// 「可用 / 不可用」这个词在颜色和图标上已经说过了；真正新增的信息是耗时，
+// 所以这里只报耗时，慢的那次一眼能看出来。
+function statusText(ch, m, proto) {
+  const ms = ch._testResult?.[m]?.protocols?.[proto]?.ms
+  if (typeof ms !== 'number') return '—'
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
 }
 
 function isSelected(ch, m) {
@@ -412,7 +425,9 @@ async function pingModel(ch, m) {
 }
 
 async function testAll(ch) {
-  const list = modelList(ch)
+  // 只测启用的模型：停用的模型本来就不参与路由，测它既没有参考价值，
+  // 又会把「全部测试」的等待时间按停用模型的数量线性拉长。
+  const list = enabledModelList(ch)
   if (!list.length) return
   ch._testingAll = true
   let ok = 0

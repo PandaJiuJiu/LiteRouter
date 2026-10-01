@@ -37,18 +37,6 @@
                   </svg>
                 </el-icon>{{ t('nav.github') }}
               </el-dropdown-item>
-              <!-- el-dropdown 不支持嵌套下拉，语言选项平铺成两项，
-                   当前语言打勾。选项文案恒用各自母语。 -->
-              <el-dropdown-item command="lang:zh-CN" divided
-                :class="{ 'lang-active': locale === 'zh-CN' }">
-                <span>{{ LANGUAGES[0].label }}</span>
-                <el-icon v-if="locale === 'zh-CN'" class="lang-check"><Select /></el-icon>
-              </el-dropdown-item>
-              <el-dropdown-item command="lang:en-US"
-                :class="{ 'lang-active': locale === 'en-US' }">
-                <span>{{ LANGUAGES[1].label }}</span>
-                <el-icon v-if="locale === 'en-US'" class="lang-check"><Select /></el-icon>
-              </el-dropdown-item>
               <el-dropdown-item command="logout" divided>
                 <el-icon><SwitchButton /></el-icon>{{ t('nav.logout') }}
               </el-dropdown-item>
@@ -67,9 +55,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { ArrowRight, Select, SwitchButton } from '@element-plus/icons-vue'
-import { LANGUAGES } from '../i18n'
-import { locale, switchLanguage } from '../language'
+import { ArrowRight, SwitchButton } from '@element-plus/icons-vue'
 import { logout } from '../api'
 import { loadSession, session } from '../session'
 
@@ -86,12 +72,6 @@ const initial = computed(() => (username.value || '?').charAt(0).toUpperCase())
 function onUserCommand(cmd) {
   if (cmd === 'logout') return doLogout()
   if (cmd === 'github') window.open(repoUrl, '_blank', 'noopener,noreferrer')
-  if (cmd?.startsWith('lang:')) return onLanguageCommand(cmd.slice(5))
-}
-
-function onLanguageCommand(lang) {
-  if (lang === locale.value) return
-  return switchLanguage(lang)
 }
 
 async function doLogout() {
@@ -189,14 +169,5 @@ onMounted(loadSession)
 }
 .dd-user {
   margin-right: 6px;
-}
-/* Language rows: label left, checkmark right — the check is what tells you
-   which one is live now. */
-:deep(.el-dropdown-menu__item.lang-active) {
-  color: #409eff;
-}
-.lang-check {
-  margin-left: 12px;
-  font-size: 12px;
 }
 </style>
