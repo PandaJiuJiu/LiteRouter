@@ -2,10 +2,9 @@ import { reactive, readonly } from 'vue'
 import { getDebugLogging, setDebugLogging } from './api'
 
 // Debug-logging is a *global* server setting, but it only has a home on the
-// logs page. Both the navbar bubble (Layout) and the switch in the logs
-// pagination row (Logs) reflect and flip the same flag, so the state lives
-// here rather than in either component — otherwise the two would drift until
-// the next remount.
+// logs page today. The state lives in its own module rather than in the
+// component so the next place that wants to show the same flag (a navbar
+// bubble, most likely) can't drift from the switch until a remount.
 //
 // The backend guards these endpoints with require_admin, so a failed load for
 // a regular user just leaves the switch off / hidden.

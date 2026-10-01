@@ -85,7 +85,7 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │       └── views/
 │           ├── Setup.vue        # first-run wizard
 │           ├── Login.vue
-│           ├── Layout.vue       # shell: sidebar, user menu, change-password dialog
+│           ├── Layout.vue       # shell: sidebar + user menu (no password dialog)
 │           ├── Channels.vue / Models.vue
 │           ├── Tokens.vue / Mappings.vue
 │           ├── Logs.vue / LogDetail.vue

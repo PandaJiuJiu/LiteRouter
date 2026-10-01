@@ -54,10 +54,6 @@ export async function me() {
   return data
 }
 
-export async function changePassword(oldPassword, newPassword) {
-  await api.post('/password', { old_password: oldPassword, new_password: newPassword })
-}
-
 // ---------- user management (admin) ----------
 export const listUsers = () => api.get('/users').then((r) => r.data.users)
 export const createUser = (u) => api.post('/users', u).then((r) => r.data)
@@ -112,8 +108,6 @@ export const setLanguage = (language) =>
 // ---------- circuit breaker ----------
 export const getBreakerConfig = () =>
   api.get('/settings/breaker').then((r) => r.data)
-export const setBreakerConfig = (cfg) =>
-  api.put('/settings/breaker', cfg).then((r) => r.data)
 export const getBreakerSnapshot = () =>
   api.get('/breaker/snapshot').then((r) => r.data.snapshot || [])
 export const resetBreaker = () =>

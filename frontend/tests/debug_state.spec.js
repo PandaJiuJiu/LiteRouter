@@ -32,7 +32,7 @@ describe('loadDebugLogging', () => {
   })
 
   it('does not retry after a failed read', async () => {
-    // The module comment calls this out: Layout.vue and Logs.vue both call
+    // The module comment calls this out: every consumer calls
     // loadDebugLogging on mount, so a backend that's briefly unreachable
     // would otherwise produce one doomed request per component per render.
     const m = await freshModule()
