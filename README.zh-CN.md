@@ -122,3 +122,7 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 | `GET/POST /api/mappings`、`PUT/DELETE /api/mappings/:id` | 模型路由管理 |
 | `GET /api/logs` | 调用日志 |
 | `GET /api/usage` | 用量统计 |
+
+---
+
+[更新日志](CHANGELOG.md) · [Releases](https://github.com/qihangkong/LiteRouter/releases)

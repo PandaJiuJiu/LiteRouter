@@ -122,3 +122,7 @@ Admin UI (Bearer session):
 | `GET/POST /api/mappings`, `PUT/DELETE /api/mappings/:id` | Model routing management |
 | `GET /api/logs` | Call logs |
 | `GET /api/usage` | Usage statistics |
+
+---
+
+[Changelog](CHANGELOG.md) · [Releases](https://github.com/qihangkong/LiteRouter/releases)
