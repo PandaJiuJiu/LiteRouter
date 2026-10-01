@@ -101,17 +101,25 @@ function onUserCommand(cmd) {
 // 万一写库失败，下次加载会回到 DB 里的旧值，行为可预期。
 async function switchLanguage(lang) {
   if (lang === locale.value) return
-  setLocale(lang)
+  // setLocale 归一化不受支持的语言（回落到默认），落库要用归一化后的值 ——
+  // 否则会把后端不认的语言写进 settings，之后每次加载都收到 400。
+  const applied = setLocale(lang)
   try {
-    await setLanguage(lang)
+    await setLanguage(applied)
   } catch (_) {
     // 拦截器已经弹过提示了；本地状态保持用户刚选的，不回滚
   }
 }
 
 async function doLogout() {
-  await logout()
-  router.push('/login')
+  // finally：登出请求本身失败（会话早已过期）不能把用户困在后台页，
+  // 跳转必须发生。
+  try {
+    await logout()
+  } catch (_) {
+  } finally {
+    router.push('/login')
+  }
 }
 
 onMounted(loadMe)
