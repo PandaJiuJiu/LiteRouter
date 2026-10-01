@@ -66,7 +66,14 @@ jobs:
         working-directory: frontend
         # Fails the build when en-US and zh-CN drift apart. vue-i18n falls back
         # silently, so nothing else would catch it.
-        run: npm test
+        run: npm run check:i18n
+
+      - name: Unit tests
+        working-directory: frontend
+        # vitest + @vue/test-utils + jsdom: i18n helpers, router guard, axios
+        # interceptors, the shared debug/breaker stores, and the Layout and
+        # Tokens views.
+        run: npm run test:unit
 
       - name: Build
         working-directory: frontend
