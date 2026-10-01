@@ -84,7 +84,16 @@ async function load() {
     totes.value = data.totals || totes.value
     by_token.value = data.by_token || []
     by_model.value = data.by_model || []
-    by_channel.value = data.by_channel || []
+    // A request where every candidate failed is logged with a blank
+    // `channel_name` (the backend refuses to blame the last channel tried),
+    // so those requests group into an empty-key bucket. It is real traffic,
+    // but it is not a channel — showing it here would be a nameless row of
+    // requests with zero tokens. It stays counted in `totals` and stays
+    // visible per-token / per-model / per-day; drop it from this tab only.
+    // Caveat: a channel saved with an empty name is filtered out too — the
+    // backend doesn't validate `name`, and such a row would be unusable here
+    // regardless.
+    by_channel.value = (data.by_channel || []).filter((r) => r.key)
     by_day.value = data.by_day || []
   } finally {
     loading.value = false

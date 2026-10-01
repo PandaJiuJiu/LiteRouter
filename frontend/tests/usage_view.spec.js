@@ -67,4 +67,24 @@ describe('usage tables', () => {
     const cells = w.findAll('.el-table__body-wrapper')[0].findAll('td').map((c) => c.text())
     expect(cells[2]).toBe((1_234_567).toLocaleString())
   })
+
+  it('drops the nameless all-failed bucket from the channel tab only', async () => {
+    // The backend logs a request whose every candidate failed with a blank
+    // channel_name — deliberately, rather than blaming the last channel
+    // tried. Those group into an empty-key bucket that is not a channel, so
+    // the channel tab filters it. It must still be counted everywhere else.
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      totals: { requests: 7, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      by_channel: [
+        { key: 'ark', requests: 3, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        { key: '', requests: 4, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      ],
+    })
+    const w = await mountUsage()
+    expect(w.vm.by_channel.map((r) => r.key)).toEqual(['ark'])
+    // Not filtered out of the other tabs, and still in the totals.
+    expect(w.vm.by_token).toHaveLength(1)
+    expect(w.vm.totes.requests).toBe(7)
+  })
 })
