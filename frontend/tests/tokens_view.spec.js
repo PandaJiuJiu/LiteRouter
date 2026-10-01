@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { nextTick } from 'vue'
 import ElementPlus from 'element-plus'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import i18n, { setLocale } from '../src/i18n'
@@ -20,15 +21,16 @@ vi.mock('../src/api', () => ({
   me,
 }))
 
-const { warning, success } = vi.hoisted(() => ({
+const { warning, success, error } = vi.hoisted(() => ({
   warning: vi.fn(),
   success: vi.fn(),
+  error: vi.fn(),
 }))
 vi.mock('element-plus', async (orig) => {
   const actual = await orig()
-  // Keep every other ElMessage method (info/error/...) real; only the two the
-  // view calls on these paths become spies.
-  return { ...actual, ElMessage: { ...actual.ElMessage, warning, success } }
+  // Keep every other ElMessage method (info/warning/...) real; only the three
+  // the view calls on these paths become spies.
+  return { ...actual, ElMessage: { ...actual.ElMessage, warning, success, error } }
 })
 
 const { default: Tokens } = await import('../src/views/Tokens.vue')
@@ -81,7 +83,7 @@ const rows = (w) =>
 
 beforeEach(() => {
   for (const m of [listTokens, createToken, updateToken, deleteToken, listUsers, me]) m.mockReset()
-  for (const m of [warning, success]) m.mockReset()
+  for (const m of [warning, success, error]) m.mockReset()
   resetSession() // the view now reads identity from a module singleton
   setLocale('zh-CN')
   me.mockResolvedValue({ username: 'ada', is_admin: false })
@@ -292,12 +294,75 @@ describe('inline actions', () => {
   })
 
   it('copies the key to the clipboard', async () => {
-    const writeText = vi.fn()
+    const writeText = vi.fn().mockResolvedValue(undefined)
     Object.assign(navigator, { clipboard: { writeText } })
     const w = await mountTokens()
-    w.vm.copyKey('sk-aaaa')
+    await w.vm.copyKey('sk-aaaa')
     expect(writeText).toHaveBeenCalledWith('sk-aaaa')
     expect(success).toHaveBeenCalledWith(zhCN.tokens.copied)
+  })
+
+  it('reports a failure instead of claiming success when the copy throws', async () => {
+    // The async write rejects on a rejected permission — the old code fired
+    // `copied` without awaiting, so it toasted success either way.
+    Object.assign(navigator, {
+      clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+    })
+    document.execCommand = vi.fn().mockReturnValue(false)
+    const w = await mountTokens()
+    await w.vm.copyKey('sk-aaaa')
+    expect(success).not.toHaveBeenCalled()
+    expect(error).toHaveBeenCalledWith(zhCN.tokens.copyFailed)
+  })
+
+  it('falls back to execCommand when the clipboard API is absent', async () => {
+    // `navigator.clipboard` is undefined outside a secure context — the
+    // plain-HTTP LAN access this project is usually opened with.
+    Object.assign(navigator, { clipboard: undefined })
+    const exec = vi.fn().mockReturnValue(true)
+    document.execCommand = exec
+    const w = await mountTokens()
+    await w.vm.copyKey('sk-aaaa')
+    expect(exec).toHaveBeenCalledWith('copy')
+    expect(success).toHaveBeenCalledWith(zhCN.tokens.copied)
+    // The scratch textarea must not be left behind.
+    expect(document.querySelectorAll('textarea')).toHaveLength(0)
+  })
+})
+
+describe('key masking', () => {
+  it('masks the key until the eye is clicked', async () => {
+    const w = await mountTokens()
+    // Column 1 is the key: the owner column is hidden for a non-admin.
+    const cell = () => rows(w)[0][1]
+    expect(cell()).not.toContain('sk-aaaa')
+    expect(cell()).toContain('sk-')
+
+    w.vm.toggleReveal(1)
+    await nextTick()
+    expect(rows(w)[0][1]).toContain('sk-aaaa')
+  })
+
+  it('reveals tokens independently of each other', async () => {
+    // One boolean would hide the other key when the admin compares two.
+    const w = await mountTokens()
+    w.vm.toggleReveal(1)
+    await nextTick()
+    expect(rows(w)[0][1]).toContain('sk-aaaa')
+    expect(rows(w)[1][1]).not.toContain('sk-bbbb')
+
+    w.vm.toggleReveal(1)
+    await nextTick()
+    expect(rows(w)[0][1]).not.toContain('sk-aaaa')
+  })
+
+  it('copies the full key even while it is masked', async () => {
+    // Otherwise the eye toggle would gate the button the user needs.
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.assign(navigator, { clipboard: { writeText } })
+    const w = await mountTokens()
+    await w.vm.copyKey('sk-aaaa')
+    expect(writeText).toHaveBeenCalledWith('sk-aaaa')
   })
 })
 

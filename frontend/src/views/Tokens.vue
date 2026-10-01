@@ -14,8 +14,14 @@
       </el-table-column>
       <el-table-column :label="t('tokens.col.key')" min-width="280">
         <template #default="{ row }">
-          <span class="mono">{{ row.key }}</span>
-          <el-button size="small" text @click="copyKey(row.key)">{{ t('tokens.copy') }}</el-button>
+          <span class="mono">{{ isRevealed(row) ? row.key : maskKey(row.key) }}</span>
+          <el-button size="small" text :title="isRevealed(row) ? t('tokens.hideKey') : t('tokens.showKey')"
+            @click="toggleReveal(row.id)">
+            <el-icon><View v-if="!isRevealed(row)" /><Hide v-else /></el-icon>
+          </el-button>
+          <el-button size="small" text :title="t('tokens.copy')" @click="copyKey(row.key)">
+            <el-icon><CopyDocument /></el-icon>
+          </el-button>
         </template>
       </el-table-column>
       <el-table-column :label="t('tokens.col.status')" width="80">
@@ -92,9 +98,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
+import { CopyDocument, Hide, View } from '@element-plus/icons-vue'
 import { createToken, deleteToken, listTokens, listUsers, updateToken } from '../api'
 import { loadSession, session } from '../session'
 import { fmtNum } from '../format'
+import { copyText } from '../clipboard'
 
 const { t } = useI18n()
 
@@ -104,7 +112,31 @@ const loading = ref(false)
 const saving = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
+// Ids of tokens currently shown in full. A Set rather than one boolean: an
+// admin comparing two keys side by side shouldn't collapse the other.
+const revealed = ref(new Set())
 const isAdmin = computed(() => session.isAdmin)
+
+const isRevealed = (row) => revealed.value.has(row.id)
+
+function toggleReveal(id) {
+  // Replace the Set rather than mutate it — `ref` only re-renders on a new
+  // reference.
+  const next = new Set(revealed.value)
+  if (next.has(id)) {
+    next.delete(id)
+  } else {
+    next.add(id)
+  }
+  revealed.value = next
+}
+
+// Keep the `sk-` prefix readable — it tells you this is an API key and not a
+// session id — and hide the secret. The length is deliberately not the real
+// one, so the mask doesn't leak how long the key is.
+function maskKey(key) {
+  return `${(key || '').slice(0, 3)}••••••••`
+}
 
 const emptyForm = () => ({
   name: '',
@@ -191,9 +223,14 @@ async function remove(id) {
   await load()
 }
 
-function copyKey(key) {
-  navigator.clipboard.writeText(key)
-  ElMessage.success(t('tokens.copied'))
+async function copyKey(key) {
+  // Copies the full key whether or not it's revealed — otherwise the eye
+  // toggle would gate the button the user actually needs.
+  if (await copyText(key)) {
+    ElMessage.success(t('tokens.copied'))
+  } else {
+    ElMessage.error(t('tokens.copyFailed'))
+  }
 }
 
 function resetForm() {

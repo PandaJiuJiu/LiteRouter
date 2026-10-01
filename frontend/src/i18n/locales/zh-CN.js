@@ -150,6 +150,9 @@ export default {
     nameRequired: '请输入名称',
     created: '已创建',
     copied: '已复制',
+    copyFailed: '复制失败，请手动选中 Key 复制',
+    showKey: '显示 Key',
+    hideKey: '隐藏 Key',
   },
   mappings: {
     description:

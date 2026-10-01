@@ -153,6 +153,9 @@ export default {
     nameRequired: 'Please enter a name',
     created: 'Created',
     copied: 'Copied',
+    copyFailed: 'Copy failed — select the key and copy it manually',
+    showKey: 'Show key',
+    hideKey: 'Hide key',
   },
   mappings: {
     description:
