@@ -49,34 +49,49 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │   ├── migrations/              # SQL schema migrations, embedded by sqlx::migrate!
 │   │   ├── 0001_channels.sql
 │   │   ├── …
-│   │   └── 0012_users.sql
+│   │   └── 0026_ui_language.sql
+│   ├── tests/                   # integration tests (see Testing)
+│   │   ├── support/mod.rs       # shared fixtures — not a test target itself
+│   │   ├── relay_contract.rs    # wiremock as a real upstream
+│   │   ├── manage_users.rs / manage_data.rs
+│   │   └── convert_tests.rs / stream_convert.rs / small_helpers.rs
 │   └── src/
-│       ├── main.rs              # axum router wiring, /v1/* + /api/* + startup
-│       ├── lib.rs               # library root: build_state() + build_router() (see Testing)
-│       ├── db.rs                # init_pool() + PBKDF2 password hash helpers
-│       ├── auth.rs              # session middleware, setup/login/logout/me/password
+│       ├── lib.rs               # library root: build_state() + build_router()
+│       ├── main.rs              # thin shell: env → pool → state → router → serve
+│       ├── state.rs             # AppState: pool + http client + sessions + breaker
+│       ├── db.rs                # init_pool(), PBKDF2 helpers, log retention
+│       ├── auth.rs              # setup/login/logout/me/password + json_err
 │       ├── users.rs             # /api/users CRUD (admin only)
 │       ├── admin.rs             # channels/tokens/mappings/logs/usage handlers
+│       ├── settings.rs          # debug-logging / language / breaker-config endpoints
+│       ├── breaker.rs           # circuit-breaker state machine + /api/breaker/*
+│       ├── breaker_probe.rs     # background half-open probe ticker
 │       ├── proxy.rs             # /v1/chat/completions, /v1/messages — the actual relay
-│       ├── convert.rs           # OpenAI ⇄ Anthropic protocol conversion
-│       └── state.rs             # AppState: pool + in-memory sessions
+│       └── convert.rs           # OpenAI ⇄ Anthropic protocol conversion
 ├── frontend/
 │   ├── vite.config.js           # proxies /api + /v1 → backend, port 5173
+│   ├── vitest.config.js         # jsdom env for the unit suites
+│   ├── scripts/check-i18n.mjs   # locale key parity (see Testing)
+│   ├── tests/                   # vitest suites
 │   └── src/
-│       ├── main.js
+│       ├── main.js              # bootstrap: locale, then mount
+│       ├── App.vue              # el-config-provider — wires Element Plus to the locale
 │       ├── router.js            # global beforeEach checks /api/setup-status
-│       ├── api.js               # fetch wrappers for every backend endpoint
-│       ├── App.vue
+│       ├── api.js               # axios instance + fetch wrappers for every endpoint
+│       ├── i18n/index.js        # createI18n, setLocale, translate
+│       ├── language.js          # shared language switch (sidebar + Settings)
+│       ├── debug.js             # shared debug-logging flag
+│       ├── breaker.js           # shared breaker snapshot
 │       └── views/
 │           ├── Setup.vue        # first-run wizard
 │           ├── Login.vue
-│           ├── Layout.vue       # shell, navbar, change-password dialog
-│           ├── Channels.vue
-│           ├── Tokens.vue
-│           ├── Mappings.vue
-│           ├── Logs.vue
+│           ├── Layout.vue       # shell: sidebar, user menu, change-password dialog
+│           ├── Channels.vue / Models.vue
+│           ├── Tokens.vue / Mappings.vue
+│           ├── Logs.vue / LogDetail.vue
 │           ├── Usage.vue
-│           └── Users.vue        # admin-only
+│           ├── Users.vue        # admin-only
+│           └── Settings.vue     # language (and growing)
 └── data/literouter.db           # gitignored, SQLite
 ```
 
@@ -164,6 +179,7 @@ For production, sqlx's `migrate` runs on container start, same way.
 `backend/tests/` holds 8 integration suites (~236 tests) plus unit tests inside `src/`. They all run in-process:
 
 - `src/lib.rs` exposes `build_state(pool)` and `build_router(state)`. `src/main.rs` is a thin shell that calls them — **all routing lives in the lib** so tests can mount the real `Router` via `tower::ServiceExt::oneshot`. Never move route definitions back into `main.rs`.
+- Matching a SQLite error code goes through `db::is_unique_violation`, never a string literal. sqlx reports the **primary** code (`2067`), not the extended one (`20602`); a literal that doesn't match silently degrades a 409 into a 500. This bit two handlers before it was centralized.
 - `tests/support/mod.rs` is the shared fixture module (not a test target itself): `TestDb` gives each test its own SQLite file in a tempdir, `Harness` bundles db + router + breaker, `call`/`call_json`/`login` wrap the oneshot plumbing.
   - **One SQLite file per test, deliberately.** A shared in-memory pool flakes with `database is locked` because SQLite serializes writers per-database and `cargo test` runs suites in parallel threads.
   - `shared_hash()` computes the PBKDF2 hash **once per test binary** via `OnceLock`. Production `PBKDF2_ITERATIONS` stays at 100k — do not add a test-only env override to weaken the work factor.
