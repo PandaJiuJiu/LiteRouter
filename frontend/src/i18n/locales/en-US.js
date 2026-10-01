@@ -182,9 +182,9 @@ export default {
       openCount: '{count} (channel, model) pairs open',
       reset: 'Reset all',
       desc:
-        'Open (channel, model) pairs are skipped by the router — they consume no quota and do not appear in the attempt chain.\n          Any failure (5xx / 4xx / 408 / 429 / network error) opens the breaker for {base}s;\n          if the probe fails again the backoff doubles (×2), up to {max}s.\n          Once the cooldown elapses a background task probes for recovery; user requests are not retried before then.\n          The background task checks all due pairs every {probe}s.\n          Recovered pairs drop out of this table.',
+        'Open (channel, model) pairs are skipped by the router without a request; the log still records the skip, but it does not count as a failure.\n          Any failure (5xx / 408 / 429 / other 4xx / network error) opens the breaker for {base}s — 400 and 422 excepted, those mean a bad request rather than a sick upstream;\n          if the probe fails again the backoff doubles (×2), capped at {max}s.\n          Recovery relies solely on the background task probing due pairs every {probe}s; user requests are not retried before then. A recovered pair drops out of this table.',
       allHealthy: 'All upstream pairs are healthy',
-      col: { channel: 'Channel', model: 'Model', nextProbe: 'Next probe' },
+      col: { channel: 'Channel', model: 'Model', reason: 'Reason', nextProbe: 'Next probe' },
     },
     aliasRequired: 'Please enter a client model name',
     needOneTarget: 'Add at least one forwarding target',

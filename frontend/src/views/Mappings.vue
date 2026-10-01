@@ -131,6 +131,7 @@
         >
           <el-table-column prop="channel" :label="t('mappings.breaker.col.channel')" width="160" show-overflow-tooltip />
           <el-table-column prop="target_model" :label="t('mappings.breaker.col.model')" min-width="180" show-overflow-tooltip />
+          <el-table-column prop="reason" :label="t('mappings.breaker.col.reason')" min-width="220" show-overflow-tooltip />
           <el-table-column :label="t('mappings.breaker.col.nextProbe')" width="100">
             <template #default="{ row }">
               <span v-if="row.cooldown_remaining_secs">{{ row.cooldown_remaining_secs }}s</span>

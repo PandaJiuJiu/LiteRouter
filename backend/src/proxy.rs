@@ -679,7 +679,10 @@ async fn record_outcome_in_breaker(
         *retriable_429_count += 1;
     }
     if code != 400 && code != 422 {
-        state.breaker.record(breaker_key, Outcome::Failure).await;
+        state
+            .breaker
+            .record(breaker_key, Outcome::Failure(format!("HTTP {code}")))
+            .await;
     }
 }
 
@@ -1327,7 +1330,10 @@ async fn relay(
                     ));
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, err_msg));
                     transport_err_count += 1;
-                    state.breaker.record(&breaker_key, Outcome::Failure).await;
+                    state
+                        .breaker
+                        .record(&breaker_key, Outcome::Failure(err_msg.clone()))
+                        .await;
                     // Fall through to the next candidate / next target.
                 }
             }

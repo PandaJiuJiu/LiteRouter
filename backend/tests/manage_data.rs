@@ -702,7 +702,7 @@ async fn a_breaker_reset_clears_every_recorded_key() {
     h.breaker
         .record(
             &literouter::breaker::breaker_key("ch", "gpt-4o"),
-            literouter::breaker::Outcome::Failure,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
         )
         .await;
     let (_, body) = support::call_json(

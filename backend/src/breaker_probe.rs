@@ -129,7 +129,7 @@ async fn sweep_once(
                     if success {
                         Outcome::Success
                     } else {
-                        Outcome::Failure
+                        Outcome::Failure(probe_reason(&result))
                     },
                 )
                 .await;
@@ -203,6 +203,17 @@ enum ProbeResult {
     Http { status: u16 },
     Transport(String),
     Error(String),
+}
+
+/// One-line cause for the breaker panel. Mirrors the relay-side strings so
+/// the two look alike in the snapshot: `HTTP 429` / `transport: …`.
+fn probe_reason(r: &ProbeResult) -> String {
+    match r {
+        ProbeResult::Success => String::new(),
+        ProbeResult::Http { status } => format!("HTTP {status}"),
+        ProbeResult::Transport(e) => format!("transport: {e}"),
+        ProbeResult::Error(e) => e.clone(),
+    }
 }
 
 fn log_probe(channel: &str, model: &str, result: &ProbeResult) {

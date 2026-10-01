@@ -565,7 +565,10 @@ async fn an_open_breaker_skips_the_upstream_without_sending_a_request() {
 
     let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
     h.breaker
-        .record(&bkey, literouter::breaker::Outcome::Failure)
+        .record(
+            &bkey,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+        )
         .await;
 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
@@ -592,7 +595,7 @@ async fn a_skipped_hop_is_recorded_as_skipped_not_as_a_failure() {
     h.breaker
         .record(
             &literouter::breaker::breaker_key("ch", "gpt-4o"),
-            literouter::breaker::Outcome::Failure,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
         )
         .await;
     chat(&h, &key, "gpt-4o", json!({})).await;
@@ -613,7 +616,10 @@ async fn a_success_clears_the_breaker_for_that_channel_and_model() {
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
     let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
     h.breaker
-        .record(&bkey, literouter::breaker::Outcome::Failure)
+        .record(
+            &bkey,
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+        )
         .await;
     assert!(!h.breaker.allow(&bkey).await);
 
