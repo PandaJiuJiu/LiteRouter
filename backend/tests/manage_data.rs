@@ -509,6 +509,47 @@ async fn usage_with_no_rows_reports_zeroes_not_nulls() {
 }
 
 #[tokio::test]
+async fn failed_requests_land_in_an_empty_channel_bucket() {
+    // A request where every candidate failed gets a synthetic winner with an
+    // empty `channel_name` (see `proxy.rs`) — deliberately, so the parent row
+    // shows "—" instead of blaming the last channel tried. That empty string
+    // then groups into its own bucket on the by-channel tab, which is the
+    // nameless `4 requests / 0 tokens` row an admin reported seeing.
+    let h = Harness::with_admin().await;
+    let (admin, _) = two_users(&h).await;
+    let now = literouter::db::now();
+    insert_log(h.pool(), "bob-token", now, 100).await;
+    sqlx::query(
+        "INSERT INTO logs (token_name, model, request_model, channel_name, status_code,
+                           created_at, prompt_tokens, completion_tokens, total_tokens, upstream_model, error)
+         VALUES (?,?,?,?,502,?,0,0,0,?,?)",
+    )
+    .bind("bob-token")
+    .bind("gpt-4o")
+    .bind("gpt-4o")
+    .bind("")
+    .bind(now)
+    .bind("gpt-4o")
+    .bind("all 1 candidate(s) failed")
+    .execute(h.pool())
+    .await
+    .expect("insert failed log");
+
+    let (_, body) = support::call_json(&h.router, "GET", "/api/usage", None, Some(&admin)).await;
+    let by_channel = body["by_channel"].as_array().unwrap();
+    assert_eq!(by_channel.len(), 2, "one real channel + the empty bucket");
+    let empty = by_channel
+        .iter()
+        .find(|r| r["key"] == "")
+        .expect("the nameless row should be present");
+    assert_eq!(empty["requests"], 1);
+    assert_eq!(empty["total_tokens"], 0);
+    // It still counts as a client request in the totals — the row is real,
+    // only the channel attribution is blank.
+    assert_eq!(body["totals"]["requests"], 2);
+}
+
+#[tokio::test]
 async fn the_usage_range_excludes_older_activity() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
