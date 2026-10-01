@@ -21,6 +21,7 @@
 //! non-wildcard `models` lists are used verbatim with no extra round-trip.
 
 use crate::breaker::{self, Outcome};
+use crate::proxy;
 use crate::state::AppState;
 use serde_json::json;
 use sqlx::Row;
@@ -187,31 +188,44 @@ async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeRes
     }
     let resp = match req.json(&body).send().await {
         Ok(r) => r,
-        Err(e) => return ProbeResult::Transport(format!("{e}")),
+        Err(e) => return ProbeResult::Transport(proxy::describe_transport_error(&e)),
     };
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
         ProbeResult::Success
     } else {
-        ProbeResult::Http { status }
+        ProbeResult::Http {
+            status,
+            detail: proxy::read_error_detail(resp).await,
+        }
     }
 }
 
 #[derive(Debug)]
 enum ProbeResult {
     Success,
-    Http { status: u16 },
+    Http {
+        status: u16,
+        /// Upstream's own wording, same as the relay path. `None` when the
+        /// body was empty or unreadable.
+        detail: Option<String>,
+    },
     Transport(String),
     Error(String),
 }
 
 /// One-line cause for the breaker panel. Mirrors the relay-side strings so
-/// the two look alike in the snapshot: `HTTP 429` / `transport: …`.
+/// the two look alike in the snapshot: `HTTP 429: <detail>` /
+/// `transport: <kind>`. The transport string arrives already formatted by
+/// `describe_transport_error`, so it passes through untouched.
 fn probe_reason(r: &ProbeResult) -> String {
     match r {
         ProbeResult::Success => String::new(),
-        ProbeResult::Http { status } => format!("HTTP {status}"),
-        ProbeResult::Transport(e) => format!("transport: {e}"),
+        ProbeResult::Http { status, detail } => match detail {
+            Some(d) => format!("HTTP {status}: {d}"),
+            None => format!("HTTP {status}"),
+        },
+        ProbeResult::Transport(e) => e.clone(),
         ProbeResult::Error(e) => e.clone(),
     }
 }
@@ -223,12 +237,14 @@ fn log_probe(channel: &str, model: &str, result: &ProbeResult) {
         ProbeResult::Success => {
             println!("breaker probe channel={channel} model={model} result=success")
         }
-        ProbeResult::Http { status } => {
+        ProbeResult::Http { status, .. } => {
             println!("breaker probe channel={channel} model={model} result=failure status={status}")
         }
-        ProbeResult::Transport(e) => println!(
-            "breaker probe channel={channel} model={model} result=failure error=transport:{e}"
-        ),
+        // Already carries its own `transport: ` prefix from
+        // `describe_transport_error` — don't add a second one.
+        ProbeResult::Transport(e) => {
+            println!("breaker probe channel={channel} model={model} result=failure error={e}")
+        }
         ProbeResult::Error(e) => {
             println!("breaker probe channel={channel} model={model} result=failure error={e}")
         }

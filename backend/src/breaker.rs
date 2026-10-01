@@ -87,10 +87,16 @@ pub enum Outcome {
     Failure(String),
 }
 
-/// Upstream errors are unbounded strings (reqwest's `Display` chains every
-/// cause). The breaker panel shows them in a tooltip, so clip rather than
-/// carry a multi-KB reqwest backtrace through the snapshot.
-const REASON_MAX: usize = 120;
+/// Upstream errors are unbounded strings — a provider's error `message` can
+/// be a paragraph, and `extract_error_msg`'s own raw fallback runs to 160
+/// chars before this cap applies. The breaker panel shows the reason in a
+/// tooltip, so clip rather than carry an arbitrary blob through the
+/// snapshot.
+///
+/// Head-preserving is correct here because both producers now put the
+/// load-bearing part first: `HTTP 429: <msg>` and `transport: <kind>` are
+/// short prefixes, so a long `<msg>` is the only thing that ever gets cut.
+const REASON_MAX: usize = 200;
 
 fn clip_reason(s: &str) -> String {
     let s = s.trim();

@@ -610,6 +610,10 @@ enum UpstreamOutcome {
     Http {
         status: u16,
         retry_after_secs: Option<u64>,
+        /// Best-effort human-readable cause pulled out of the upstream's
+        /// error body, e.g. `"Rate limit exceeded"`. `None` when the body
+        /// was empty or unreadable.
+        detail: Option<String>,
     },
     /// Connection / DNS / TLS / timeout failure — no HTTP status received.
     Transport(String),
@@ -617,8 +621,9 @@ enum UpstreamOutcome {
 
 /// Build and dispatch one upstream request, classify the outcome. The
 /// response body is **not** consumed here; for `Ok` the caller streams
-/// or reads it, for `Http` / `Transport` it is discarded because the
-/// next target gets a fresh attempt.
+/// or reads it. For `Http` it is drained into a short [`read_error_detail`]
+/// note (never forwarded anywhere) and for `Transport` there is nothing to
+/// read, because the next target gets a fresh attempt either way.
 async fn try_upstream(
     state: &AppState,
     cand: &Candidate,
@@ -648,11 +653,111 @@ async fn try_upstream(
                 UpstreamOutcome::Http {
                     status,
                     retry_after_secs,
+                    detail: read_error_detail(resp).await,
                 }
             }
         }
-        Err(e) => UpstreamOutcome::Transport(format!("transport: {e}")),
+        Err(e) => UpstreamOutcome::Transport(describe_transport_error(&e)),
     }
+}
+
+/// Turn a reqwest failure into a one-line cause for the breaker panel.
+///
+/// reqwest's own `Display` only says `error sending request for url (…)` —
+/// the actionable part (DNS vs TLS vs refused vs timeout) lives further down
+/// the `source()` chain, which is exactly what an admin staring at a tripped
+/// breaker needs. So we classify on the well-known `is_*` predicates first and
+/// fall back to the deepest `source()` message, skipping reqwest's own URL
+/// boilerplate.
+///
+/// Shared with the background probe (`breaker_probe.rs`) so a probe and a
+/// user request describe the same failure the same way.
+pub(crate) fn describe_transport_error(e: &reqwest::Error) -> String {
+    // Order matters: `is_timeout` and `is_connect` are both true for a
+    // connect-timeout, and "connect" alone would hide the timeout.
+    let kind = if e.is_timeout() {
+        "timeout".to_string()
+    } else if e.is_connect() {
+        // reqwest flattens DNS / TLS / refused into `is_connect`, so dig
+        // into the chain for the specific one where we can.
+        let chain = source_chain(e);
+        if chain.contains("dns error") || chain.contains("name resolution") {
+            "dns".to_string()
+        } else if chain.contains("certificate") || chain.contains("tls") {
+            "tls".to_string()
+        } else if chain.contains("Connection refused") {
+            "refused".to_string()
+        } else {
+            "connect".to_string()
+        }
+    } else if e.is_request() {
+        "request".to_string()
+    } else if e.is_body() || e.is_decode() {
+        "body".to_string()
+    } else {
+        // Unknown shape — surface the most specific message we can find.
+        deepest_source(e).unwrap_or_else(|| e.to_string())
+    };
+    format!("transport: {kind}")
+}
+
+/// The full `source()` chain as one lowercased string, for substring probes.
+fn source_chain(e: &dyn std::error::Error) -> String {
+    let mut s = String::new();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        s.push_str(&src.to_string());
+        s.push(' ');
+        cur = src.source();
+    }
+    s
+}
+
+/// The innermost `source()` message — the root cause rather than the wrapper.
+fn deepest_source(e: &dyn std::error::Error) -> Option<String> {
+    let mut last = None;
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        last = Some(src.to_string());
+        cur = src.source();
+    }
+    last
+}
+
+/// Cap on how much of a failed upstream's body we read. Error payloads are
+/// small in practice; the cap just stops a misbehaving upstream from making
+/// the gateway buffer an unbounded body it is about to discard anyway.
+const ERROR_DETAIL_MAX: usize = 4096;
+
+/// Read a failed response's body and pull a human-readable cause out of it.
+///
+/// Best-effort: any read error yields `None` rather than propagating, since
+/// the status code alone is already a usable fallback and the caller is on
+/// its way to the next candidate anyway. Only the first
+/// [`ERROR_DETAIL_MAX`] bytes are consumed — `extract_error_msg` truncates
+/// its own output, so a longer body buys nothing.
+///
+/// `pub(crate)` because the background probe drains a failed response the
+/// same way, so both paths describe a failure identically.
+pub(crate) async fn read_error_detail(resp: reqwest::Response) -> Option<String> {
+    use futures_util::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut body = resp.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let room = ERROR_DETAIL_MAX.saturating_sub(buf.len());
+                if room == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            Err(_) => return None,
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let msg = admin::extract_error_msg(&raw);
+    (!msg.is_empty()).then_some(msg)
 }
 
 /// Feed a non-2xx HTTP status into the breaker. 429 increments the
@@ -672,6 +777,7 @@ async fn record_outcome_in_breaker(
     state: &AppState,
     breaker_key: &str,
     code: u16,
+    detail: Option<&str>,
     _retry_after_secs: Option<u64>,
     retriable_429_count: &mut usize,
 ) {
@@ -679,9 +785,16 @@ async fn record_outcome_in_breaker(
         *retriable_429_count += 1;
     }
     if code != 400 && code != 422 {
+        // Prefer the upstream's own wording so the panel says *why* it
+        // tripped (`HTTP 429: Rate limit exceeded`) instead of a bare code;
+        // `clip_reason` inside the breaker trims an over-long message.
+        let reason = match detail {
+            Some(d) => format!("HTTP {code}: {d}"),
+            None => format!("HTTP {code}"),
+        };
         state
             .breaker
-            .record(breaker_key, Outcome::Failure(format!("HTTP {code}")))
+            .record(breaker_key, Outcome::Failure(reason))
             .await;
     }
 }
@@ -1291,8 +1404,13 @@ async fn relay(
                 UpstreamOutcome::Http {
                     status: code,
                     retry_after_secs,
+                    detail,
                 } => {
                     let elapsed = relay_start.elapsed().as_millis() as i64;
+                    // Stays a bare status code: this string is both the log
+                    // row and part of the error body the client eventually
+                    // sees. The richer upstream wording goes to the breaker
+                    // panel only — see `record_outcome_in_breaker`.
                     let err_msg = format!("HTTP {code}");
                     attempts.push(Attempt::new(
                         target_model,
@@ -1312,6 +1430,7 @@ async fn relay(
                         state,
                         &breaker_key,
                         code,
+                        detail.as_deref(),
                         retry_after_secs,
                         &mut retriable_429_count,
                     )
@@ -1505,6 +1624,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::time::Duration;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut m = HeaderMap::new();
@@ -1515,6 +1635,87 @@ mod tests {
             );
         }
         m
+    }
+
+    // ---------- describe_transport_error ----------
+
+    /// Build a real reqwest error by actually attempting a connection to a
+    /// closed port, so the classification is driven by the genuine error
+    /// chain rather than a hand-rolled stand-in.
+    async fn closed_port_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 must not accept connections")
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_classified_rather_than_echoed() {
+        let e = closed_port_error().await;
+        let reason = describe_transport_error(&e);
+        assert!(
+            reason.starts_with("transport: "),
+            "expected a `transport: <kind>` shape, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("error sending request"),
+            "reqwest's URL boilerplate should be replaced, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("http://127.0.0.1:1"),
+            "the URL adds nothing an admin doesn't already see, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_wins_over_the_generic_connect_classification() {
+        // `is_timeout` and `is_connect` are both true for a connect-timeout;
+        // reporting "connect" would hide the more useful signal.
+        let e = reqwest::Client::new()
+            .get("http://10.255.255.1/")
+            .timeout(Duration::from_millis(1))
+            .send()
+            .await
+            .expect_err("a 1ms timeout must fire");
+        assert!(
+            e.is_timeout(),
+            "test premise: expected a timeout, got {e:?}"
+        );
+        assert_eq!(describe_transport_error(&e), "transport: timeout");
+    }
+
+    #[test]
+    fn the_root_cause_is_preferred_over_the_wrapper_message() {
+        // A synthetic chain: an outer error whose `Display` says nothing
+        // useful, wrapping one that names the actual cause.
+        #[derive(Debug)]
+        struct Wrapper(Inner);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("wrapper said nothing helpful")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the actual root cause")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        assert_eq!(
+            deepest_source(&Wrapper(Inner)).as_deref(),
+            Some("the actual root cause")
+        );
+        // A leaf error has no `source()` to offer.
+        assert_eq!(deepest_source(&Inner), None);
     }
 
     // ---------- extract_token ----------

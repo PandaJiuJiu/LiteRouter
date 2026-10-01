@@ -448,7 +448,11 @@ async fn probe(r: reqwest::RequestBuilder, timeout: Duration) -> Value {
 
 /// Pull a human-readable error message out of an upstream's JSON error body,
 /// falling back to a truncated raw string when the schema is unknown.
-fn extract_error_msg(raw: &str) -> String {
+///
+/// Shared with the relay path (`proxy.rs`) so the circuit breaker records
+/// the upstream's own wording — `HTTP 429: Rate limit exceeded` — rather
+/// than a bare status code.
+pub(crate) fn extract_error_msg(raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
         .ok()
         .and_then(|v| {

@@ -500,6 +500,31 @@ async fn all_transport_failures_surface_as_504() {
 }
 
 #[tokio::test]
+async fn the_breaker_reason_classifies_an_unreachable_upstream() {
+    // Port 1 is closed → connection refused. The reason should say *which*
+    // kind of unreachable it was, not repeat reqwest's
+    // "error sending request for url (…)" boilerplate.
+    let (h, key) = all_fail("http://127.0.0.1:1").await;
+    chat(&h, &key, "gpt-4o", json!({})).await;
+
+    let rows = h.breaker.snapshot().await;
+    // `all_fail` registers two channels against the same dead URL, so both
+    // trip independently.
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        let reason = &row.reason;
+        assert!(
+            reason.starts_with("transport: "),
+            "expected a transport classification, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("error sending request"),
+            "reqwest boilerplate should be stripped, got {reason:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_mix_of_failure_kinds_surfaces_as_502() {
     let a = MockServer::start().await;
     upstream_status(&a, 429).await;
@@ -662,6 +687,60 @@ async fn an_upstream_500_does_trip_the_breaker() {
             .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
             .await
     );
+}
+
+#[tokio::test]
+async fn the_breaker_reason_carries_the_upstreams_own_error_message() {
+    // A bare "HTTP 429" tells the admin nothing they can't already infer
+    // from the status. The upstream body is drained (it was being discarded)
+    // so the panel shows what actually went wrong.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+    chat(&h, &key, "gpt-4o", json!({})).await;
+
+    let rows = h.breaker.snapshot().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason, "HTTP 429: boom");
+}
+
+#[tokio::test]
+async fn the_error_message_is_not_leaked_to_the_client_or_the_log() {
+    // The richer wording is for the admin panel only. `error` on the attempt
+    // row also reaches the client as the final synthesized message, so it
+    // stays a bare status code.
+    let a = MockServer::start().await;
+    upstream_status(&a, 500).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+    let (status, body) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        !body.to_string().contains("boom"),
+        "upstream wording must not reach the client: {body}"
+    );
+
+    let err: String = sqlx::query_scalar("SELECT error FROM log_attempts LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(err, "HTTP 500");
+}
+
+#[tokio::test]
+async fn an_unreadable_error_body_leaves_the_reason_as_a_bare_status() {
+    // No JSON body to read → we still have the code, which is a usable
+    // reason. This must not turn into `HTTP 500: ` or a panic.
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&a)
+        .await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+    chat(&h, &key, "gpt-4o", json!({})).await;
+
+    let rows = h.breaker.snapshot().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason, "HTTP 503");
 }
 
 // ===================== protocol conversion =====================
