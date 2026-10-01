@@ -17,6 +17,7 @@ const routes = [
       { path: 'logs', component: () => import('./views/Logs.vue') },
       { path: 'logs/:id', component: () => import('./views/LogDetail.vue') },
       { path: 'users', component: () => import('./views/Users.vue') },
+      { path: 'settings', component: () => import('./views/Settings.vue') },
     ],
   },
 ]

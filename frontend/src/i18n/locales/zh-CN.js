@@ -28,6 +28,7 @@ export default {
     usage: '用量统计',
     logs: '调用日志',
     users: '用户管理',
+    settings: '设置',
     github: '项目 GitHub',
     logout: '退出登录',
   },
@@ -245,6 +246,13 @@ export default {
     ok: '成功',
     connFailed: '连接失败',
     latencyNote: '耗时为从请求进入网关到该次尝试结束的累计值，因此后面的尝试会更大。',
+  },
+  settings: {
+    description: '全局设置',
+    language: {
+      title: '界面语言',
+      desc: '语言是全站统一的设置，任何登录用户修改后立即对所有人生效。',
+    },
   },
   users: {
     description: '系统用户：管理员可创建、重置密码或删除账号',

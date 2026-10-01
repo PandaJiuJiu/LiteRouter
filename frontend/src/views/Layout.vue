@@ -12,6 +12,7 @@
         <el-menu-item index="/usage">{{ t('nav.usage') }}</el-menu-item>
         <el-menu-item index="/logs">{{ t('nav.logs') }}</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/users">{{ t('nav.users') }}</el-menu-item>
+        <el-menu-item index="/settings">{{ t('nav.settings') }}</el-menu-item>
       </el-menu>
       <div class="user-wrap">
         <el-dropdown trigger="click" placement="top-end" @command="onUserCommand">
@@ -67,12 +68,12 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ArrowRight, Select, SwitchButton } from '@element-plus/icons-vue'
-import { LANGUAGES, i18n, setLocale } from '../i18n'
-import { logout, me, setLanguage } from '../api'
+import { LANGUAGES } from '../i18n'
+import { locale, switchLanguage } from '../language'
+import { logout, me } from '../api'
 
 const { t } = useI18n()
 const router = useRouter()
-const locale = computed(() => i18n.global.locale.value)
 const username = ref('')
 const isAdmin = ref(false)
 
@@ -94,21 +95,12 @@ async function loadMe() {
 function onUserCommand(cmd) {
   if (cmd === 'logout') return doLogout()
   if (cmd === 'github') window.open(repoUrl, '_blank', 'noopener,noreferrer')
-  if (cmd?.startsWith('lang:')) return switchLanguage(cmd.slice(5))
+  if (cmd?.startsWith('lang:')) return onLanguageCommand(cmd.slice(5))
 }
 
-// 先本地切换、立刻可见，再写库。语言是纯展示设置，不值得为它转圈；
-// 万一写库失败，下次加载会回到 DB 里的旧值，行为可预期。
-async function switchLanguage(lang) {
+function onLanguageCommand(lang) {
   if (lang === locale.value) return
-  // setLocale 归一化不受支持的语言（回落到默认），落库要用归一化后的值 ——
-  // 否则会把后端不认的语言写进 settings，之后每次加载都收到 400。
-  const applied = setLocale(lang)
-  try {
-    await setLanguage(applied)
-  } catch (_) {
-    // 拦截器已经弹过提示了；本地状态保持用户刚选的，不回滚
-  }
+  return switchLanguage(lang)
 }
 
 async function doLogout() {

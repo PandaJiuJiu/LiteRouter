@@ -27,6 +27,7 @@ export default {
     usage: 'Usage',
     logs: 'Logs',
     users: 'Users',
+    settings: 'Settings',
     github: 'Project GitHub',
     logout: 'Sign out',
   },
@@ -254,6 +255,13 @@ export default {
     connFailed: 'Connection failed',
     latencyNote:
       'Duration is cumulative from the moment the request entered the gateway until that attempt finished, so later attempts show larger values.',
+  },
+  settings: {
+    description: 'Global settings',
+    language: {
+      title: 'Interface language',
+      desc: 'The language is a site-wide setting — a change by any signed-in user takes effect for everyone immediately.',
+    },
   },
   users: {
     description: 'System users — admins can create accounts, reset passwords and remove users',
