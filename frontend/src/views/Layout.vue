@@ -126,7 +126,9 @@ onMounted(loadSession)
 .user-box {
   display: flex;
   align-items: center;
-  justify-content: center;
+  /* 头像和用户名靠左，和上方菜单项的文字左边缘对齐；chevron 被
+     .user-name 的 flex:1 推到最右。 */
+  justify-content: space-between;
   gap: 10px;
   padding: 10px 20px;
   color: #303133;
@@ -144,9 +146,10 @@ onMounted(loadSession)
   color: #3d5a80;
   font-size: 14px;
 }
-/* No flex:1 here — the row is centered as a group, so the name must size to
-   its content and let the chevron sit right beside it. */
+/* flex:1 让用户名吃掉所有剩余空间，这样 space-between 才真的把 chevron
+   推到右边缘；没有它两者会挤在名字右边那一小块里。长名字靠 ellipsis 截断。 */
 .user-name {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
