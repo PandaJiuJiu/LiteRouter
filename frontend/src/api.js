@@ -119,6 +119,36 @@ export const getLogRetention = () =>
 export const setLogRetention = (days) =>
   api.put('/settings/log-retention-days', { days }).then((r) => r.data.days)
 
+// ---------- config backup / restore ----------
+//
+// Admin-only. The export side returns a binary blob with the server-stamped
+// filename in `Content-Disposition` — we surface both to the SPA so the
+// browser saves it under the same name the server suggested.
+// The import side takes the file as a base64 string (the SPA decodes via
+// FileReader) plus the passphrase; the server decodes, decrypts, and
+// reports conflicts without writing anything.
+
+const contentDispositionName = (headerValue) => {
+  if (!headerValue) return null
+  const m = /filename\*?=(?:UTF-8'')?"([^"]+)"|filename=([^;]+)/i.exec(headerValue)
+  const raw = (m && (m[1] || m[2])) || ''
+  return raw.replace(/^"|"$/g, '') || null
+}
+
+export const exportConfig = (sections, passphrase) =>
+  api
+    .post('/config/export', { sections, passphrase }, { responseType: 'blob' })
+    .then((r) => ({
+      blob: r.data,
+      name: contentDispositionName(r.headers?.['content-disposition']) || 'literouter-backup.lrbak',
+    }))
+
+export const previewImport = ({ file, passphrase }) =>
+  api.post('/config/import/preview', { file, passphrase }).then((r) => r.data)
+
+export const commitImport = ({ file, passphrase, decisions }) =>
+  api.post('/config/import/commit', { file, passphrase, decisions }).then((r) => r.data)
+
 // ---------- circuit breaker ----------
 export const getBreakerConfig = () =>
   api.get('/settings/breaker').then((r) => r.data)

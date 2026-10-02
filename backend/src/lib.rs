@@ -11,6 +11,8 @@ pub mod admin;
 pub mod auth;
 pub mod breaker;
 pub mod breaker_probe;
+pub mod config_backup;
+pub mod config_backup_routes;
 pub mod convert;
 pub mod db;
 pub mod proxy;
@@ -107,6 +109,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/breaker/snapshot", get(breaker::http_snapshot))
         .route("/api/breaker/reset", post(breaker::http_reset))
         .route("/api/breaker/probe-now", post(breaker::http_probe_now))
+        .route(
+            "/api/config/export",
+            post(config_backup_routes::export_config),
+        )
+        .route(
+            "/api/config/import/preview",
+            post(config_backup_routes::preview_import),
+        )
+        .route(
+            "/api/config/import/commit",
+            post(config_backup_routes::commit_import),
+        )
         .route(
             "/api/mappings",
             get(admin::list_mappings).post(admin::create_mapping),

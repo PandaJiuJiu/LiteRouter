@@ -700,7 +700,7 @@ pub fn parse_targets(targets: &str, fallback: &str) -> Vec<(String, String)> {
 }
 
 /// Serialize normalized targets back into the stored JSON form.
-fn encode_targets(targets: &[(String, String)]) -> String {
+pub fn encode_targets(targets: &[(String, String)]) -> String {
     let entries: Vec<TargetEntry> = targets
         .iter()
         .map(|(channel, model)| TargetEntry::Obj {

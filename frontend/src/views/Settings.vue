@@ -33,6 +33,11 @@
       </el-select>
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
+
+    <!-- Encrypted backup/restore. Lives in its own component because the
+         preview/commit flow has a lot of UI state, and a sibling spec keeps
+         the existing Settings spec from having to mock the whole pipeline. -->
+    <ConfigBackup v-if="isAdmin" />
   </el-card>
 </template>
 
@@ -43,6 +48,7 @@ import { LANGUAGES } from '../i18n'
 import { languageSaving, locale, switchLanguage } from '../language'
 import { getLogRetention, setLogRetention } from '../api'
 import { session } from '../session'
+import ConfigBackup from './ConfigBackup.vue'
 
 const { t } = useI18n()
 

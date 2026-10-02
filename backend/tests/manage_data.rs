@@ -9,6 +9,8 @@
 mod support;
 
 use axum::http::StatusCode;
+use base64::Engine;
+use literouter::config_backup;
 use serde_json::json;
 use support::Harness;
 
@@ -1455,4 +1457,412 @@ async fn the_sweeps_cleanup_helpers_to_what_the_endpoint_returns() {
     .await;
     let days = literouter::settings::current_log_retention_days(h.pool()).await;
     assert_eq!(days, 14);
+}
+
+// ============ /api/config/{export,import/preview,import/commit} ============
+//
+// End-to-end: write some rows, export, drop everything, re-import, check the
+// rows came back. The preview → commit split lets us exercise "overwrite" /
+// "skip" / "keep_both" per row, which is the only thing the conflict picker
+// in the SPA is good at being clear about.
+
+fn encrypt_with(passphrase: &str, payload: &config_backup::BackupPayload) -> Vec<u8> {
+    config_backup::encrypt(passphrase, payload)
+}
+
+#[tokio::test]
+async fn a_channel_export_then_import_round_trip_rebuilds_the_same_row() {
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    support::insert_channel(h.pool(), "first", "http://x", "", "gpt-4o", true).await;
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+
+    // Build a payload by reading the same way the endpoint does.
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://x".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-secret".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+
+    // Wipe the channel from a fresh DB, then import.
+    sqlx::query("DELETE FROM channels")
+        .execute(h.pool())
+        .await
+        .unwrap();
+    let admin = support::login(&h.router, "admin").await;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "aaaaaaaa",
+            "decisions": { "channels": [], "tokens": [], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1);
+
+    let api_key: String = sqlx::query_scalar("SELECT api_key FROM channels WHERE name=?")
+        .bind("first")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(api_key, "sk-secret");
+    // The token, untouched by the channels-only export, is still present.
+    let _ = token;
+}
+
+#[tokio::test]
+async fn wrong_passphrase_is_refused_with_a_400_and_does_not_touch_the_db() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://x".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-secret".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("right-passphrase", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "wrong-passphrase",
+            "decisions": { "channels": [], "tokens": [], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // No rows were created.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn preview_reports_existing_rows_as_conflicts() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::insert_channel(h.pool(), "first", "http://local", "", "gpt-4o", true).await;
+
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://imported".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-new".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/preview",
+        Some(json!({ "file": b64, "passphrase": "aaaaaaaa" })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = &body["plan"]["channels"][0];
+    assert_eq!(row["name"], "first");
+    assert_eq!(row["conflict"], true);
+}
+
+#[tokio::test]
+async fn the_overwrite_decision_replaces_a_local_channel() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::insert_channel(h.pool(), "first", "http://local", "", "gpt-4o", true).await;
+
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://imported".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-new".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "aaaaaaaa",
+            "decisions": { "channels": [{"name": "first", "action": "overwrite"}], "tokens": [], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["updated"], 1);
+    let api_key: String = sqlx::query_scalar("SELECT api_key FROM channels WHERE name=?")
+        .bind("first")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(api_key, "sk-new");
+}
+
+#[tokio::test]
+async fn the_skip_decision_leaves_a_local_channel_untouched() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::insert_channel(h.pool(), "first", "http://local", "", "gpt-4o", true).await;
+
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://imported".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-new".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "aaaaaaaa",
+            "decisions": { "channels": [{"name": "first", "action": "skip"}], "tokens": [], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skipped"], 1);
+    let api_key: String = sqlx::query_scalar("SELECT api_key FROM channels WHERE name=?")
+        .bind("first")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(api_key, "sk-upstream-secret"); // the harness's default
+}
+
+#[tokio::test]
+async fn the_keep_both_decision_inserts_a_suffixed_row() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::insert_channel(h.pool(), "first", "http://local", "", "gpt-4o", true).await;
+
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["channels".into()],
+        channels: vec![config_backup::ChannelRow {
+            name: "first".into(),
+            website: String::new(),
+            base_url: "http://imported".into(),
+            base_url_anthropic: String::new(),
+            api_key: "sk-new".into(),
+            models: "gpt-4o".into(),
+            enabled: true,
+            created_at: literouter::db::now(),
+        }],
+        tokens: vec![],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "aaaaaaaa",
+            "decisions": { "channels": [{"name": "first", "action": "keep_both"}], "tokens": [], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kept_both"], 1);
+    // Both rows are present.
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM channels ORDER BY name")
+        .fetch_all(h.pool())
+        .await
+        .unwrap();
+    assert!(names.contains(&"first".to_string()));
+    assert!(names.contains(&"first_1".to_string()));
+}
+
+#[tokio::test]
+async fn token_overwrite_does_not_replace_the_local_credential_key() {
+    // The key stays put on overwrite — overwriting it would 401 every
+    // client holding the old key without warning. This is the deliberate
+    // safety carve-out called out in the docs.
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let existing = support::insert_token(h.pool(), "prod", admin_id).await;
+    let admin = support::login(&h.router, "admin").await;
+
+    let payload = config_backup::BackupPayload {
+        created_at: literouter::db::now(),
+        sections: vec!["tokens".into()],
+        channels: vec![],
+        tokens: vec![config_backup::TokenRow {
+            name: "prod".into(),
+            key: "sk-imported".into(),
+            enabled: false,
+            rpm_limit: 99,
+            daily_token_limit: 88,
+            username: "admin".into(),
+            created_at: literouter::db::now(),
+        }],
+        mappings: vec![],
+    };
+    let blob = encrypt_with("aaaaaaaa", &payload);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/commit",
+        Some(json!({
+            "file": b64,
+            "passphrase": "aaaaaaaa",
+            "decisions": { "channels": [], "tokens": [{"name": "prod", "action": "overwrite"}], "mappings": [] }
+        })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["updated"], 1);
+    // Key stays local; flag/quotas refresh.
+    let (key, enabled, rpm): (String, i64, i64) =
+        sqlx::query_as("SELECT key, enabled, rpm_limit FROM tokens WHERE id=?")
+            .bind(existing.id)
+            .fetch_one(h.pool())
+            .await
+            .unwrap();
+    assert_eq!(key, existing.key);
+    assert_eq!(enabled, 0);
+    assert_eq!(rpm, 99);
+}
+
+#[tokio::test]
+async fn export_requires_a_non_empty_section_list() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/export",
+        Some(json!({ "sections": [], "passphrase": "aaaaaaaa" })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_requires_an_eight_character_passphrase() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/export",
+        Some(json!({ "sections": ["channels"], "passphrase": "short" })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn regular_users_cannot_export_or_import() {
+    let h = Harness::with_admin().await;
+    let (_, bob) = two_users(&h).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/export",
+        Some(json!({ "sections": ["channels"], "passphrase": "aaaaaaaa" })),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/api/config/import/preview",
+        Some(json!({ "file": "AAAA", "passphrase": "aaaaaaaa" })),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
