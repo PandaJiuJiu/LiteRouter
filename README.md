@@ -15,7 +15,7 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
   - `POST /v1/messages` — Anthropic Messages protocol (`x-api-key: sk-...`)
   - Both support streaming (SSE) passthrough
 - **Channel management**: upstream channel keys (OpenAI / Claude / relay stations) are stored only in the gateway and never exposed; supports dual-protocol URLs (for channels serving both protocols with the same key, such as Volcengine Ark, just fill in both URLs)
-- **Channel routing**: routes requests to upstream channels that support the requested `model`; wildcard `*` supported
+- **Channel routing**: routes requests to upstream channels that support the requested `model`
 - **Protocol conversion**: automatically converts bidirectionally when the client protocol doesn't match the channel's (Anthropic Messages ⇄ OpenAI ChatCompletions), including streaming and tool calls. For example, an OpenAI-protocol channel can directly serve Claude Code (an Anthropic-protocol client) with zero configuration
 - **Model routing (Mappings)**: maps the model name in client requests (e.g. `my-model`) to a list of real upstream model IDs, one-to-many with adjustable order; requests are forwarded in list order and automatically fall back to the next target when earlier ones fail or have no available channel
 - **Multi-channel failover**: on upstream transport errors or retryable status codes (408 / 429 / 5xx / 524), automatically switches to the next candidate channel; non-retryable 4xx errors are returned to the client as-is
@@ -33,16 +33,11 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 
 ### Deploy from GHCR (recommended)
 
-Prebuilt images are published to GitHub Container Registry:
+Prebuilt images are published to GitHub Container Registry. The list of published tags lives at <https://github.com/qihangkong/literouter/pkgs/container/literouter>; pin a tag in production, or use `latest` if you'd rather track the most recent release:
 
 ```bash
-docker pull ghcr.io/qihangkong/literouter:v0.0.3
+docker pull ghcr.io/qihangkong/literouter:latest
 ```
-
-Tags:
-
-- `v0.0.3` — pinned release, use this in production
-- `latest` — tracks the most recent release
 
 **The package is private**, so log in first with a GitHub token that has the `read:packages` scope (a classic PAT with that scope, or a fine-grained PAT granting read access to this package):
 
@@ -55,7 +50,7 @@ Then run it. Save this as `compose.yml` next to your data directory:
 ```yaml
 services:
   literouter:
-    image: ghcr.io/qihangkong/literouter:v0.0.3
+    image: ghcr.io/qihangkong/literouter:latest
     container_name: literouter
     ports:
       - "${PORT:-3000}:3000"

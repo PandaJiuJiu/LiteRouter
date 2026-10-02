@@ -15,7 +15,7 @@
   - `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`）
   - 均支持流式（SSE）透传
 - **渠道管理**：上游渠道（OpenAI / Claude / 各类中转站）的密钥只保存在网关，不对外暴露；支持 OpenAI / Anthropic 双协议地址（同一个 key 双协议的渠道如火山方舟，两个地址都填即可）
-- **渠道路由**：按请求中的 `model` 自动路由到支持该模型的上游渠道；支持通配符 `*`
+- **渠道路由**：按请求中的 `model` 自动路由到支持该模型的上游渠道
 - **协议转换**：客户端协议与渠道不一致时自动双向转换（Anthropic Messages ⇄ OpenAI ChatCompletions），含流式与工具调用。例如 OpenAI 协议的渠道可直接服务 Claude Code（Anthropic 协议客户端），无需任何配置
 - **模型路由（Mappings）**：把客户端请求中的模型名（如 `my-model`）映射到一列上游真实模型 ID，可一对多并调整顺序；请求按列表顺序依次转发，前面的目标失败或无可用渠道时自动回退到后面的
 - **多渠道故障转移**：上游出现传输错误或可重试状态码（408 / 429 / 5xx / 524）时自动切换到下一个候选渠道；不可重试的 4xx 原样返回给客户端
@@ -33,16 +33,11 @@
 
 ### 从 GHCR 部署（推荐）
 
-预构建镜像发布在 GitHub Container Registry：
+预构建镜像发布在 GitHub Container Registry。已发布的标签列表见 <https://github.com/qihangkong/literouter/pkgs/container/literouter>；生产环境建议固定一个标签，想跟随最新版本就用 `latest`：
 
 ```bash
-docker pull ghcr.io/qihangkong/literouter:v0.0.3
+docker pull ghcr.io/qihangkong/literouter:latest
 ```
-
-可用标签：
-
-- `v0.0.3` — 固定版本，生产环境请用这个
-- `latest` — 指向最新版本
 
 **该包目前为私有**，需要先用一个带 `read:packages` 权限的 GitHub token 登录（classic PAT 勾选该权限，或 fine-grained PAT 授予本包的读权限）：
 
@@ -55,7 +50,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --passwor
 ```yaml
 services:
   literouter:
-    image: ghcr.io/qihangkong/literouter:v0.0.3
+    image: ghcr.io/qihangkong/literouter:latest
     container_name: literouter
     ports:
       - "${PORT:-3000}:3000"
