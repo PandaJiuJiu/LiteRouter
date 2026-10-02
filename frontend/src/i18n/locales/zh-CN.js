@@ -87,7 +87,7 @@ export default {
     subtitle: '所有渠道的模型配置,按渠道分组',
     searchPlaceholder: '按模型名过滤',
     filterByChannel: '按渠道筛选',
-    showDisabledOnly: '只看已停用',
+    showEnabledOnly: '只看已启用',
     focusChannel: '只看此渠道',
     summaryModels: '共 {count} 个模型',
     summaryChannels: '{count} 个渠道',

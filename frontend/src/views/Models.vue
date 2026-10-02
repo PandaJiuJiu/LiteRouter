@@ -32,8 +32,8 @@
         <el-option v-for="ch in channels" :key="ch.id" :label="ch.name" :value="ch.id" />
       </el-select>
       <span class="filter-toggle">
-        <span class="filter-toggle-label">{{ t('models.showDisabledOnly') }}</span>
-        <el-switch v-model="disabledOnly" />
+        <span class="filter-toggle-label">{{ t('models.showEnabledOnly') }}</span>
+        <el-switch v-model="enabledOnly" />
       </span>
       <div class="summary">
         <el-tag size="small" effect="plain">{{ t('models.summaryModels', { count: totalModels }) }}</el-tag>
@@ -207,13 +207,13 @@ const loading = ref(false)
 const known = reactive({})
 
 // Toolbar filters — only meaningful on the un-focused view. `search` matches
-// against either enabled or disabled models; `disabledOnly` narrows to
-// channels that actually have a disabled entry; `filterChannelId` pins the
+// against either enabled or disabled models; `enabledOnly` narrows to
+// channels that actually have an enabled entry; `filterChannelId` pins the
 // list to one channel without leaving the page. All three are local, no URL
 // state: a refresh resets them, which is the right call for a debugging page.
 const search = ref('')
 const filterChannelId = ref(null)
-const disabledOnly = ref(false)
+const enabledOnly = ref(false)
 
 function channelModelStrings(ch) {
   // Models that this channel *could* show — enabled + disabled, normalized
@@ -222,8 +222,8 @@ function channelModelStrings(ch) {
   return [...new Set(all.map((m) => m.trim()).filter((m) => m && m !== '*'))]
 }
 
-function channelHasDisabled(ch) {
-  return splitModels(ch.disabled_models).length > 0
+function channelHasEnabled(ch) {
+  return splitModels(ch.models).length > 0
 }
 
 const matchedChannels = computed(() => {
@@ -234,7 +234,7 @@ const matchedChannels = computed(() => {
   const q = search.value.trim().toLowerCase()
   return channels.value.filter((ch) => {
     if (filterChannelId.value && ch.id !== filterChannelId.value) return false
-    if (disabledOnly.value && !channelHasDisabled(ch)) return false
+    if (enabledOnly.value && !channelHasEnabled(ch)) return false
     if (q) {
       const haystack = channelModelStrings(ch).join('\n').toLowerCase()
       if (!haystack.includes(q)) return false

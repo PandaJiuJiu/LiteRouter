@@ -88,7 +88,7 @@ export default {
     subtitle: 'All configured models, grouped by channel',
     searchPlaceholder: 'Filter by model name',
     filterByChannel: 'Filter by channel',
-    showDisabledOnly: 'Disabled only',
+    showEnabledOnly: 'Enabled only',
     focusChannel: 'Focus this channel',
     summaryModels: '{count} models',
     summaryChannels: '{count} channels',
