@@ -293,6 +293,11 @@ export default {
       title: '界面语言',
       desc: '语言是全站统一的设置，任何登录用户修改后立即对所有人生效。',
     },
+    logRetention: {
+      title: '日志保留',
+      desc: '保留多少天的 logs 行。清理任务每小时重读这个值，所以修改最多约一小时后生效。',
+      days: '{n} 天',
+    },
   },
   users: {
     description: '系统用户：管理员可创建、重置密码或删除账号',

@@ -8,14 +8,25 @@ async fn main() {
 
     // background: keep the `logs` table bounded — relay traffic is high
     // volume and every row is an INSERT, so without this the DB grows
-    // unbounded. retention window is 7 days; sweep runs once on startup
-    // and every hour after.
+    // unbounded. retention window is read from the settings table on every
+    // sweep, so the admin's Settings-page edit takes effect on the next
+    // hourly cycle without a restart. Missing/unparseable falls back to 7
+    // days — same as the pre-setting behavior.
     {
         let pool = state.pool.clone();
         tokio::spawn(async move {
             loop {
-                match db::cleanup_old_logs(&pool, 7).await {
-                    Ok(n) if n > 0 => println!("log cleanup: removed {} rows older than 7d", n),
+                let days = literouter::db::get_setting(&pool, "log_retention_days")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|d| *d > 0)
+                    .unwrap_or(7);
+                match db::cleanup_old_logs(&pool, days).await {
+                    Ok(n) if n > 0 => {
+                        println!("log cleanup: removed {} rows older than {}d", n, days)
+                    }
                     Ok(_) => {}
                     Err(e) => eprintln!("log cleanup failed: {}", e),
                 }

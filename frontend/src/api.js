@@ -111,6 +111,13 @@ export const setDebugLogging = (enabled) =>
 // read the same value from /setup-status since they have no session yet.
 export const setLanguage = (language) =>
   api.put('/settings/language', { language }).then((r) => r.data.language)
+// How many days of logs to keep. Admin only — the backend enforces 1..=90
+// and the Settings page only offers 7/14/30/90; the API never lies about
+// the current ceiling so a future server-side bump shows up here.
+export const getLogRetention = () =>
+  api.get('/settings/log-retention-days').then((r) => r.data)
+export const setLogRetention = (days) =>
+  api.put('/settings/log-retention-days', { days }).then((r) => r.data.days)
 
 // ---------- circuit breaker ----------
 export const getBreakerConfig = () =>

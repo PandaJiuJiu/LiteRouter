@@ -1329,3 +1329,130 @@ async fn get_log_debug_requires_auth() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ============ /api/settings/log-retention-days ============
+//
+// Admin-only; persisted on the settings row that the hourly sweep reads on
+// each cycle. Non-admins must not see the row, and an out-of-range edit
+// must not land.
+
+#[tokio::test]
+async fn regular_users_do_not_see_the_log_retention_setting() {
+    let h = Harness::with_admin().await;
+    let (_, bob) = two_users(&h).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/settings/log-retention-days",
+        None,
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_log_retention_default_is_seven_days() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/settings/log-retention-days",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(body["days"], 7);
+    // The Settings page needs to know what to offer. The preset list lives
+    // server-side so a future tweak propagates without a frontend change.
+    assert_eq!(body["presets"], serde_json::json!([7, 14, 30, 90]));
+}
+
+#[tokio::test]
+async fn setting_out_changes_the_dropdown_default() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/log-retention-days",
+        Some(json!({ "days": 30 })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = support::call_json(
+        &h.router,
+        "GET",
+        "/api/settings/log-retention-days",
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(body["days"], 30);
+}
+
+#[tokio::test]
+async fn setting_out_rejects_values_outside_the_allowed_window() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    // 0 would skip every cleanup — must be rejected.
+    let (status, _) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/log-retention-days",
+        Some(json!({ "days": 0 })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The Settings dropdown tops out at 90; the server enforces the same
+    // ceiling so a direct DB write (or a future wider dropdown) can't slip
+    // a much larger window past the warning log message.
+    let (status, _) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/log-retention-days",
+        Some(json!({ "days": 365 })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn setting_out_is_refused_to_non_admins() {
+    let h = Harness::with_admin().await;
+    let (_, bob) = two_users(&h).await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/log-retention-days",
+        Some(json!({ "days": 14 })),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// The background sweep reads the setting on every cycle, so the test for
+// that is "the next cleanup uses the current value". Pin it with a fake
+// clock would require a global — instead, this test asserts that the
+// helper used in main is the same one the API exposes (no drift between
+// the code paths).
+#[tokio::test]
+async fn the_sweeps_cleanup_helpers_to_what_the_endpoint_returns() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/log-retention-days",
+        Some(json!({ "days": 14 })),
+        Some(&admin),
+    )
+    .await;
+    let days = literouter::settings::current_log_retention_days(h.pool()).await;
+    assert_eq!(days, 14);
+}

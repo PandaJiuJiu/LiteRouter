@@ -303,6 +303,11 @@ export default {
       title: 'Interface language',
       desc: 'The language is a site-wide setting — a change by any signed-in user takes effect for everyone immediately.',
     },
+    logRetention: {
+      title: 'Log retention',
+      desc: 'How many days of `logs` rows to keep. The hourly cleanup reads this on each cycle, so a change takes effect within about an hour.',
+      days: '{n} days',
+    },
   },
   users: {
     description: 'System users — admins can create accounts, reset passwords and remove users',

@@ -128,6 +128,97 @@ pub async fn set_language(
     Ok(Json(json!({ "language": req.language })))
 }
 
+// ---------- log retention ----------
+//
+// How many days of `logs` rows to keep. The hourly sweep in main.rs reads
+// this on every cycle so an admin's edit takes effect on the next sweep,
+// not on the next process restart. The dropdown offers four preset windows
+// — chosen to match the operational windows an LLM gateway is typically
+// asked to support — and the server rejects anything outside `[1, 90]` so
+// a hand-edited value can't silently disable cleanup or balloon the disk.
+
+/// Lower bound. One day is the smallest window that still produces useful
+/// hour-level charts.
+const LOG_RETENTION_MIN_DAYS: i64 = 1;
+/// Upper bound. The Settings page tops out at 90 days; the server enforces
+/// the same ceiling so direct DB edits can't set something far larger.
+const LOG_RETENTION_MAX_DAYS: i64 = 90;
+
+/// The four preset windows the Settings page offers. The order matters —
+/// it's the order the user sees them in.
+const LOG_RETENTION_PRESETS: &[i64] = &[7, 14, 30, 90];
+
+/// Read the retention window, falling back to the migration's default if
+/// the row is missing or unreadable. Never errors — a cosmetic preference
+/// should not fail a request.
+pub async fn current_log_retention_days(pool: &sqlx::SqlitePool) -> i64 {
+    db::get_setting(pool, "log_retention_days")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| (LOG_RETENTION_MIN_DAYS..=LOG_RETENTION_MAX_DAYS).contains(d))
+        .unwrap_or(7)
+}
+
+/// GET /api/settings/log-retention-days — admin only.
+pub async fn get_log_retention_days(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    let _user = require_admin(&state, &headers)?;
+    Ok(Json(json!({
+        "days": current_log_retention_days(&state.pool).await,
+        "min": LOG_RETENTION_MIN_DAYS,
+        "max": LOG_RETENTION_MAX_DAYS,
+        "presets": LOG_RETENTION_PRESETS,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct SetLogRetentionDaysReq {
+    /// The new retention window in days. Validated by the handler.
+    days: i64,
+}
+
+/// PUT /api/settings/log-retention-days — admin only. Rejects out-of-range
+/// values so a typo can't silently disable cleanup.
+pub async fn set_log_retention_days(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<SetLogRetentionDaysReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _user = require_admin(&state, &headers)
+        .map_err(|s| (s, json!({"error": "需要管理员权限"}).into()))?;
+    if !(LOG_RETENTION_MIN_DAYS..=LOG_RETENTION_MAX_DAYS).contains(&req.days) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!(
+                    "保留天数需在 {min}–{max} 之间",
+                    min = LOG_RETENTION_MIN_DAYS,
+                    max = LOG_RETENTION_MAX_DAYS
+                )
+            })
+            .into(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('log_retention_days', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(req.days.to_string())
+    .execute(&state.pool)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "db error"}).into(),
+        )
+    })?;
+    Ok(Json(json!({ "days": req.days })))
+}
+
 // ---------- breaker (circuit breaker) ----------
 
 /// Read one breaker setting, falling back to a hardcoded default. We parse

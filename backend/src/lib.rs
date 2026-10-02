@@ -100,6 +100,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/settings/breaker",
             get(settings::get_breaker_config).put(settings::set_breaker_config),
         )
+        .route(
+            "/api/settings/log-retention-days",
+            get(settings::get_log_retention_days).put(settings::set_log_retention_days),
+        )
         .route("/api/breaker/snapshot", get(breaker::http_snapshot))
         .route("/api/breaker/reset", post(breaker::http_reset))
         .route("/api/breaker/probe-now", post(breaker::http_probe_now))
