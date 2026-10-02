@@ -156,10 +156,60 @@ pub async fn insert_mapping_targets(pool: &SqlitePool, alias: &str, targets: &Va
     .last_insert_rowid()
 }
 
+/// The debug-capture directory the relay actually uses for this pool. Tests
+/// assert against files written by the relay, so they have to look in the
+/// same place — derived from the pool's file path so parallel tests don't
+/// collide.
+pub fn debug_log_dir(pool: &sqlx::SqlitePool) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("literouter-debug-logs-{}", std::process::id()))
+        .join(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .get_filename()
+                .to_string_lossy()
+                .replace('/', "_"),
+        )
+}
+
+/// Point the relay's debug-capture directory at a temp dir keyed by the test's
+/// pool, so parallel tests don't overwrite each other's captures. The relay's
+/// capture directory is keyed by the pool's underlying SQLite file path,
+/// which `TestDb` makes unique per test — that's how the redirect reaches a
+/// stable, race-free path.
+pub fn redirect_debug_logs(pool: &sqlx::SqlitePool) {
+    let base = std::env::temp_dir()
+        .join(format!("literouter-debug-logs-{}", std::process::id()))
+        .join(
+            pool.connect_options()
+                .as_ref()
+                .clone()
+                .get_filename()
+                .to_string_lossy()
+                .replace('/', "_"),
+        );
+    literouter::proxy::set_debug_log_dir_for(pool, base.to_str().unwrap());
+}
+
+/// A harness with debug logging pre-enabled for the relays it builds. Use
+/// when a test needs to assert against the capture of a *successful* request
+/// — failures capture unconditionally and don't need it.
+pub async fn harness_with_debug(pool: SqlitePool) -> (Router, Arc<literouter::breaker::Breaker>) {
+    redirect_debug_logs(&pool);
+    let state = build_state(pool).await;
+    state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let breaker = state.breaker.clone();
+    (build_router(state), breaker)
+}
+
 /// Mount the full API over a database, exactly as `main` would. The
 /// breaker comes back too so tests can pre-trip it without first having to
 /// drive N real failures through the relay.
 pub async fn mount(pool: SqlitePool) -> (Router, Arc<literouter::breaker::Breaker>) {
+    redirect_debug_logs(&pool);
     let state = build_state(pool).await;
     let breaker = state.breaker.clone();
     (build_router(state), breaker)
@@ -171,27 +221,39 @@ pub struct Harness {
     pub router: Router,
     /// The same `Arc<Breaker>` the mounted router is using.
     pub breaker: Arc<literouter::breaker::Breaker>,
+    /// `Some` if the harness was built with debug logging pre-enabled; tests
+    /// that need to assert against a successful request's capture use this
+    /// to flip the per-state switch without affecting other harnesses.
+    pub state: Arc<literouter::state::AppState>,
 }
 
 impl Harness {
     pub async fn new() -> Self {
         let db = TestDb::new().await;
-        let (router, breaker) = mount(db.pool.clone()).await;
+        redirect_debug_logs(&db.pool);
+        let state = build_state(db.pool.clone()).await;
+        let breaker = state.breaker.clone();
+        let router = build_router(state.clone());
         Self {
             db,
             router,
             breaker,
+            state,
         }
     }
 
     /// A harness that already has an `admin` user.
     pub async fn with_admin() -> Self {
         let db = TestDb::with_admin().await;
-        let (router, breaker) = mount(db.pool.clone()).await;
+        redirect_debug_logs(&db.pool);
+        let state = build_state(db.pool.clone()).await;
+        let breaker = state.breaker.clone();
+        let router = build_router(state.clone());
         Self {
             db,
             router,
             breaker,
+            state,
         }
     }
 

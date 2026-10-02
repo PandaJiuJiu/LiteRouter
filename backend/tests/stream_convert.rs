@@ -550,3 +550,31 @@ fn content_block_stop_and_ping_produce_nothing() {
         .on_data(&json!({"type":"message_stop"}).to_string())
         .is_empty());
 }
+
+#[test]
+fn finish_opens_a_message_when_no_payload_was_received() {
+    // The bug we're fixing: an upstream that opened the stream and then
+    // closed without ever sending a `data:` chunk left `started` false.
+    // The old `finish()` ignored that and emitted `message_delta` +
+    // `message_stop` with no `message_start` — malformed.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let events = c.finish();
+    let joined = events.concat();
+    assert!(
+        joined.contains("\"type\":\"message_start\""),
+        "finish() must open the message: {joined}"
+    );
+    // The closing envelope is also still produced.
+    assert!(joined.contains("\"type\":\"message_stop\""));
+}
+
+#[test]
+fn finish_does_not_re_open_a_message_that_was_already_opened() {
+    let mut c = OpenAiToAnthropicStream::new("m");
+    // Open the stream via a real payload, then close.
+    let mut events = c.on_data(&json!({"id":"c1","choices":[{"delta":{}}]}).to_string());
+    events.extend(c.finish());
+    let joined = events.concat();
+    // Exactly one message_start.
+    assert_eq!(joined.matches("\"type\":\"message_start\"").count(), 1);
+}

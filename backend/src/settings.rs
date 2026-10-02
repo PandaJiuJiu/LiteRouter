@@ -51,7 +51,7 @@ pub async fn set_debug_logging(
     .execute(&state.pool)
     .await;
 
-    proxy::set_debug_logging(req.enabled);
+    proxy::set_debug_logging(&state, req.enabled);
 
     Ok(Json(json!({ "enabled": req.enabled })))
 }

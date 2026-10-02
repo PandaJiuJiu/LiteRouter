@@ -35,10 +35,13 @@ pub async fn build_state(pool: SqlitePool) -> Arc<AppState> {
         .flatten()
         .map(|v| v == "1")
         .unwrap_or(false);
-    proxy::set_debug_logging(debug_logging);
     let breaker_cfg = settings::load_breaker_config(&pool).await;
     let breaker = Arc::new(breaker::Breaker::new(breaker_cfg));
-    Arc::new(AppState::new(pool, debug_logging, breaker))
+    let state = Arc::new(AppState::new(pool, breaker));
+    state
+        .debug_logging
+        .store(debug_logging, std::sync::atomic::Ordering::Relaxed);
+    state
 }
 
 /// The full API surface. Deliberately free of I/O beyond the state it is
@@ -81,7 +84,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::put(admin::toggle_token).delete(admin::delete_token),
         )
         .route("/api/logs", get(admin::list_logs))
+        .route("/api/logs/filter-options", get(admin::log_filter_options))
         .route("/api/logs/:id", get(admin::get_log))
+        .route("/api/logs/:id/debug", get(admin::get_log_debug))
         .route("/api/usage", get(admin::usage))
         .route(
             "/api/settings/debug-logging",

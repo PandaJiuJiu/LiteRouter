@@ -291,16 +291,132 @@ async fn pinned_channel(state: &AppState, name: &str, protocol: &str) -> Option<
     })
 }
 
-/// Directory where debug request/response bodies are stored.
+/// Default directory where captured response bodies are stored:
 /// `data/debug_logs/{log_id}/` — created on first write for each log_id.
 const DEBUG_LOG_DIR: &str = "data/debug_logs";
 
-/// Write the upstream request body and response body to disk when debug
-/// logging is enabled. Errors are silently ignored — debug logging is a
-/// diagnostic aid, never a reason to fail a request.
-/// Files: `data/debug_logs/{log_id}/req.json` and `resp.json`.
-async fn write_debug_log(log_id: i64, req_body: &[u8], resp_body: &[u8]) {
-    let dir = format!("{DEBUG_LOG_DIR}/{log_id}");
+/// Per-pool debug directory overrides. Indexed by the SQLite file path the
+/// pool is using, which is unique per `TestDb` and therefore per test.
+/// Without it, parallel tests would race: each pool starts at row id 1 and both
+/// would write to the same `dir/1/resp.json`. The map is keyed by the
+/// database path (rather than the pool pointer) so two pools sharing a
+/// database — for instance the prod app and a migration probe — share a
+/// capture directory, which is the right semantics.
+static DEBUG_LOG_DIR_OVERRIDE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Set the per-pool debug log directory. Test fixture only.
+pub fn set_debug_log_dir_for(pool: &sqlx::SqlitePool, dir: &str) {
+    let key = pool_key(pool);
+    DEBUG_LOG_DIR_OVERRIDE
+        .lock()
+        .unwrap()
+        .insert(key, dir.to_string());
+}
+
+fn debug_log_dir_for(pool: &sqlx::SqlitePool) -> String {
+    let key = pool_key(pool);
+    DEBUG_LOG_DIR_OVERRIDE
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(|| DEBUG_LOG_DIR.to_string())
+}
+
+/// Stable identifier for the SQLite file backing this pool. Two pools from
+/// the same `TestDb` would otherwise share captures; tests that need
+/// isolation get isolation via the SQLite path, which `TestDb` makes unique.
+fn pool_key(pool: &sqlx::SqlitePool) -> String {
+    // `connect_options` returns `Arc<SqliteConnectOptions>`; `get_filename`
+    // takes `self` by value so we clone the inner options to read the path.
+    pool.connect_options()
+        .as_ref()
+        .clone()
+        .get_filename()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Upper bound on a captured response body. A failing upstream can send
+/// anything — an HTML error page, a multi-megabyte dump — and the log detail
+/// page has no use for more than the first chunk of it. Past the cap we stop
+/// accumulating and mark the capture truncated so the reader knows they're
+/// looking at a fragment.
+pub const DEBUG_BODY_MAX: usize = 256 * 1024;
+
+#[derive(Default)]
+struct CaptureInner {
+    bytes: Vec<u8>,
+    /// Total bytes offered to `push`, including the ones dropped past the
+    /// cap — the log page shows "of N bytes" so a truncated capture is
+    /// visibly incomplete rather than silently short.
+    seen: usize,
+    truncated: bool,
+}
+
+/// A handle on the upstream response body, filled as it streams past and read
+/// once the request settles. Cloning shares the buffer, so the SSE pump and
+/// the log-writing task can each hold one.
+///
+/// Deliberately narrow: it captures the **upstream** bytes and nothing else.
+/// The request body is never offered to it — see `write_debug_log`.
+#[derive(Clone, Default)]
+pub struct DebugCapture(Arc<Mutex<CaptureInner>>);
+
+impl DebugCapture {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a chunk. Cheap and non-blocking (a `std::sync::Mutex`, never
+    /// held across an await) so it's safe to call from inside the unfold
+    /// closure driving a live stream.
+    pub fn push(&self, chunk: &[u8]) {
+        let mut inner = self.0.lock().unwrap();
+        inner.seen += chunk.len();
+        let room = DEBUG_BODY_MAX.saturating_sub(inner.bytes.len());
+        if room == 0 {
+            inner.truncated = true;
+            return;
+        }
+        let take = chunk.len().min(room);
+        inner.bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            inner.truncated = true;
+        }
+    }
+
+    /// `(captured bytes, total bytes seen, truncated)`.
+    pub fn snapshot(&self) -> (Vec<u8>, usize, bool) {
+        let inner = self.0.lock().unwrap();
+        (inner.bytes.clone(), inner.seen, inner.truncated)
+    }
+}
+
+/// One captured body plus the metadata `resp.meta.json` records alongside it.
+pub struct DebugCaptureFile {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// Write the captured **response** body to disk.
+///
+/// The request body is deliberately not written. Migration
+/// `0014_log_details.sql` records the stance — prompts and replies are the
+/// user's private data, and diagnosing a relay fault needs "what did the
+/// upstream actually send", not what we sent it. Not writing it is the
+/// strongest form of that: there is no code path that could leak it.
+///
+/// Files: `data/debug_logs/{log_id}/resp.json` and `resp.meta.json`.
+/// Errors are swallowed — a diagnostic aid never fails a request.
+pub async fn write_debug_log(pool: &sqlx::SqlitePool, log_id: i64, capture: &DebugCapture) {
+    let (bytes, seen, truncated) = capture.snapshot();
+    if bytes.is_empty() {
+        return;
+    }
+    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         eprintln!("debug_log: create_dir {} failed: {}", dir, e);
         return;
@@ -311,15 +427,45 @@ async fn write_debug_log(log_id: i64, req_body: &[u8], resp_body: &[u8]) {
             eprintln!("debug_log: write {} failed: {}", path, e);
         }
     }
-    write(&dir, "req.json", req_body).await;
-    write(&dir, "resp.json", resp_body).await;
+    write(&dir, "resp.json", &bytes).await;
+    let meta = json!({
+        "bytes": seen,
+        "captured": bytes.len(),
+        "truncated": truncated,
+        "max_bytes": DEBUG_BODY_MAX,
+        "at": now(),
+    });
+    write(
+        &dir,
+        "resp.meta.json",
+        serde_json::to_vec_pretty(&meta)
+            .unwrap_or_default()
+            .as_slice(),
+    )
+    .await;
+}
+
+/// Read back a previously captured body. `None` when nothing was captured
+/// for this log id — which is the normal case, since we only write on failure
+/// or when debug logging is on.
+pub async fn read_debug_log(pool: &sqlx::SqlitePool, log_id: i64) -> Option<DebugCaptureFile> {
+    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
+    let bytes = tokio::fs::read(format!("{dir}/resp.json")).await.ok()?;
+    let truncated = match tokio::fs::read(format!("{dir}/resp.meta.json")).await {
+        Ok(meta) => serde_json::from_slice::<Value>(&meta)
+            .ok()
+            .and_then(|v| v.get("truncated").and_then(|b| b.as_bool()))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    Some(DebugCaptureFile { bytes, truncated })
 }
 
 /// Delete the debug log directory for a given log_id. Idempotent —
 /// directory may not exist. Called by `db::cleanup_old_logs` so the files
 /// under a purged `logs` row go with it.
-pub async fn delete_debug_log(log_id: i64) {
-    let dir = format!("{DEBUG_LOG_DIR}/{log_id}");
+pub async fn delete_debug_log(pool: &sqlx::SqlitePool, log_id: i64) {
+    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
     if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
         // ENOENT is fine — already gone
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -395,14 +541,6 @@ impl Attempt {
 
     fn with_usage(mut self, usage: Option<convert::Usage>) -> Self {
         self.usage = usage;
-        self
-    }
-
-    fn with_error(mut self, error: String) -> Self {
-        self.error = error;
-        // The attempt failed — it was surfaced as a 502 to the client, so it
-        // is not the "winning" hop, even though it was the last one tried.
-        self.ok = false;
         self
     }
 
@@ -595,14 +733,15 @@ fn build_request(
     req.header("Content-Type", "application/json")
 }
 
-/// Outcome of one upstream attempt, classified into three buckets so the
+/// Outcome of one upstream attempt, classified into four buckets so the
 /// caller can dispatch without re-checking status codes. The relay never
-/// returns non-2xx to the client — every `Http` / `Transport` outcome is
-/// a fallback signal.
+/// returns a failure to the client — every `Http` / `InvalidBody` /
+/// `Transport` outcome is a fallback signal.
 enum UpstreamOutcome {
-    /// 2xx — the upstream call succeeded; pass `resp` to
-    /// `respond_from_upstream` to build the client response.
-    Ok(reqwest::Response),
+    /// 2xx with a body of the expected shape. `Buffered` for non-streaming
+    /// (already read and validated), `Live` for streaming (handed straight to
+    /// the SSE pump, body still unread).
+    Ok(UpstreamBody),
     /// Non-2xx with a parsed HTTP status. `retry_after_secs` is the
     /// upstream's `Retry-After` header parsed as integer seconds (only
     /// the form defined by RFC 7231 §7.1.3 is supported; HTTP-date form
@@ -615,21 +754,87 @@ enum UpstreamOutcome {
         /// was empty or unreadable.
         detail: Option<String>,
     },
+    /// 2xx whose body is **not** the response the client asked for — the
+    /// relay-station failure mode where an upstream answers `200
+    /// {"error": {...}}` because its *own* backend is down. Status alone
+    /// cannot tell us this apart from success, so the shape has to.
+    InvalidBody {
+        status: u16,
+        /// Fixed wording, never a quote of the upstream body: this string
+        /// ends up in the `logs` row and in the error the client sees. The
+        /// body itself goes to the debug capture instead.
+        detail: &'static str,
+        body: DebugCapture,
+    },
     /// Connection / DNS / TLS / timeout failure — no HTTP status received.
     Transport(String),
 }
 
-/// Build and dispatch one upstream request, classify the outcome. The
-/// response body is **not** consumed here; for `Ok` the caller streams
-/// or reads it. For `Http` it is drained into a short [`read_error_detail`]
-/// note (never forwarded anywhere) and for `Transport` there is nothing to
-/// read, because the next target gets a fresh attempt either way.
+/// A 2xx upstream response, either already read into memory or still live.
+enum UpstreamBody {
+    /// Non-streaming: body read and shape-validated by `try_upstream`.
+    Buffered {
+        status: StatusCode,
+        content_type: Option<axum::http::HeaderValue>,
+        bytes: Bytes,
+    },
+    /// Streaming: untouched, so the SSE pump can forward it without buffering.
+    Live(reqwest::Response),
+}
+
+/// Does this JSON body look like a real response in `protocol`?
+///
+/// This is the check that catches a relay station answering `200` with an
+/// error envelope. It is intentionally structural — one required field — and
+/// not a full schema check: we only need to separate "a response the client
+/// can parse" from "an error page dressed as a 200", and a stricter check
+/// would start rejecting legitimate variants as providers add fields.
+fn body_matches_protocol(bytes: &[u8], protocol: &str) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    if protocol == "anthropic" {
+        v.get("type").and_then(|t| t.as_str()) == Some("message")
+    } else {
+        v.get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .map(|c| c.get("message").is_some())
+            .unwrap_or(false)
+    }
+}
+
+/// The log/error wording for a 2xx body that failed [`body_matches_protocol`].
+fn invalid_body_detail(protocol: &str) -> &'static str {
+    if protocol == "anthropic" {
+        "HTTP 200 but body is not an Anthropic message"
+    } else {
+        "HTTP 200 but body is not an OpenAI completion"
+    }
+}
+
+/// Build and dispatch one upstream request, classify the outcome.
+///
+/// Non-streaming 2xx responses are read into a [`DebugCapture`] and
+/// shape-validated before being called a success — without this, a relay
+/// station answering `200 {"error": ...}` short-circuits the candidate loop
+/// and the client gets a body it can't parse, with no failover attempted.
+///
+/// Streaming 2xx can't be buffered (it's the response, live), so it gets the
+/// weaker check instead: the `Content-Type` gate in [`is_json_content_type`].
+/// The body there is one the client is already parsing incrementally, so the
+/// damage is much smaller than a bad buffered body.
+///
+/// For `Http` the body is drained into a short [`read_error_detail`] note
+/// (never forwarded anywhere) and for `Transport` there is nothing to read,
+/// because the next target gets a fresh attempt either way.
 async fn try_upstream(
     state: &AppState,
     cand: &Candidate,
     upstream_protocol: &str,
     body: Vec<u8>,
     headers: &HeaderMap,
+    is_streaming: bool,
 ) -> UpstreamOutcome {
     let req = build_request(
         state,
@@ -643,22 +848,86 @@ async fn try_upstream(
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
-                UpstreamOutcome::Ok(resp)
-            } else {
-                let retry_after_secs = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-                UpstreamOutcome::Http {
-                    status,
-                    retry_after_secs,
-                    detail: read_error_detail(resp).await,
+                if is_streaming {
+                    return upstream_2xx_streaming(resp, status);
                 }
+                return upstream_2xx_buffered(resp, status, upstream_protocol).await;
+            }
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            UpstreamOutcome::Http {
+                status,
+                retry_after_secs,
+                detail: read_error_detail(resp).await,
             }
         }
         Err(e) => UpstreamOutcome::Transport(describe_transport_error(&e)),
     }
+}
+
+/// A 2xx on a streaming request. We can't inspect the body, so the only
+/// usable signal is the header: a JSON content-type on a stream request
+/// means the upstream answered with a complete document instead of SSE, which
+/// is never what was asked for.
+fn upstream_2xx_streaming(resp: reqwest::Response, status: u16) -> UpstreamOutcome {
+    let is_json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(is_json_content_type)
+        .unwrap_or(false);
+    if is_json {
+        return UpstreamOutcome::InvalidBody {
+            status,
+            detail: "HTTP 200 but a streaming request got a JSON response, not an event stream",
+            // Nothing to capture: the body is still owned by `resp`, which is
+            // dropped here without being read.
+            body: DebugCapture::new(),
+        };
+    }
+    UpstreamOutcome::Ok(UpstreamBody::Live(resp))
+}
+
+/// A 2xx on a non-streaming request: read it, then check it's actually a
+/// response in the protocol we asked for.
+async fn upstream_2xx_buffered(
+    resp: reqwest::Response,
+    status: u16,
+    upstream_protocol: &str,
+) -> UpstreamOutcome {
+    let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+    let capture = DebugCapture::new();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            // A body that won't finish arriving is a transport failure wearing
+            // a 200 status line; classify it as one.
+            return UpstreamOutcome::Transport(format!("upstream body read failed: {e}"));
+        }
+    };
+    capture.push(&bytes);
+    if !body_matches_protocol(&bytes, upstream_protocol) {
+        return UpstreamOutcome::InvalidBody {
+            status,
+            detail: invalid_body_detail(upstream_protocol),
+            body: capture,
+        };
+    }
+    UpstreamOutcome::Ok(UpstreamBody::Buffered {
+        status: StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+        content_type,
+        bytes,
+    })
+}
+
+/// Does this content-type value denote a JSON document? Tolerates the
+/// `application/json; charset=utf-8` form and `application/problem+json`.
+fn is_json_content_type(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("application/json") || value.ends_with("+json")
 }
 
 /// Turn a reqwest failure into a one-line cause for the breaker panel.
@@ -812,42 +1081,62 @@ async fn record_outcome_in_breaker(
 /// `LogEntry` is already fully owned, so it moves into the spawned task as-is.
 struct StreamLog {
     pool: sqlx::SqlitePool,
+    /// Shared with the relay that owns this stream, so the Drop-driven
+    /// capture writes the live (not frozen) debug flag value.
+    state: Arc<AppState>,
     entry: LogEntry,
-    /// The upstream request body, written to disk when debug logging is on.
-    req_body: Bytes,
 }
 
 impl StreamLog {
-    /// Finalize the log row and (if `state.debug_logging`) write the request
-    /// and response bodies to disk. Usage and the accumulated response bytes are
-    /// supplied by the caller (Drop impl of LogOnEnd).
-    async fn spawn_inline(mut self, usage: Option<convert::Usage>, resp_buf: Arc<Mutex<Vec<u8>>>) {
+    /// Finalize the log row and write the captured upstream bytes to disk
+    /// when there's a reason to (`should_capture`). Usage is supplied by the
+    /// caller (Drop impl of LogOnEnd).
+    async fn spawn_inline(mut self, usage: Option<convert::Usage>, capture: DebugCapture) {
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
         }
+        let ok = self.entry.winner.as_ref().map(|w| w.ok).unwrap_or(false);
         let log_id = log_request(&self.pool, &self.entry).await;
-        if state_debug_logging() {
+        if should_capture(&self.state, ok) {
             if let Some(id) = log_id {
-                let req = self.req_body.to_vec();
-                let resp = resp_buf.lock().unwrap().clone();
-                write_debug_log(id, &req, &resp).await;
+                write_debug_log(&self.pool, id, &capture).await;
             }
         }
     }
 }
 
-/// Whether debug logging is globally enabled. Stored in a static so we avoid a
-/// DB lookup on every request; updated atomically when an admin toggles it.
-static DEBUG_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Set the global debug_logging flag. Called at startup and whenever an admin
-/// toggles the switch.
-pub fn set_debug_logging(v: bool) {
-    DEBUG_LOGGING.store(v, std::sync::atomic::Ordering::Relaxed);
+/// Whether debug logging is currently enabled. Read on every request so
+/// the runtime toggle takes effect without a restart — the bug the static
+/// version had was it being snapshotted into AppState at boot. The
+/// `set_debug_logging` helper below keeps the public API stable for callers
+/// that only have a bool and the AppState alongside it.
+fn state_debug_logging(state: &AppState) -> bool {
+    state
+        .debug_logging
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn state_debug_logging() -> bool {
-    DEBUG_LOGGING.load(std::sync::atomic::Ordering::Relaxed)
+/// Do we need to write a capture file for a request that ended this way?
+///
+/// Always for failures. That's the whole point: the switch is a *diagnostic
+/// for healthy traffic*, but a request that failed is exactly the one whose
+/// upstream body nobody can reconstruct later, and the admin looking at a red
+/// row in the log list shouldn't have to wonder whether the switch happened
+/// to be on when it happened. Failures are rare enough that the disk cost is
+/// bounded by the error rate rather than by traffic.
+///
+/// The switch still means "capture everything", successes included.
+fn should_capture(state: &AppState, ok: bool) -> bool {
+    !ok || state_debug_logging(state)
+}
+
+/// Set the per-state debug_logging flag. Called at startup and by the admin
+/// settings handler; the change is immediate because every relay call reads
+/// the live value.
+pub fn set_debug_logging(state: &AppState, v: bool) {
+    state
+        .debug_logging
+        .store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Wraps a byte stream and spawns a log task when the wrapper is dropped.
@@ -871,9 +1160,9 @@ struct LogOnEnd<S> {
     /// If set, overrides `usage` when Drop fires. Used for the converted
     /// path so the converter's own usage counter is the source of truth.
     converter_usage: Option<Arc<Mutex<Box<dyn SseConverter>>>>,
-    /// Full response body accumulated during streaming. Read at Drop and
-    /// forwarded to `StreamLog` for the debug log file.
-    resp_buf: Arc<Mutex<Vec<u8>>>,
+    /// The upstream response body, accumulated as it streams past. Read at
+    /// Drop and forwarded to `StreamLog` for the debug capture file.
+    capture: DebugCapture,
 }
 
 impl<S> LogOnEnd<S> {
@@ -881,28 +1170,28 @@ impl<S> LogOnEnd<S> {
         inner: S,
         log: StreamLog,
         usage: Arc<Mutex<Option<convert::Usage>>>,
-        resp_buf: Arc<Mutex<Vec<u8>>>,
+        capture: DebugCapture,
     ) -> Self {
         Self {
             inner,
             log: Some(log),
             usage,
             converter_usage: None,
-            resp_buf,
+            capture,
         }
     }
     fn wrap_with_converter(
         inner: S,
         log: StreamLog,
         converter: Arc<Mutex<Box<dyn SseConverter>>>,
-        resp_buf: Arc<Mutex<Vec<u8>>>,
+        capture: DebugCapture,
     ) -> Self {
         Self {
             inner,
             log: Some(log),
             usage: Arc::new(Mutex::new(None)),
             converter_usage: Some(converter),
-            resp_buf,
+            capture,
         }
     }
 }
@@ -936,9 +1225,9 @@ impl<S> Drop for LogOnEnd<S> {
             } else {
                 *self.usage.lock().unwrap()
             };
-            let resp_buf = self.resp_buf.clone();
+            let capture = self.capture.clone();
             tokio::spawn(async move {
-                log.spawn_inline(usage, resp_buf).await;
+                log.spawn_inline(usage, capture).await;
             });
         }
     }
@@ -959,21 +1248,23 @@ fn passthrough_stream(
     status: StatusCode,
     content_type: Option<axum::http::HeaderValue>,
     log: StreamLog,
-    resp_buf: Arc<Mutex<Vec<u8>>>,
+    capture: DebugCapture,
 ) -> Response {
     let usage: Arc<Mutex<Option<convert::Usage>>> = Arc::new(Mutex::new(None));
     let usage_for_drop = Arc::clone(&usage);
     let body_stream = stream::unfold(
-        (resp, Vec::<u8>::new(), Arc::clone(&usage)),
+        (resp, Vec::<u8>::new(), Arc::clone(&usage), capture.clone()),
         |mut st| async move {
-            let (resp, buf, usage_ref) = (&mut st.0, &mut st.1, &mut st.2);
+            let (resp, buf, usage_ref, capture) = (&mut st.0, &mut st.1, &mut st.2, &st.3);
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
-                    // Copy the bytes into buf for side-effect usage
-                    // extraction, then forward the original chunk to the
-                    // client untouched. Copying (not moving) lets us
-                    // hand `bytes` straight to axum while keeping the
-                    // parse buffer authoritative for line scanning.
+                    // Capture the raw upstream bytes for the debug log, then
+                    // copy into buf for side-effect usage extraction before
+                    // forwarding the original chunk to the client untouched.
+                    // Copying (not moving) lets us hand `bytes` straight to
+                    // axum while keeping the parse buffer authoritative for
+                    // line scanning.
+                    capture.push(&bytes);
                     buf.extend_from_slice(&bytes);
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                         let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -1003,7 +1294,7 @@ fn passthrough_stream(
             body_stream,
             log,
             usage_for_drop,
-            resp_buf,
+            capture,
         )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
 }
@@ -1018,6 +1309,7 @@ fn converted_stream(
     resp: reqwest::Response,
     conv: Box<dyn SseConverter>,
     log: StreamLog,
+    capture: DebugCapture,
 ) -> Response {
     let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
     let mut response = Response::builder().status(StatusCode::OK);
@@ -1027,9 +1319,16 @@ fn converted_stream(
             "text/event-stream".parse().unwrap(),
         );
     }
-    let state = (resp, String::new(), Arc::clone(&conv), false);
+    let state = (
+        resp,
+        String::new(),
+        Arc::clone(&conv),
+        false,
+        capture.clone(),
+    );
     let body_stream = stream::unfold(state, |mut st| async move {
         let (resp, buf, conv_ref, done) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
+        let capture = &st.4;
         loop {
             if *done {
                 return None;
@@ -1060,6 +1359,11 @@ fn converted_stream(
             }
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
+                    // Capture what the *upstream* sent, not the translated
+                    // events — the same thing both stream paths record, so
+                    // `resp.json` always answers "what did the provider
+                    // actually reply" regardless of translation.
+                    capture.push(&bytes);
                     buf.push_str(&String::from_utf8_lossy(&bytes));
                 }
                 Ok(None) => {
@@ -1083,9 +1387,25 @@ fn converted_stream(
             body_stream,
             log,
             conv,
-            Arc::new(Mutex::new(Vec::new())),
+            capture,
         )))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
+}
+
+/// Everything about the client request that stays constant across candidates.
+/// Threading these as one struct keeps the signatures at a sane arity and
+/// makes it obvious which values the failover loop may not vary per hop.
+struct RelayCtx<'a> {
+    state: &'a AppState,
+    state_arc: Arc<AppState>,
+    token_name: &'a str,
+    /// The model the client asked for.
+    request_model: &'a str,
+    /// The protocol the client speaks — not necessarily the upstream's.
+    protocol: &'a str,
+    streaming: bool,
+    start: Instant,
+    client_info: ClientInfo,
 }
 
 /// Convert an upstream response into the client response, returning the
@@ -1093,154 +1413,114 @@ fn converted_stream(
 /// of this request. This function does not log — logging is the caller's job,
 /// because only the caller knows about the hops that failed before this one.
 ///
-/// **Only called on 2xx** — the main loop falls through to the next target
-/// on every non-2xx, so the streaming and conversion paths here can assume
-/// success.
+/// **Only called on a validated 2xx** — the main loop falls through to the
+/// next target on every other outcome, so the streaming and conversion paths
+/// here can assume success.
 ///
-/// Streaming requests pass through unchanged; non-streaming responses are
-/// buffered so we can extract usage. `convert` says which protocol
-/// translation this hop needs. `start` is when the relay started, so we can
-/// record how long the upstream took to first respond (TTFB); on stream replay
-/// it's frozen at the transition.
-#[allow(clippy::too_many_arguments)]
+/// Streaming requests pass through unchanged; non-streaming responses arrive
+/// already buffered. `model` is the post-mapping model sent upstream. `start`
+/// is when the relay started, so we can record how long the upstream took to
+/// first respond (TTFB); on stream replay it's frozen at the transition.
 async fn respond_from_upstream(
-    state: &AppState,
-    token_name: &str,
-    request_model: &str,
+    ctx: &RelayCtx<'_>,
     model: &str,
     cand: &Candidate,
-    resp: reqwest::Response,
-    is_streaming: bool,
-    protocol: &str,
-    streaming: bool,
-    start: Instant,
+    body: UpstreamBody,
     attempts: Vec<Attempt>,
-    // The body that was actually sent upstream (post-mappings rewrite).
-    req_body: Bytes,
-    client_info: ClientInfo,
 ) -> (Response, Attempt) {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let state = ctx.state;
     // Latency up to "we got the upstream's response headers". For streams
     // this is the TTFB, which is what people usually want; for buffered
     // responses this is the whole round-trip.
-    let latency_ms = start.elapsed().as_millis() as i64;
-    // This hop ends the request either way — the client gets its response
-    // here, whether it succeeded or was a non-retriable error.
-    let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true);
-
-    if !is_streaming {
-        let content_type = resp.headers().get("content-type").cloned();
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                let attempt = attempt.with_error(format!("upstream body read failed: {}", e));
-                let entry = LogEntry {
-                    token_name: token_name.to_string(),
-                    request_model: request_model.to_string(),
-                    protocol: protocol.to_string(),
-                    streaming,
-                    winner: Some(attempt.clone()),
-                    attempts: push(attempts, attempt.clone()),
-                    client_ip: client_info.ip.clone(),
-                    user_agent: client_info.user_agent.clone(),
-                };
-                let _ = log_request(&state.pool, &entry).await;
-                return (
-                    error_response(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("upstream body read failed: {}", e),
-                        None,
-                    ),
-                    attempt,
-                );
-            }
-        };
-        let attempt = attempt.with_usage(parse_usage(&bytes));
-        // translate the buffered body when converting
-        let out_bytes = if cand.convert != ConvertMode::None {
-            match serde_json::from_slice::<Value>(&bytes) {
-                Ok(v) => {
-                    let converted = if status.is_success() {
-                        match cand.convert {
-                            ConvertMode::ToOpenAI => convert::openai_resp_to_anthropic(&v, model),
-                            ConvertMode::ToAnthropic => {
-                                convert::anthropic_resp_to_openai(&v, model)
-                            }
-                            ConvertMode::None => unreachable!(),
-                        }
-                    } else {
-                        match cand.convert {
-                            ConvertMode::ToOpenAI => convert::openai_err_to_anthropic(&v),
-                            ConvertMode::ToAnthropic => convert::anthropic_err_to_openai(&v),
-                            ConvertMode::None => unreachable!(),
-                        }
-                    };
-                    serde_json::to_vec(&converted).unwrap_or_else(|_| bytes.to_vec())
-                }
-                Err(_) => bytes.to_vec(), // not JSON — pass through untouched
-            }
-        } else {
-            bytes.to_vec()
-        };
-        let entry = LogEntry {
-            token_name: token_name.to_string(),
-            request_model: request_model.to_string(),
-            protocol: protocol.to_string(),
-            streaming,
-            winner: Some(attempt.clone()),
-            attempts: push(attempts, attempt.clone()),
-            client_ip: client_info.ip.clone(),
-            user_agent: client_info.user_agent.clone(),
-        };
-        let log_id = log_request(&state.pool, &entry).await;
-        if state.debug_logging {
-            let _ = write_debug_log(log_id.unwrap_or(0), &req_body, &out_bytes).await;
-        }
-        let mut builder = Response::builder().status(status);
-        if let Some(ct) = content_type {
-            if let Some(h) = builder.headers_mut() {
-                h.insert(axum::http::header::CONTENT_TYPE, ct);
-            }
-        }
-        let resp = builder
-            .body(Body::from(out_bytes))
-            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
-        return (resp, attempt);
-    }
-
-    // Streaming: forward to the client. The stream wrapper owns the log row
-    // and writes it when the body stream is dropped (i.e., when the upstream
-    // ends, the client finishes, or the client disconnects). It carries the
-    // preceding failed hops so the detail page can show the whole chain.
-    let resp_buf = Arc::new(Mutex::new(Vec::new()));
-    let log = StreamLog {
-        pool: state.pool.clone(),
-        entry: LogEntry {
-            token_name: token_name.to_string(),
-            request_model: request_model.to_string(),
-            protocol: protocol.to_string(),
-            streaming,
-            winner: Some(attempt.clone()),
-            attempts: push(attempts, attempt.clone()),
-            client_ip: client_info.ip.clone(),
-            user_agent: client_info.user_agent.clone(),
-        },
-        req_body,
+    let latency_ms = ctx.start.elapsed().as_millis() as i64;
+    let entry_of = |winner: Attempt, attempts: Vec<Attempt>| LogEntry {
+        token_name: ctx.token_name.to_string(),
+        request_model: ctx.request_model.to_string(),
+        protocol: ctx.protocol.to_string(),
+        streaming: ctx.streaming,
+        winner: Some(winner.clone()),
+        attempts: push(attempts, winner),
+        client_ip: ctx.client_info.ip.clone(),
+        user_agent: ctx.client_info.user_agent.clone(),
     };
-    let resp = match cand.convert {
-        ConvertMode::None => {
+
+    let (status, content_type, bytes) = match body {
+        UpstreamBody::Buffered {
+            status,
+            content_type,
+            bytes,
+        } => (status, content_type, bytes),
+        UpstreamBody::Live(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = resp.headers().get("content-type").cloned();
-            passthrough_stream(resp, status, content_type, log, resp_buf)
-        }
-        ConvertMode::ToOpenAI => {
-            let conv = convert::OpenAiToAnthropicStream::new(model);
-            converted_stream(resp, Box::new(conv), log)
-        }
-        ConvertMode::ToAnthropic => {
-            let conv = convert::AnthropicToOpenAiStream::new(model);
-            converted_stream(resp, Box::new(conv), log)
+            // This hop ends the request either way — the client gets its
+            // response here, whether it succeeded or not.
+            let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true);
+            let entry = entry_of(attempt.clone(), attempts);
+            let log = StreamLog {
+                pool: state.pool.clone(),
+                state: ctx.state_arc.clone(),
+                entry,
+            };
+            let capture = DebugCapture::new();
+            let response = match cand.convert {
+                ConvertMode::None => {
+                    passthrough_stream(resp, status, content_type, log, capture.clone())
+                }
+                ConvertMode::ToOpenAI => {
+                    let conv = convert::OpenAiToAnthropicStream::new(model);
+                    converted_stream(resp, Box::new(conv), log, capture.clone())
+                }
+                ConvertMode::ToAnthropic => {
+                    let conv = convert::AnthropicToOpenAiStream::new(model);
+                    converted_stream(resp, Box::new(conv), log, capture.clone())
+                }
+            };
+            return (response, attempt);
         }
     };
+
+    let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true)
+        .with_usage(parse_usage(&bytes));
+    // Translate the buffered body when this hop crosses protocols. The body
+    // has already been validated against the *upstream's* protocol, so a
+    // parse failure here is only reachable if a provider returns something
+    // unparseable — pass the bytes through rather than inventing an error.
+    let out_bytes = if cand.convert != ConvertMode::None {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => {
+                let converted = match cand.convert {
+                    ConvertMode::ToOpenAI => convert::openai_resp_to_anthropic(&v, model),
+                    ConvertMode::ToAnthropic => convert::anthropic_resp_to_openai(&v, model),
+                    ConvertMode::None => unreachable!(),
+                };
+                serde_json::to_vec(&converted).unwrap_or_else(|_| bytes.to_vec())
+            }
+            Err(_) => bytes.to_vec(),
+        }
+    } else {
+        bytes.to_vec()
+    };
+    let entry = entry_of(attempt.clone(), attempts);
+    let ok = attempt.ok;
+    let log_id = log_request(&state.pool, &entry).await;
+    if should_capture(state, ok) {
+        let capture = DebugCapture::new();
+        capture.push(&bytes);
+        if let Some(id) = log_id {
+            write_debug_log(&state.pool, id, &capture).await;
+        }
+    }
+    let mut builder = Response::builder().status(status);
+    if let Some(ct) = content_type {
+        if let Some(h) = builder.headers_mut() {
+            h.insert(axum::http::header::CONTENT_TYPE, ct);
+        }
+    }
+    let resp = builder
+        .body(Body::from(out_bytes))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
     (resp, attempt)
 }
 
@@ -1253,12 +1533,13 @@ fn push(mut attempts: Vec<Attempt>, a: Attempt) -> Vec<Attempt> {
 
 /// Common relay: auth -> route -> forward with multi-channel failover.
 async fn relay(
-    state: &AppState,
+    state_arc: Arc<AppState>,
     headers: &HeaderMap,
     body: axum::body::Bytes,
     protocol: &str,
     direct_ip: Option<std::net::SocketAddr>,
 ) -> Response {
+    let state = &*state_arc;
     // 1. internal token auth
     let key = match extract_token(headers) {
         Some(k) => k,
@@ -1308,6 +1589,9 @@ async fn relay(
     // 2xx response that gets returned to the client — is pushed by
     // `respond_from_upstream`; failed hops are pushed inline below.
     let mut attempts: Vec<Attempt> = Vec::new();
+    // The upstream body from the most recent unusable-2xx hop, if any. Held
+    // rather than written immediately so only the final failure is persisted.
+    let mut last_capture: Option<DebugCapture> = None;
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
@@ -1376,27 +1660,33 @@ async fn relay(
                 continue;
             }
             attempted += 1;
-            // `target_body` is consumed by `try_upstream`; keep a `Bytes`
-            // copy for the debug-log write that happens on the 2xx winner.
-            let req_body = Bytes::from(target_body.clone());
-            let outcome = try_upstream(state, cand, upstream_protocol, target_body, headers).await;
+            let outcome = try_upstream(
+                state,
+                cand,
+                upstream_protocol,
+                target_body,
+                headers,
+                is_streaming,
+            )
+            .await;
             match outcome {
-                UpstreamOutcome::Ok(resp) => {
+                UpstreamOutcome::Ok(body) => {
                     state.breaker.record(&breaker_key, Outcome::Success).await;
                     return respond_from_upstream(
-                        state,
-                        &token_name,
-                        &model,
+                        &RelayCtx {
+                            state,
+                            state_arc: state_arc.clone(),
+                            token_name: &token_name,
+                            request_model: &model,
+                            protocol,
+                            streaming: is_streaming,
+                            start: relay_start,
+                            client_info: client_info.clone(),
+                        },
                         target_model,
                         cand,
-                        resp,
-                        is_streaming,
-                        protocol,
-                        is_streaming,
-                        relay_start,
+                        body,
                         attempts,
-                        req_body,
-                        client_info.clone(),
                     )
                     .await
                     .0;
@@ -1435,6 +1725,37 @@ async fn relay(
                         &mut retriable_429_count,
                     )
                     .await;
+                    // Fall through to the next candidate / next target.
+                }
+                UpstreamOutcome::InvalidBody {
+                    status: code,
+                    detail,
+                    body,
+                } => {
+                    let elapsed = relay_start.elapsed().as_millis() as i64;
+                    attempts.push(Attempt::new(
+                        target_model,
+                        cand,
+                        code as i64,
+                        detail,
+                        elapsed,
+                        false,
+                    ));
+                    all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, detail));
+                    // Not a 429 and not a transport error, so neither counter
+                    // moves: the final-status decision lands on 502, which is
+                    // right — we got a response, it just wasn't usable.
+                    state
+                        .breaker
+                        .record(
+                            &breaker_key,
+                            Outcome::Failure(format!("HTTP {code}: {detail}")),
+                        )
+                        .await;
+                    // Keep the offending body for the log detail page. Only
+                    // the last one is retained, so a long failover chain
+                    // writes one file, not one per hop.
+                    last_capture = Some(body);
                     // Fall through to the next candidate / next target.
                 }
                 UpstreamOutcome::Transport(err_msg) => {
@@ -1552,7 +1873,15 @@ async fn relay(
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
     };
-    log_request(&state.pool, &entry).await;
+    let log_id = log_request(&state.pool, &entry).await;
+    // Unconditional: a request that exhausted every candidate is exactly the
+    // one an admin will want to investigate, and whether the debug switch was
+    // on when it happened is not something they can retroactively know.
+    if let Some(capture) = last_capture {
+        if let Some(id) = log_id {
+            write_debug_log(&state.pool, id, &capture).await;
+        }
+    }
     error_response(final_status, &err, relay_retry_after.as_deref())
 }
 
@@ -1563,7 +1892,7 @@ pub async fn chat_completions(
     OptionalConnectInfo(addr): OptionalConnectInfo,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "openai", addr).await
+    relay(state, &headers, body, "openai", addr).await
 }
 
 /// POST /v1/messages — Anthropic Messages API relay.
@@ -1573,7 +1902,7 @@ pub async fn anthropic_messages(
     OptionalConnectInfo(addr): OptionalConnectInfo,
     body: axum::body::Bytes,
 ) -> Response {
-    relay(&state, &headers, body, "anthropic", addr).await
+    relay(state, &headers, body, "anthropic", addr).await
 }
 
 /// GET /v1/models — list union of all enabled channel models.
@@ -1893,5 +2222,116 @@ mod tests {
         }
         let models: Vec<&str> = v.iter().map(|a| a.upstream_model.as_str()).collect();
         assert_eq!(models, vec!["m0", "m1", "m2", "m3"]);
+    }
+
+    // ---------- body_matches_protocol ----------
+
+    #[test]
+    fn an_anthropic_message_is_recognized() {
+        let body = br#"{"type":"message","id":"m1","content":[]}"#;
+        assert!(body_matches_protocol(body, "anthropic"));
+    }
+
+    #[test]
+    fn an_anthropic_body_without_type_message_is_rejected() {
+        let body = br#"{"id":"m1","content":[]}"#;
+        assert!(!body_matches_protocol(body, "anthropic"));
+    }
+
+    #[test]
+    fn an_openai_completion_with_a_message_is_recognized() {
+        let body = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        assert!(body_matches_protocol(body, "openai"));
+    }
+
+    #[test]
+    fn an_openai_completion_without_a_message_is_rejected() {
+        // Relay-station failure mode: 200 + `{"choices":[{"delta":...}]}`
+        // (streaming-shaped but never a real completion).
+        let body = br#"{"choices":[{"delta":{"content":"x"}}]}"#;
+        assert!(!body_matches_protocol(body, "openai"));
+    }
+
+    #[test]
+    fn non_json_is_rejected_for_both_protocols() {
+        let html = b"<html>oops</html>";
+        assert!(!body_matches_protocol(html, "anthropic"));
+        assert!(!body_matches_protocol(html, "openai"));
+    }
+
+    // ---------- should_capture ----------
+
+    /// The point of the new capture rule: failures always capture. The
+    /// switch is for *successful* requests, not for "did we get a body" — a
+    /// failed request is the one we cannot diagnose later.
+    #[tokio::test]
+    async fn a_failure_always_captures_regardless_of_the_switch() {
+        let state = make_state().await;
+        // Switch off (default).
+        assert!(should_capture(&state, false));
+        // Switch on.
+        state
+            .debug_logging
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(should_capture(&state, false));
+    }
+
+    #[tokio::test]
+    async fn a_success_only_captures_when_the_switch_is_on() {
+        let state = make_state().await;
+        assert!(!should_capture(&state, true));
+        state
+            .debug_logging
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(should_capture(&state, true));
+    }
+
+    async fn make_state() -> AppState {
+        // Just need an instance with a working AtomicBool; the relay only
+        // touches `debug_logging` for `should_capture`, never `pool`.
+        let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").expect("lazy connect");
+        AppState::new(
+            pool,
+            Arc::new(crate::breaker::Breaker::new(
+                crate::breaker::BreakerConfig::default(),
+            )),
+        )
+    }
+
+    // ---------- DebugCapture ----------
+
+    #[test]
+    fn debug_capture_caps_at_the_byte_limit_and_marks_truncation() {
+        let cap = DebugCapture::new();
+        // Two chunks past the cap. Only the first DEBUG_BODY_MAX bytes stick,
+        // and the truncation flag is set as soon as the cap is crossed.
+        cap.push(&vec![b'a'; DEBUG_BODY_MAX]);
+        cap.push(&[b'b'; 16]);
+        let (bytes, seen, truncated) = cap.snapshot();
+        assert_eq!(bytes.len(), DEBUG_BODY_MAX);
+        assert!(bytes.iter().all(|&b| b == b'a'));
+        assert_eq!(seen, DEBUG_BODY_MAX + 16);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn debug_capture_under_the_cap_is_not_marked_truncated() {
+        let cap = DebugCapture::new();
+        cap.push(b"hello");
+        let (bytes, seen, truncated) = cap.snapshot();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(seen, 5);
+        assert!(!truncated);
+    }
+
+    // ---------- is_json_content_type ----------
+
+    #[test]
+    fn content_type_recognises_json_and_ignores_charset() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/problem+json"));
+        assert!(!is_json_content_type("text/event-stream"));
+        assert!(!is_json_content_type("text/plain"));
     }
 }

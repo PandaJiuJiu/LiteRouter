@@ -1,5 +1,6 @@
 use crate::auth::{check_auth, require_admin, AuthUser};
 use crate::db::{self, now};
+use crate::proxy;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -828,6 +829,27 @@ pub struct PageQuery {
     /// `0` means no window (show everything).
     #[serde(default = "default_range_hours")]
     pub range: i64,
+    // Optional filters, all combined with AND. The four text ones are
+    // case-insensitive substring matches so the user can paste a fragment of an
+    // IP or a model family; `status` is an exact match on the status code.
+    /// Substring of `client_ip`. Empty string means "no filter" — the UI sends
+    /// its inputs verbatim, so an untouched box arrives as "".
+    #[serde(default)]
+    pub ip: String,
+    /// Substring of `token_name`.
+    #[serde(default)]
+    pub token: String,
+    /// Substring of the requested model (see `COALESCE` in the WHERE clause —
+    /// rows predating migration 0009 have it empty and keep `model`).
+    #[serde(default)]
+    pub model: String,
+    /// Substring of the forwarded upstream model, with the same fallback.
+    #[serde(default)]
+    pub upstream_model: String,
+    /// Exact status code. `Option` rather than `i64` because `0` is not a
+    /// status code but *is* what an empty input parses to.
+    #[serde(default)]
+    pub status: Option<i64>,
 }
 fn default_page() -> i64 {
     1
@@ -837,6 +859,134 @@ fn default_size() -> i64 {
 }
 fn default_range_hours() -> i64 {
     1
+}
+
+/// One `?` in the log list's WHERE clause, tagged with the type sqlx has to
+/// bind it as. The clause mixes TEXT columns (token names, LIKE fragments) with
+/// INTEGER ones (the window bound, the status code), so a single homogeneous
+/// bind vec can't carry them — and since the count and page queries share the
+/// clause, they share this vec too.
+enum LogBind {
+    Text(String),
+    Int(i64),
+}
+
+/// Apply the clause's binds to a query. A macro rather than a function because
+/// sqlx's `Query` and `QueryScalar` are unrelated types with structurally
+/// identical `bind` methods — no trait bound unifies them, and the log list
+/// needs both (COUNT and SELECT share one WHERE clause).
+macro_rules! bind_clause {
+    ($query:expr, $binds:expr) => {{
+        let mut q = $query;
+        for b in $binds {
+            q = match b {
+                LogBind::Text(s) => q.bind(s.as_str()),
+                LogBind::Int(i) => q.bind(*i),
+            };
+        }
+        q
+    }};
+}
+
+/// Escape the LIKE wildcards in a user-supplied fragment, so filtering by
+/// `100%` matches a literal percent sign rather than turning the `%` into a
+/// wildcard. Paired with `ESCAPE '\'` at the call site.
+fn like_fragment(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// The four text filter params and the column each one matches, in the order
+/// `PageQuery` declares them. Shared by the WHERE builder and the
+/// `/api/logs/filter-options` handler so a dropdown can only ever offer values
+/// the corresponding filter is able to match — including the `COALESCE`
+/// fallbacks, so the offered models are the ones that column really holds.
+const LOG_FILTER_COLUMNS: [(&str, &str); 4] = [
+    ("ip", "client_ip"),
+    ("token", "token_name"),
+    ("model", "COALESCE(NULLIF(request_model,''), model)"),
+    (
+        "upstream_model",
+        "COALESCE(NULLIF(upstream_model,''), model)",
+    ),
+];
+
+/// One filter's value from the query, blank-filtered. `None` means "this box is
+/// empty, contribute no clause".
+fn log_filter_value<'a>(q: &'a PageQuery, key: &str) -> Option<&'a str> {
+    let raw = match key {
+        "ip" => q.ip.trim(),
+        "token" => q.token.trim(),
+        "model" => q.model.trim(),
+        "upstream_model" => q.upstream_model.trim(),
+        _ => return None,
+    };
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// Build the log list's WHERE clause and its binds: visibility scope, time
+/// window, and the caller's filters. Shared by `list_logs` and
+/// `log_filter_options` so the dropdowns and the list can never disagree about
+/// what "the current filters" means.
+///
+/// `skip` drops one filter from the clause. The options endpoint uses it to
+/// compute each dropdown independently — otherwise narrowing by token would
+/// leave the token dropdown showing only the value already picked, with no way
+/// to change it.
+fn log_where_clause(
+    user: &AuthUser,
+    allowed: &[String],
+    range: i64,
+    q: &PageQuery,
+    skip: Option<&str>,
+) -> (String, Vec<LogBind>) {
+    let since = if range > 0 {
+        Some(crate::db::now() - range.min(24 * 365) * 3600)
+    } else {
+        None
+    };
+    // Admin sees every log; a non-admin is limited to their own tokens. An
+    // empty `allowed` collapses to `1=0` because `token IN ()` is a syntax
+    // error in SQLite.
+    let mut where_parts: Vec<String> = Vec::new();
+    // One entry per `?`, in clause order — see `bind_clause`.
+    let mut binds: Vec<LogBind> = Vec::new();
+    if !user.is_admin {
+        if allowed.is_empty() {
+            where_parts.push("1=0".to_string());
+        } else {
+            let ph = std::iter::repeat_n("?", allowed.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            where_parts.push(format!("token_name IN ({ph})"));
+            binds.extend(allowed.iter().cloned().map(LogBind::Text));
+        }
+    }
+    if let Some(s) = since {
+        where_parts.push("created_at >= ?".to_string());
+        binds.push(LogBind::Int(s));
+    }
+    // The user's filters, ANDed onto the visibility + window clauses.
+    for (key, column) in LOG_FILTER_COLUMNS {
+        if Some(key) == skip {
+            continue;
+        }
+        if let Some(needle) = log_filter_value(q, key) {
+            where_parts.push(format!("{column} LIKE ? ESCAPE '\\'"));
+            binds.push(LogBind::Text(format!("%{}%", like_fragment(needle))));
+        }
+    }
+    if let Some(status) = q.status {
+        where_parts.push("status_code = ?".to_string());
+        binds.push(LogBind::Int(status));
+    }
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    (where_sql, binds)
 }
 
 pub async fn list_logs(
@@ -853,71 +1003,21 @@ pub async fn list_logs(
     // mismatched count leaks the existence of other users' logs). The time
     // window belongs in that same clause: the total in the pager has to be the
     // total *within the selected range*.
-    let since = if q.range > 0 {
-        Some(crate::db::now() - q.range.min(24 * 365) * 3600)
-    } else {
-        None
-    };
-    // Admin sees every log; a non-admin is limited to their own tokens. An
-    // empty `allowed` collapses to `1=0` because `token IN ()` is a syntax
-    // error in SQLite.
-    let mut where_parts: Vec<String> = Vec::new();
-    let mut token_binds: Vec<String> = Vec::new();
-    if !user.is_admin {
-        if allowed.is_empty() {
-            where_parts.push("1=0".to_string());
-        } else {
-            let ph = std::iter::repeat_n("?", allowed.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            where_parts.push(format!("token_name IN ({ph})"));
-            token_binds.extend(allowed.iter().cloned());
-        }
-    }
-    if since.is_some() {
-        where_parts.push("created_at >= ?".to_string());
-    }
-    let where_sql = if where_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", where_parts.join(" AND "))
-    };
+    let (where_sql, binds) = log_where_clause(&user, &allowed, q.range, &q, None);
 
-    // Binds are spelled out per query instead of collected into one vec: token
-    // names are TEXT and the window bound is INTEGER, so a single homogeneous
-    // vec can't carry both. Clause and binds are built together, so they can't
-    // get out of step.
     let count_sql = format!("SELECT COUNT(*) FROM logs{where_sql}");
-    let total: i64 = {
-        let mut query = sqlx::query_scalar(&count_sql);
-        for t in &token_binds {
-            query = query.bind(t);
-        }
-        if let Some(s) = since {
-            query = query.bind(s);
-        }
-        query
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let total: i64 = bind_clause!(sqlx::query_scalar(&count_sql), &binds)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let page_sql = format!("SELECT * FROM logs{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?");
-    let rows = {
-        let mut query = sqlx::query(&page_sql);
-        for t in &token_binds {
-            query = query.bind(t);
-        }
-        if let Some(s) = since {
-            query = query.bind(s);
-        }
-        query
-            .bind(q.size)
-            .bind(offset)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let rows = bind_clause!(sqlx::query(&page_sql), &binds)
+        .bind(q.size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // The list shows a "failed N times" badge whose tooltip lists the failed
     // hops. Fetch every attempt for the visible page in one query and group in
     // Rust — a per-row lookup would be N+1 on the hottest endpoint.
@@ -984,6 +1084,100 @@ pub async fn list_logs(
     Ok(Json(json!({ "logs": logs, "total": total })))
 }
 
+/// How many distinct value combinations `/api/logs/filter-options` reads before
+/// giving up. The dropdowns are built from the combinations actually present
+/// under the current filters, and the cap keeps an all-time window over a
+/// busy month from materializing hundreds of thousands of rows. Past the cap
+/// the lists are simply shorter — every value offered still matches.
+const LOG_OPTION_ROW_CAP: usize = 20_000;
+
+/// GET /api/logs/filter-options — the values each of the five log filters can
+/// be set to, so the UI can offer dropdowns instead of free-text boxes.
+///
+/// Takes the same query string as `/api/logs` (it reuses `PageQuery`) and
+/// answers "given the filters applied *except this one*, what could I pick?"
+/// — the facet rule, so narrowing by token doesn't leave the token dropdown
+/// holding only the value already chosen. `page`/`size` are accepted and
+/// ignored; sharing the struct is cheaper than maintaining a second parser
+/// that could drift.
+///
+/// Scoped to the caller's visibility exactly like the list, so a non-admin
+/// can't enumerate other users' token names or model names through it.
+pub async fn log_filter_options(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let user = check_auth(&state, &headers)?;
+    let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
+
+    // Five clauses, five DISTINCT scans. Each dropdown has to be computed
+    // without its own filter, and a single grouped pass can't answer that —
+    // the row sets differ per facet.
+    let mut out = serde_json::Map::new();
+    for (key, column) in LOG_FILTER_COLUMNS {
+        let (where_sql, binds) = log_where_clause(&user, &allowed, q.range, &q, Some(key));
+        let sql = format!(
+            "SELECT DISTINCT {column} AS v FROM logs{where_sql} ORDER BY v LIMIT {LOG_OPTION_ROW_CAP}"
+        );
+        let values: Vec<String> = bind_clause!(sqlx::query_scalar(&sql), &binds)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            // Legacy rows carry '' in the split model columns; the COALESCE
+            // handles those for matching, but there's no empty option to offer.
+            .filter(|v: &String| !v.is_empty())
+            .collect();
+        out.insert(key.to_string(), json!(values));
+    }
+
+    // Status codes are a small closed set, so exact-match filtering makes the
+    // facets indistinguishable — the code's own filter is skipped like the
+    // others'.
+    let (where_sql, binds) = log_where_clause(&user, &allowed, q.range, &q, Some("status"));
+    let status_sql =
+        format!("SELECT DISTINCT status_code FROM logs{where_sql} ORDER BY status_code LIMIT 100");
+    let statuses: Vec<i64> = bind_clause!(sqlx::query_scalar(&status_sql), &binds)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    out.insert("status".to_string(), json!(statuses));
+
+    Ok(Json(Value::Object(out)))
+}
+
+/// Load a `logs` row on behalf of `user`, applying the same ownership rule as
+/// `list_logs`: non-admins only see logs against tokens they own.
+///
+/// A row the caller may not see is a `404`, not a `403` — a 403 would confirm
+/// the id exists, which is itself a leak across tenants.
+async fn load_log_for_user(
+    pool: &sqlx::SqlitePool,
+    user: &AuthUser,
+    id: i64,
+) -> Result<sqlx::sqlite::SqliteRow, StatusCode> {
+    let row = sqlx::query("SELECT * FROM logs WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if !user.is_admin {
+        let owner = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE((SELECT user_id FROM tokens WHERE name = ?), 0)",
+        )
+        .bind(row.get::<String, _>("token_name"))
+        .fetch_one(pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if owner != user.id {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+    Ok(row)
+}
+
 /// GET /api/logs/:id — full metadata for a single request, used by the
 /// log detail page. Same user-scoping as `list_logs`: non-admins can only
 /// see logs against tokens they own.
@@ -993,25 +1187,7 @@ pub async fn get_log(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, StatusCode> {
     let user = check_auth(&state, &headers)?;
-    let row = sqlx::query("SELECT * FROM logs WHERE id=?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    // Non-admins can only inspect logs for tokens they own.
-    if !user.is_admin {
-        let owner = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE((SELECT user_id FROM tokens WHERE name = ?), 0)",
-        )
-        .bind(row.get::<String, _>("token_name"))
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if owner != user.id {
-            return Err(StatusCode::NOT_FOUND);
-        }
-    }
+    let row = load_log_for_user(&state.pool, &user, id).await?;
     // `upstream_model` is empty on rows written before 0014; `model` has
     // always held the post-mapping name, so fall back to it.
     let upstream_model = {
@@ -1073,6 +1249,44 @@ pub async fn get_log(
             "client_ip": row.get::<String, _>("client_ip"),
             "user_agent": row.get::<String, _>("user_agent"),
         }
+    })))
+}
+
+/// GET /api/logs/:id/debug — the captured upstream response body for a
+/// request, as written by the relay's debug capture.
+///
+/// Deliberately its own endpoint rather than a field on `get_log`: the body
+/// can be a couple hundred KB, and `get_log` is the hot path the log list
+/// and detail page both hit on every render.
+///
+/// Authorization is identical to `get_log` (including the 404-not-403 rule),
+/// so this can't be used to read other tenants' traffic. `available: false`
+/// with a 200 means "you may see this log, but nothing was captured" — a
+/// success that succeeded, or a failure whose upstream sent no body. The two
+/// cases are deliberately distinguishable from the 404.
+pub async fn get_log_debug(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, StatusCode> {
+    let user = check_auth(&state, &headers)?;
+    load_log_for_user(&state.pool, &user, id).await?;
+    let Some(file) = proxy::read_debug_log(&state.pool, id).await else {
+        return Ok(Json(json!({
+            "log_id": id,
+            "available": false,
+        })));
+    };
+    // Lossy: an upstream can reply with binary or with a truncated UTF-8
+    // sequence. The body is returned as a JSON *string* so the SPA never has
+    // to guess a content type, and replacement chars are visible rather than
+    // silently decoding into something that looks valid.
+    Ok(Json(json!({
+        "log_id": id,
+        "available": true,
+        "bytes": file.bytes.len(),
+        "truncated": file.truncated,
+        "body": String::from_utf8_lossy(&file.bytes),
     })))
 }
 

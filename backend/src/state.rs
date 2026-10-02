@@ -17,8 +17,11 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// session token -> metadata
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
-    /// When true, request/response bodies are written to data/debug_logs/.
-    pub debug_logging: bool,
+    /// Whether request/response bodies are captured to disk. Held on the
+    /// state itself (not a process-wide static) so each harness can flip
+    /// it independently — important for parallel tests. Updated atomically
+    /// since the admin handler mutates it without a lock.
+    pub debug_logging: std::sync::atomic::AtomicBool,
     /// Per-(channel, model) circuit breaker. In-memory only — process
     /// restart clears every key, matching the session-stores-don't-
     /// survive-restart stance. See `breaker.rs` for the state machine.
@@ -26,7 +29,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(pool: SqlitePool, debug_logging: bool, breaker: Arc<Breaker>) -> Self {
+    pub fn new(pool: SqlitePool, breaker: Arc<Breaker>) -> Self {
         Self {
             pool,
             http: reqwest::Client::builder()
@@ -34,7 +37,7 @@ impl AppState {
                 .build()
                 .expect("build http client"),
             sessions: Mutex::new(HashMap::new()),
-            debug_logging,
+            debug_logging: std::sync::atomic::AtomicBool::new(false),
             breaker,
         }
     }

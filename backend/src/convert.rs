@@ -678,6 +678,26 @@ impl OpenAiToAnthropicStream {
     }
 }
 
+impl OpenAiToAnthropicStream {
+    /// The opening envelope of the translated Anthropic stream. Split out
+    /// because `finish()` has to be able to emit it too (see there).
+    fn message_start_event(&mut self) -> String {
+        self.started = true;
+        sse_event(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id(&self.id), "type": "message", "role": "assistant",
+                    "model": self.model, "content": [], "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": 0, "output_tokens": 0 }
+                }
+            }),
+        )
+    }
+}
+
 impl SseConverter for OpenAiToAnthropicStream {
     fn on_data(&mut self, payload: &str) -> Vec<String> {
         let v: Value = match serde_json::from_str(payload) {
@@ -686,22 +706,10 @@ impl SseConverter for OpenAiToAnthropicStream {
         };
         let mut out = Vec::new();
         if !self.started {
-            self.started = true;
             if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
                 self.id = id.to_string();
             }
-            out.push(sse_event(
-                "message_start",
-                &json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id(&self.id), "type": "message", "role": "assistant",
-                        "model": self.model, "content": [], "stop_reason": Value::Null,
-                        "stop_sequence": Value::Null,
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
-                    }
-                }),
-            ));
+            out.push(self.message_start_event());
         }
         // capture usage if the upstream includes it (final chunks often do)
         if let Some(u) = v.get("usage") {
@@ -824,6 +832,14 @@ impl SseConverter for OpenAiToAnthropicStream {
 
     fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
+        // An upstream that opened a stream and then sent nothing we could
+        // translate leaves `started` false. Emitting `message_delta` /
+        // `message_stop` without a preceding `message_start` is a malformed
+        // Anthropic sequence that strict clients reject, so open the message
+        // first — the empty one is still the honest representation.
+        if !self.started {
+            out.push(self.message_start_event());
+        }
         // close open blocks in ascending block order
         let mut open: Vec<usize> = self
             .tools

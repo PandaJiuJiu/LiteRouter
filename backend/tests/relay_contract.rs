@@ -864,7 +864,8 @@ async fn an_openai_client_on_an_anthropic_only_channel_is_converted_upstream() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "msg_1", "model": "claude-x", "stop_reason": "end_turn",
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "model": "claude-x", "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "hello"}],
             "usage": {"input_tokens": 4, "output_tokens": 2}
         })))
@@ -894,9 +895,14 @@ async fn an_openai_client_on_an_anthropic_only_channel_is_converted_upstream() {
 #[tokio::test]
 async fn a_converted_hop_is_labelled_in_the_log_row() {
     let server = MockServer::start().await;
+    // Anthropic-only channel, so the upstream speaks /v1/messages and must
+    // answer with a Message envelope — an OpenAI-shaped body here would be
+    // rejected by the relay's shape check, not converted.
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-1", "choices": [{"message": {"content": "x"}}]
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "model": "claude-x", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "x"}]
         })))
         .mount(&server)
         .await;
@@ -923,7 +929,8 @@ async fn the_anthropic_version_header_is_forwarded_to_the_upstream() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "msg_1", "content": [], "stop_reason": "end_turn"
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [], "stop_reason": "end_turn"
         })))
         .mount(&server)
         .await;
@@ -1174,4 +1181,453 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
     let row = await_log_row(h.pool()).await;
     assert_eq!(row.get::<i64, _>("stream"), 1);
     assert_eq!(row.get::<i64, _>("total_tokens"), 15);
+}
+
+// ============ 2xx body validation ============
+//
+// A relay station whose own backend is down answers `200` with an error
+// envelope. Status alone cannot tell that apart from a success, so
+// `try_upstream` shape-checks the body and treats a mismatch as a failure —
+// which, crucially, means it still fails over.
+
+/// An upstream that answers 200 with a body of the wrong shape.
+async fn upstream_bad_200(server: &MockServer) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": {"message": "upstream node is down", "code": "internal"}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn anthropic_chat(h: &Harness, key: &str, model: &str, extra: Value) -> (StatusCode, Value) {
+    let mut body = json!({
+        "model": model, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    support::call_json(&h.router, "POST", "/v1/messages", Some(body), Some(key)).await
+}
+
+#[tokio::test]
+async fn a_200_carrying_an_error_envelope_fails_over_to_the_next_channel() {
+    let a = MockServer::start().await;
+    upstream_bad_200(&a).await;
+    let b = MockServer::start().await;
+    upstream_ok(&b).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let (status, body) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The client got the second channel's real completion, not the error page.
+    assert_eq!(body["choices"][0]["message"]["content"], "hi");
+
+    let row = sqlx::query("SELECT failed_count FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<i64, _>("failed_count"), 1);
+}
+
+#[tokio::test]
+async fn an_anthropic_200_that_is_not_a_message_fails_over() {
+    let a = MockServer::start().await;
+    // Anthropic-only channel, and this is what the failing relay station
+    // actually sends back: HTTP 200, JSON, but no Message envelope.
+    let (h, key) = {
+        let h = Harness::with_admin().await;
+        let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+            .fetch_one(h.pool())
+            .await
+            .unwrap();
+        let token = support::insert_token(h.pool(), "relay", admin_id).await;
+        support::insert_channel(h.pool(), "first", "", &a.uri(), "claude-x", true).await;
+        (h, token.key)
+    };
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": {"message": "no capacity", "type": "overloaded_error"}
+        })))
+        .mount(&a)
+        .await;
+
+    let (status, body) = anthropic_chat(&h, &key, "claude-x", json!({})).await;
+    // Only one channel, so the request does fail — but it must fail as a
+    // gateway error naming the real cause, not as a 200 handed to the client.
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not an Anthropic message"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn every_candidate_returning_a_bad_200_synthesizes_502() {
+    let a = MockServer::start().await;
+    upstream_bad_200(&a).await;
+    let b = MockServer::start().await;
+    upstream_bad_200(&b).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let (status, body) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let msg = body["error"]["message"].as_str().unwrap();
+    // Both channels are named, so the admin can see the whole chain.
+    assert!(msg.contains("first"), "{msg}");
+    assert!(msg.contains("second"), "{msg}");
+    // Both attempts recorded the real upstream status, not a synthesized one.
+    let rows = sqlx::query("SELECT status_code, ok, error FROM log_attempts ORDER BY seq ASC")
+        .fetch_all(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.get::<i64, _>("status_code"), 200);
+        assert_eq!(row.get::<i64, _>("ok"), 0);
+        assert!(row
+            .get::<String, _>("error")
+            .contains("not an OpenAI completion"));
+    }
+}
+
+#[tokio::test]
+async fn a_bad_200_does_not_count_as_a_rate_limit() {
+    // One channel rate-limited, one answering a bad 200. Neither counter is
+    // satisfied on its own, so the mix must land on 502 — not 429, which
+    // would tell the client to back off when the real problem is a broken
+    // relay station.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let b = MockServer::start().await;
+    upstream_bad_200(&b).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn a_bad_200_trips_the_breaker_for_that_channel_and_model() {
+    let a = MockServer::start().await;
+    upstream_bad_200(&a).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let snapshot = h.breaker.snapshot().await;
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "the bad 200 should have tripped the breaker"
+    );
+    let row = snapshot.into_iter().next().unwrap();
+    assert_eq!(row.state, "open");
+}
+
+#[tokio::test]
+async fn a_failed_request_captures_the_upstream_body_without_the_debug_switch() {
+    // Debug logging is off by default for the harness's per-state bool.
+    // No setup needed: failures always capture regardless of the switch.
+    let a = MockServer::start().await;
+    upstream_bad_200(&a).await;
+    let b = MockServer::start().await;
+    upstream_bad_200(&b).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let body = std::fs::read_to_string(
+        support::debug_log_dir(h.pool())
+            .join(id.to_string())
+            .join("resp.json"),
+    )
+    .unwrap();
+    assert!(
+        body.contains("upstream node is down"),
+        "the captured body should be what the upstream actually sent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_never_contains_the_request_body() {
+    let a = MockServer::start().await;
+    upstream_bad_200(&a).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+
+    chat(&h, &key, "gpt-4o", json!({})).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    // The privacy decision from migration 0014, made structural: there is no
+    // req.json to leak, because nothing ever writes one.
+    assert!(
+        !support::debug_log_dir(h.pool())
+            .join(id.to_string())
+            .join("req.json")
+            .exists(),
+        "the request body must never be written to disk"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_request_writes_no_capture_when_the_switch_is_off() {
+    // Switch is off by default (the harness's per-state bool), so no setup.
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert!(!support::debug_log_dir(h.pool())
+        .join(id.to_string())
+        .exists());
+}
+
+#[tokio::test]
+async fn the_debug_switch_captures_successful_requests_too() {
+    // Flip the per-state bool on this harness's state. The state is not
+    // shared with other harnesses, so parallel tests cannot toggle this
+    // off mid-flight.
+    let h = Harness::with_admin().await;
+    h.state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", true).await;
+
+    chat(&h, &token.key, "gpt-4o", json!({})).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let body = std::fs::read_to_string(
+        support::debug_log_dir(h.pool())
+            .join(id.to_string())
+            .join("resp.json"),
+    )
+    .unwrap();
+    assert!(body.contains("chatcmpl-up"), "{body}");
+}
+
+#[tokio::test]
+async fn a_capture_is_truncated_and_marked_past_the_cap() {
+    // Two channels both return 2xx with a shape that fails the relay's body
+    // check (`choices[0].message` missing), so the request exhausts every
+    // candidate and the relay's "only the final failure is persisted" rule
+    // writes one big truncated capture.
+    let filler = "y".repeat(literouter::proxy::DEBUG_BODY_MAX + 4096);
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"delta": filler.clone()}]
+        })))
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"delta": filler}]
+        })))
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // The capture of the first (failing) hop is what gets persisted.
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let dir = support::debug_log_dir(h.pool()).join(id.to_string());
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("resp.meta.json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["truncated"], true);
+    assert_eq!(meta["captured"], literouter::proxy::DEBUG_BODY_MAX);
+    assert_eq!(
+        std::fs::metadata(dir.join("resp.json")).unwrap().len(),
+        literouter::proxy::DEBUG_BODY_MAX as u64
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_request_rejects_a_json_200_and_fails_over() {
+    // The streaming side of the same failure. We can't buffer a live SSE body
+    // to check its shape, but a JSON content-type on a stream request means
+    // the upstream sent a whole document instead of an event stream — and
+    // that we can reject before a single byte reaches the client.
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({"error": {"message": "nope"}})),
+        )
+        .mount(&a)
+        .await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({"model": "gpt-4o", "stream": true, "messages": []})),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("\"nope\""),
+        "the bad body reached the client: {text}"
+    );
+    assert!(text.contains("ok"), "{text}");
+}
+
+#[tokio::test]
+async fn a_passthrough_stream_captures_the_upstream_bytes() {
+    // Switch on this harness's own state — each harness owns its bool, so
+    // parallel tests can't toggle it off.
+    let h = Harness::with_admin().await;
+    h.state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", true).await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({"model": "gpt-4o", "stream": true, "messages": []})),
+        Some(&token.key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    await_log_row(h.pool()).await;
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let body = std::fs::read_to_string(
+        support::debug_log_dir(h.pool())
+            .join(id.to_string())
+            .join("resp.json"),
+    )
+    .unwrap();
+    // Regression: this file used to come out 0 bytes on every stream, because
+    // the pump accumulated into its line-parsing buffer and never the
+    // capture.
+    assert!(
+        body.contains("[DONE]"),
+        "captured stream was empty: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_converted_stream_captures_the_upstream_bytes_too() {
+    // Anthropic client, OpenAI upstream, success on the only channel with
+    // the debug switch on this harness's state. The capture holds the
+    // *upstream* (OpenAI) bytes regardless of the translation happening on
+    // the way out.
+    let h = Harness::with_admin().await;
+    h.state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", true).await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&token.key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    await_log_row(h.pool()).await;
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let body = std::fs::read_to_string(
+        support::debug_log_dir(h.pool())
+            .join(id.to_string())
+            .join("resp.json"),
+    )
+    .unwrap();
+    assert!(
+        body.contains("[DONE]"),
+        "captured stream was empty: {body:?}"
+    );
 }

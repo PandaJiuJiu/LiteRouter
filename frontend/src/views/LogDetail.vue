@@ -85,6 +85,38 @@
         </p>
       </section>
 
+      <!-- 捕获到的上游响应体。仅上游响应被落盘，请求体从不落盘
+           （见 migration 0014）。失败请求自动捕获；健康请求需要打开 debug 开关。 -->
+      <section>
+        <h3>{{ t('logDetail.sectionDebug') }}</h3>
+        <p class="hint">{{ t('logDetail.debugPrivacy') }}</p>
+        <div v-if="debug.loading" class="hint">{{ t('common.loading') }}</div>
+        <div v-else-if="debug.error" class="hint">
+          {{ t('common.error') }}: {{ debug.error }}
+        </div>
+        <div v-else-if="debug.data === null">
+          <el-button @click="loadDebug" size="small" :disabled="loading">
+            {{ t('logDetail.debugLoad') }}
+          </el-button>
+        </div>
+        <template v-else-if="debug.data.available">
+          <el-descriptions :column="1" border size="small" class="debug-meta">
+            <el-descriptions-item :label="t('logDetail.debug_meta_bytes')">
+              {{ debug.data.bytes.toLocaleString() }}
+            </el-descriptions-item>
+            <el-descriptions-item :label="t('logDetail.debug_meta_truncated')">
+              {{ debug.data.truncated ? t('logDetail.yes') : t('logDetail.no') }}
+            </el-descriptions-item>
+          </el-descriptions>
+          <pre class="debug-body"><code>{{ debug.pretty }}</code></pre>
+          <p v-if="debug.parseError" class="hint">{{ t('logDetail.debugParseError') }}</p>
+          <el-button size="small" @click="loadDebug" :disabled="debug.loading" class="debug-reload">
+            {{ t('logDetail.debugReload') }}
+          </el-button>
+        </template>
+        <p v-else class="hint">{{ t('logDetail.debugNone') }}</p>
+      </section>
+
       <!-- Token 明细：cache 段只在该次请求非零时显示 -->
       <section>
         <h3>{{ t('logDetail.sectionTokens') }}</h3>
@@ -111,11 +143,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { i18n } from '../i18n'
-import { getLog } from '../api'
+import { getLog, getLogDebug } from '../api'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -131,6 +163,47 @@ async function load() {
     ok.value = log.value && log.value.status_code >= 200 && log.value.status_code < 300
   } finally {
     loading.value = false
+  }
+}
+
+// Captured upstream body. Held as { data, requested, error }:
+//   - `data` null = not yet fetched (button visible).
+//   - `data.available: false` = fetched, nothing to show.
+//   - `data.available: true` = fetched, render the body.
+const debug = reactive({
+  data: null,
+  loading: false,
+  error: null,
+  pretty: '',
+  parseError: false,
+})
+
+async function loadDebug() {
+  debug.loading = true
+  debug.error = null
+  try {
+    const payload = await getLogDebug(route.params.id)
+    debug.data = payload
+    debug.pretty = payload.available ? formatBody(payload.body) : ''
+  } catch (e) {
+    debug.error = String(e)
+  } finally {
+    debug.loading = false
+  }
+}
+
+// Pretty-print JSON when we can. The upstream body can be anything — a relay
+// station may answer with an HTML error page, a half-streamed SSE chunk, or
+// just `text/plain`, so a parse failure is the normal case for some of those.
+// Fall back to showing the raw string so the admin always sees what arrived.
+function formatBody(raw) {
+  try {
+    const obj = JSON.parse(raw)
+    debug.parseError = false
+    return JSON.stringify(obj, null, 2)
+  } catch {
+    debug.parseError = true
+    return raw
   }
 }
 
@@ -218,5 +291,29 @@ h3 {
 }
 .muted {
   color: #c0c4cc;
+}
+
+/* Captured upstream body. The body can be very long (up to the capture cap
+   is 256 KB) — a fixed max-height with scroll is the right call; expanding
+   to fit would push the token usage section off-screen. JSON is
+   monospaced, so the eye reads it column-wise. */
+.debug-meta {
+  margin: 8px 0;
+}
+.debug-body {
+  background-color: #1e1e1e;
+  color: #d4d4d4;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 12px;
+  border-radius: 4px;
+  max-height: 480px;
+  overflow: auto;
+  white-space: pre;
+  margin: 0;
+}
+.debug-reload {
+  margin-top: 8px;
 }
 </style>

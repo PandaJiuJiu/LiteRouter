@@ -139,7 +139,7 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
     tx.commit().await?;
 
     for id in ids {
-        crate::proxy::delete_debug_log(id).await;
+        crate::proxy::delete_debug_log(pool, id).await;
     }
 
     Ok(res.rows_affected())
