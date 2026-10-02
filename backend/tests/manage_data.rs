@@ -365,6 +365,28 @@ async fn the_log_list_falls_back_to_model_when_upstream_model_is_empty() {
     assert_eq!(body["logs"][0]["upstream_model"], "gpt-4o");
 }
 
+#[tokio::test]
+async fn the_log_list_carries_latency_ms_per_row() {
+    // The list page renders a per-request duration column alongside the
+    // status code (see Logs.vue). The detail page has had the field since
+    // 0014; this is the assertion that the list endpoint surfaces it too,
+    // so admin can spot slow requests without opening each detail view.
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    sqlx::query(
+        "INSERT INTO logs (token_name, model, request_model, channel_name, status_code,
+                           created_at, prompt_tokens, completion_tokens, total_tokens, latency_ms)
+         VALUES ('admin-token', 'gpt-4o', 'gpt-4o', 'ch', 200, ?, 10, 20, 30, 1842)",
+    )
+    .bind(literouter::db::now())
+    .execute(h.pool())
+    .await
+    .expect("insert log with latency");
+
+    let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
+    assert_eq!(body["logs"][0]["latency_ms"], 1842);
+}
+
 /// A log row with every column the list filters on set explicitly — the shared
 /// `insert_log` helper hardcodes the interesting ones.
 async fn insert_log_full(

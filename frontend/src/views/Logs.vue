@@ -93,6 +93,12 @@
           </el-tag>
         </template>
       </el-table-column>
+      <el-table-column :label="t('logs.col.duration')" width="90">
+        <template #default="{ row }">
+          <span v-if="row.latency_ms > 0" class="num">{{ (row.latency_ms / 1000).toFixed(2) }}s</span>
+          <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
       <el-table-column :label="t('logs.col.tokens')" width="110" prop="total_tokens">
         <template #default="{ row }">
           <span v-if="row.total_tokens > 0" class="num">{{ fmt(row.total_tokens) }}</span>

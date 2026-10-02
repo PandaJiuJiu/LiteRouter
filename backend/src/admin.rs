@@ -1073,6 +1073,12 @@ pub async fn list_logs(
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "total_tokens": r.get::<i64, _>("total_tokens"),
+                // `logs.latency_ms` is written by `log_request` (see migration
+                // 0014) for every row — admin uses it on the list page to
+                // spot slow requests alongside the status code. The detail
+                // page still reads the same field; this only adds the key to
+                // the list payload.
+                "latency_ms": r.get::<i64, _>("latency_ms"),
                 "failed_count": failed_count,
                 "failed_attempts": failed_by_log.get(&id).cloned().unwrap_or_default(),
                 "created_at": r.get::<i64, _>("created_at"),
