@@ -1290,6 +1290,239 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
     assert_eq!(row.get::<i64, _>("total_tokens"), 15);
 }
 
+// ============ in-stream errors ============
+//
+// The buffered path shape-checks the body, but a stream is committed the
+// moment its headers land: the status line is already on the wire before a
+// body byte exists, so there is nothing left to fail over with. The error
+// event itself is forwarded — that is how both protocols *define* an in-stream
+// failure — but the hop has to stop being counted as a success, or the log
+// shows a green 200 and the breaker records Success forever.
+
+/// A harness with one admin, one `sk-` token, and a channel whose Anthropic
+/// upstream is `base_url_anthropic`. Used to test the passthrough-Anthropic
+/// stream path, where the error frame reaches the client verbatim instead of
+/// being mangled by the converter.
+async fn relay_ready_anthropic(base_url_anthropic: &str, models: &str) -> (Harness, String) {
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", "", base_url_anthropic, models, true).await;
+    (h, token.key)
+}
+
+/// A 200 SSE stream that opens normally and then gives up mid-flight.
+async fn upstream_stream_then_error(server: &MockServer) {
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-1\",\"type\":\"message\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"JSON error injected into SSE stream\",\"error_type\":\"provider_unavailable\"}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_stream_containing_an_error_event_is_not_logged_as_a_success() {
+    let server = MockServer::start().await;
+    upstream_stream_then_error(&server).await;
+    // Anthropic passthrough, so the error frame the upstream emits is the
+    // exact frame the client sees — conversion would otherwise strip it.
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("event: error") && text.contains("provider_unavailable"),
+        "the error event is part of the client's protocol and must reach it: {text}"
+    );
+
+    // The log row is written by LogOnEnd::drop, so poll for it. The stream's
+    // own verdict lives on `log_attempts` (the winning row); `logs.error`
+    // carries the fixed wording.
+    let mut winner: Option<(i64, String)> = None;
+    for _ in 0..100 {
+        if let Ok(r) = sqlx::query(
+            "SELECT a.ok, l.error FROM log_attempts a \
+             JOIN logs l ON l.id = a.log_id \
+             ORDER BY a.id DESC LIMIT 1",
+        )
+        .fetch_one(h.pool())
+        .await
+        {
+            if r.get::<i64, _>("ok") == 0 {
+                winner = Some((r.get::<i64, _>("ok"), r.get::<String, _>("error")));
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (ok, error) = winner.expect("the streamed request wrote no failed attempt");
+    assert_eq!(ok, 0, "a failed stream is not a success");
+    assert_eq!(
+        error, "upstream error event inside a 200 stream",
+        "the row carries the fixed wording; the upstream text is in the capture"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_error_trips_the_breaker_so_the_dead_provider_stops_being_picked() {
+    // Without this the relay records Success the moment headers arrive and the
+    // provider is never backed off, so every later request walks the same dead
+    // channel again.
+    let server = MockServer::start().await;
+    upstream_stream_then_error(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    let bkey = literouter::breaker::breaker_key("ch", "gpt-4o");
+    for _ in 0..100 {
+        if !h.breaker.allow(&bkey).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let rows = h.breaker.snapshot().await;
+    let row = rows
+        .iter()
+        .find(|r| r.key == bkey)
+        .expect("the failed stream must trip the breaker for that key");
+    assert!(
+        row.reason.contains("JSON error injected into SSE stream"),
+        "the panel should carry the upstream's own wording, got {:?}",
+        row.reason
+    );
+    // The `event: error` line lands first and carries no message, so the
+    // placeholder must not be locked in — the `data:` line right behind it
+    // upgrades it.
+    assert!(
+        !row.reason.starts_with("upstream error event"),
+        "the placeholder must not be the final reason, got {:?}",
+        row.reason
+    );
+}
+
+#[tokio::test]
+async fn a_converted_stream_error_is_read_before_the_converter_drops_it() {
+    let server = MockServer::start().await;
+    // Anthropic-style SSE upstream; the converter (Anthropic → OpenAI) would
+    // drop `event: error` lines as unknown types, so detection has to run on
+    // the *raw upstream* line before the converter sees it.
+    upstream_stream_then_error(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "gpt-4o", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    for _ in 0..100 {
+        if let Ok(r) = sqlx::query("SELECT a.ok FROM log_attempts a ORDER BY a.id DESC LIMIT 1")
+            .fetch_one(h.pool())
+            .await
+        {
+            assert_eq!(r.get::<i64, _>("ok"), 0);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the converted stream wrote no log row");
+}
+
+#[tokio::test]
+async fn a_clean_stream_is_still_logged_as_a_success() {
+    // The counterpart: the detector must not fire on ordinary content, least
+    // of all on a model whose own output happens to talk about errors.
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"error: undefined variable\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    await_log_row(h.pool()).await;
+    let row = sqlx::query(
+        "SELECT a.ok, l.error FROM log_attempts a JOIN logs l ON l.id = a.log_id \
+         ORDER BY a.id DESC LIMIT 1",
+    )
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i64, _>("ok"), 1);
+    assert_eq!(row.get::<String, _>("error"), "");
+    assert!(
+        h.breaker
+            .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
+            .await,
+        "a clean stream must leave the breaker closed"
+    );
+}
+
 // ============ 2xx body validation ============
 //
 // A relay station whose own backend is down answers `200` with an error

@@ -1146,13 +1146,48 @@ struct StreamLog {
     /// capture writes the live (not frozen) debug flag value.
     state: Arc<AppState>,
     entry: LogEntry,
+    /// `channel|model` for the hop that opened this stream. Needed because a
+    /// stream's verdict can only be settled when the stream *ends* — long
+    /// after `relay()` returned and gave up ownership of the candidate walk.
+    breaker_key: String,
 }
 
 impl StreamLog {
     /// Finalize the log row and write the captured upstream bytes to disk
     /// when there's a reason to (`should_capture`). Usage is supplied by the
     /// caller (Drop impl of LogOnEnd).
-    async fn spawn_inline(mut self, usage: Option<convert::Usage>, capture: DebugCapture) {
+    async fn spawn_inline(
+        mut self,
+        usage: Option<convert::Usage>,
+        capture: DebugCapture,
+        stream_error: Option<String>,
+    ) {
+        // A 200 whose body turned out to be an error is a failure, and it has
+        // to be recorded as one: the log page otherwise shows a green 200 with
+        // zero tokens, and the breaker records Success and never backs off, so
+        // a dead provider keeps getting picked. The status stays 200 because
+        // that *is* what the client received — the status line was committed
+        // before a single body byte existed.
+        //
+        // The mutation has to touch both the summary `winner` field and the
+        // winner's clone at the tail of `attempts`: `log_request` reads the
+        // `ok` flag from each `attempts` row independently (the per-attempt
+        // `log_attempts` table is what the list page filters on), and the two
+        // start out as separate clones of the same Attempt.
+        if let Some(reason) = stream_error {
+            if let Some(winner) = self.entry.winner.as_mut() {
+                winner.ok = false;
+                winner.error = STREAM_ERROR_DETAIL.to_string();
+            }
+            if let Some(last) = self.entry.attempts.last_mut() {
+                last.ok = false;
+                last.error = STREAM_ERROR_DETAIL.to_string();
+            }
+            self.state
+                .breaker
+                .record(&self.breaker_key, Outcome::Failure(reason))
+                .await;
+        }
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
         }
@@ -1224,6 +1259,11 @@ struct LogOnEnd<S> {
     /// The upstream response body, accumulated as it streams past. Read at
     /// Drop and forwarded to `StreamLog` for the debug capture file.
     capture: DebugCapture,
+    /// Set by the pump when an SSE line announces an upstream error. The
+    /// stream is still forwarded verbatim — an in-stream error is a legitimate
+    /// terminal event that the client's protocol defines — but this is what
+    /// makes the hop count as a failure once it ends.
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 impl<S> LogOnEnd<S> {
@@ -1232,6 +1272,7 @@ impl<S> LogOnEnd<S> {
         log: StreamLog,
         usage: Arc<Mutex<Option<convert::Usage>>>,
         capture: DebugCapture,
+        stream_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             inner,
@@ -1239,6 +1280,7 @@ impl<S> LogOnEnd<S> {
             usage,
             converter_usage: None,
             capture,
+            stream_error,
         }
     }
     fn wrap_with_converter(
@@ -1246,6 +1288,7 @@ impl<S> LogOnEnd<S> {
         log: StreamLog,
         converter: Arc<Mutex<Box<dyn SseConverter>>>,
         capture: DebugCapture,
+        stream_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             inner,
@@ -1253,6 +1296,7 @@ impl<S> LogOnEnd<S> {
             usage: Arc::new(Mutex::new(None)),
             converter_usage: Some(converter),
             capture,
+            stream_error,
         }
     }
 }
@@ -1287,8 +1331,9 @@ impl<S> Drop for LogOnEnd<S> {
                 *self.usage.lock().unwrap()
             };
             let capture = self.capture.clone();
+            let stream_error = self.stream_error.lock().unwrap().clone();
             tokio::spawn(async move {
-                log.spawn_inline(usage, capture).await;
+                log.spawn_inline(usage, capture, stream_error).await;
             });
         }
     }
@@ -1297,8 +1342,70 @@ impl<S> Drop for LogOnEnd<S> {
 /// Pull the token breakdown out of one SSE `data:` payload. Implemented
 /// in `convert.rs` since that's where the OpenAI/Anthropic field-name
 /// knowledge already lives; re-exported here for the passthrough path.
+/// Capture the first message-bearing detection while letting the placeholder
+/// be upgraded later. `event: error` alone carries no message, so locking it
+/// in on first sight would discard the `data:` line right behind it.
+fn note_stream_error(slot: &std::sync::Mutex<Option<String>>, reason: String) {
+    let mut slot = slot.lock().unwrap();
+    match slot.as_deref() {
+        None => *slot = Some(reason),
+        Some(STREAM_ERROR_DETAIL) if reason != STREAM_ERROR_DETAIL => *slot = Some(reason),
+        _ => {}
+    }
+}
+
 fn usage_from_sse_payload(payload: &str) -> Option<convert::Usage> {
     convert::usage_from_sse_payload(payload)
+}
+
+/// The wording written to the log row when a stream carried an error event.
+///
+/// Fixed, and never a quote of the upstream text — same rule as
+/// [`UpstreamOutcome::InvalidBody`]: the row stays a stable label while the
+/// upstream's own wording goes to the breaker reason and the raw bytes to the
+/// capture file.
+const STREAM_ERROR_DETAIL: &str = "upstream error event inside a 200 stream";
+
+/// Does this SSE line announce that the upstream gave up?
+///
+/// Returns the upstream's own message when it has one, for the breaker panel.
+/// Streams report failure two different ways and both have to be caught:
+///
+/// - Anthropic (and relays copying it): an `event: error` line, whose `data:`
+///   payload is `{"type":"error","error":{...}}`.
+/// - OpenAI-compatible relays: no `event:` line at all, just a `data:` payload
+///   carrying an `error` object.
+///
+/// The test is deliberately structural and anchored to the *top level*: a
+/// model whose own text mentions errors arrives as
+/// `{"type":"content_block_delta","delta":{"text":"error: …"}}`, which must
+/// not be mistaken for one. That's why "error" as a substring never matches —
+/// only `type == "error"` or an actual `error` key does. The `error` half is
+/// deliberately loose about the value's shape: relays emit the string
+/// `"overloaded"` there as often as an object, and no successful frame in
+/// either protocol carries the key at all.
+///
+/// `Some(…)` is idempotent per stream: the caller keeps the first hit, so a
+/// provider that emits one error frame can't overwrite a more specific one.
+fn sse_line_error(line: &str) -> Option<String> {
+    let trimmed = line.trim_end_matches('\r');
+    if trimmed.strip_prefix("event:").map(str::trim) == Some("error") {
+        return Some(STREAM_ERROR_DETAIL.to_string());
+    }
+    let payload = trimmed.strip_prefix("data:")?.trim();
+    let v: Value = serde_json::from_str(payload).ok()?;
+    let is_error = v.get("type").and_then(|t| t.as_str()) == Some("error")
+        || v.get("error").is_some_and(|e| !e.is_null());
+    if !is_error {
+        return None;
+    }
+    Some(
+        v.pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| STREAM_ERROR_DETAIL.to_string()),
+    )
 }
 
 /// Forward an upstream SSE byte stream to the client verbatim, but parse
@@ -1313,10 +1420,19 @@ fn passthrough_stream(
 ) -> Response {
     let usage: Arc<Mutex<Option<convert::Usage>>> = Arc::new(Mutex::new(None));
     let usage_for_drop = Arc::clone(&usage);
+    let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let err_for_pump = Arc::clone(&stream_error);
     let body_stream = stream::unfold(
-        (resp, Vec::<u8>::new(), Arc::clone(&usage), capture.clone()),
+        (
+            resp,
+            Vec::<u8>::new(),
+            Arc::clone(&usage),
+            capture.clone(),
+            err_for_pump,
+        ),
         |mut st| async move {
-            let (resp, buf, usage_ref, capture) = (&mut st.0, &mut st.1, &mut st.2, &st.3);
+            let (resp, buf, usage_ref, capture, err_ref) =
+                (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4);
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
                     // Capture the raw upstream bytes for the debug log, then
@@ -1331,6 +1447,9 @@ fn passthrough_stream(
                         let line: Vec<u8> = buf.drain(..=pos).collect();
                         let line_str = std::str::from_utf8(&line).unwrap_or("");
                         let trimmed = line_str.trim_end_matches('\r');
+                        if let Some(reason) = sse_line_error(trimmed) {
+                            note_stream_error(err_ref, reason);
+                        }
                         if let Some(payload) = trimmed.strip_prefix("data:") {
                             if let Some(u) = usage_from_sse_payload(payload.trim()) {
                                 *usage_ref.lock().unwrap() = Some(u);
@@ -1356,6 +1475,7 @@ fn passthrough_stream(
             log,
             usage_for_drop,
             capture,
+            stream_error,
         )))
         .unwrap_or_else(|_| {
             error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
@@ -1375,6 +1495,7 @@ fn converted_stream(
     capture: DebugCapture,
 ) -> Response {
     let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
+    let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut response = Response::builder().status(StatusCode::OK);
     if let Some(h) = response.headers_mut() {
         h.insert(
@@ -1388,10 +1509,11 @@ fn converted_stream(
         Arc::clone(&conv),
         false,
         capture.clone(),
+        stream_error.clone(),
     );
     let body_stream = stream::unfold(state, |mut st| async move {
-        let (resp, buf, conv_ref, done) = (&mut st.0, &mut st.1, &mut st.2, &mut st.3);
-        let capture = &st.4;
+        let (resp, buf, conv_ref, done, capture, err_ref) =
+            (&mut st.0, &mut st.1, &mut st.2, &mut st.3, &st.4, &st.5);
         loop {
             if *done {
                 return None;
@@ -1399,6 +1521,13 @@ fn converted_stream(
             if let Some(pos) = buf.find('\n') {
                 let line = buf[..pos].trim_end_matches('\r').to_string();
                 buf.drain(..=pos);
+                // Read the error off the *raw upstream* line, before the
+                // converter sees it. The converter drops event types it
+                // doesn't model, so an error frame would otherwise leave no
+                // trace anywhere and this hop would log as a clean success.
+                if let Some(reason) = sse_line_error(&line) {
+                    note_stream_error(err_ref, reason);
+                }
                 if let Some(payload) = line.strip_prefix("data:") {
                     let payload = payload.trim();
                     let events = if payload == "[DONE]" {
@@ -1451,6 +1580,7 @@ fn converted_stream(
             log,
             conv,
             capture,
+            stream_error,
         )))
         .unwrap_or_else(|_| {
             error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
@@ -1527,6 +1657,7 @@ async fn respond_from_upstream(
                 pool: state.pool.clone(),
                 state: ctx.state_arc.clone(),
                 entry,
+                breaker_key: breaker::breaker_key(&cand.name, model),
             };
             let capture = DebugCapture::new();
             let response = match cand.convert {
@@ -2445,5 +2576,60 @@ mod tests {
         assert!(is_json_content_type("application/problem+json"));
         assert!(!is_json_content_type("text/event-stream"));
         assert!(!is_json_content_type("text/plain"));
+    }
+
+    // ---------- sse_line_error ----------
+
+    #[test]
+    fn an_anthropic_error_event_is_recognised_with_its_own_message() {
+        let reason = sse_line_error("event: error").expect("event: error must be caught");
+        assert_eq!(reason, STREAM_ERROR_DETAIL);
+        let with_payload = sse_line_error(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"provider_unavailable\"}}",
+        )
+        .expect("the error payload must be caught");
+        assert_eq!(with_payload, "provider_unavailable");
+    }
+
+    #[test]
+    fn an_openai_style_in_stream_error_is_recognised_without_an_event_line() {
+        // Relays that speak the OpenAI dialect send a bare `data:` error with
+        // no `event:` line at all; only watching for `event: error` would miss
+        // every one of them.
+        let reason = sse_line_error(
+            "data: {\"error\":{\"message\":\"upstream node is down\",\"code\":\"internal\"}}",
+        )
+        .expect("a data-only error envelope must be caught");
+        assert_eq!(reason, "upstream node is down");
+    }
+
+    #[test]
+    fn ordinary_stream_events_are_not_mistaken_for_errors() {
+        for line in [
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-1\"}}",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"error: undefined variable\"}}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+            "event: message_stop",
+            "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"an error occurred\"}}]}",
+            "data: [DONE]",
+            ": keep-alive comment",
+            "",
+        ] {
+            assert!(
+                sse_line_error(line).is_none(),
+                "false positive on {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crlf_stream_and_a_bare_error_object_both_still_detect() {
+        assert!(sse_line_error("event: error\r").is_some());
+        // A relay that ships the message key but no type is still an error.
+        assert_eq!(
+            sse_line_error("data: {\"error\":\"overloaded\"}"),
+            Some(STREAM_ERROR_DETAIL.to_string()),
+            "a non-object error value is still an error envelope"
+        );
     }
 }
