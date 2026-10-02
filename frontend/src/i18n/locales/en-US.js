@@ -28,6 +28,7 @@ export default {
     logs: 'Logs',
     users: 'Users',
     settings: 'Settings',
+    breakerHistory: 'Breaker history',
     adminBadge: 'Admin',
     github: 'Project GitHub',
     logout: 'Sign out',
@@ -191,6 +192,7 @@ export default {
         'Open (channel, model) pairs are skipped by the router without a request; the log still records the skip, but it does not count as a failure.\n          Any failure (5xx / 408 / 429 / other 4xx / network error) opens the breaker for {base}s — 400 and 422 excepted, those mean a bad request rather than a sick upstream;\n          if the probe fails again the backoff doubles (×2), capped at {max}s.\n          Recovery relies solely on the background task probing due pairs every {probe}s; user requests are not retried before then. A recovered pair drops out of this table.\n          "Probe now" skips the wait and pings every currently open pair right away — no need to sit out the backoff after fixing an upstream.',
       allHealthy: 'All upstream pairs are healthy',
       col: { channel: 'Channel', model: 'Model', reason: 'Reason', nextProbe: 'Next probe' },
+      viewHistory: 'View history',
     },
     aliasRequired: 'Please enter a client model name',
     needOneTarget: 'Add at least one forwarding target',
@@ -296,6 +298,31 @@ export default {
     connFailed: 'Connection failed',
     latencyNote:
       'Duration is cumulative from the moment the request entered the gateway until that attempt finished, so later attempts show larger values.',
+  },
+  breakerHistory: {
+    title: 'Breaker history',
+    empty: 'No events recorded yet',
+    col: {
+      time: 'Time',
+      event: 'Event',
+      channel: 'Channel',
+      model: 'Model',
+      reason: 'Reason',
+      backoff: 'Backoff',
+    },
+    filter: {
+      channel: 'Channel',
+      model: 'Model',
+      event: 'Event',
+      reset: 'Reset',
+    },
+    event: {
+      tripped: 'Tripped',
+      retripped: 'Re-tripped',
+      recovered: 'Recovered',
+      resetAll: 'Reset all',
+      resetKey: 'Reset (key)',
+    },
   },
   settings: {
     description: 'Global settings',

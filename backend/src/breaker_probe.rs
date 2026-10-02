@@ -20,7 +20,8 @@
 //! from `GET /v1/models` and cache it for `model_cache_ttl`. Configured
 //! non-wildcard `models` lists are used verbatim with no extra round-trip.
 
-use crate::breaker::{self, Outcome};
+use crate::breaker::{self, Outcome, TransitionKind};
+use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
 use crate::proxy;
 use crate::state::AppState;
 use serde_json::json;
@@ -132,6 +133,18 @@ async fn sweep(
                     .breaker
                     .reset_key(&breaker::breaker_key(&channel_name, m))
                     .await;
+                // Append a `reset_key` row so the history reflects *something*
+                // removed the entry; the user's view shouldn't go dark.
+                record_breaker_event(
+                    &state.pool,
+                    BreakerEventRow {
+                        channel_name: channel_name.clone(),
+                        target_model: m.clone(),
+                        event: BreakerEventKind::ResetKey,
+                        reason: "channel deleted or disabled".to_string(),
+                        backoff_secs: 0,
+                    },
+                );
             }
             continue;
         };
@@ -145,7 +158,7 @@ async fn sweep(
             }
             let result = probe_one(state, &ch, m).await;
             let success = matches!(result, ProbeResult::Success);
-            state
+            let transition = state
                 .breaker
                 .record(
                     &breaker::breaker_key(&channel_name, m),
@@ -156,6 +169,26 @@ async fn sweep(
                     },
                 )
                 .await;
+            // Append the matching history row. None = breaker disabled,
+            // record() was a no-op — nothing to log.
+            let event_kind = match transition.kind {
+                TransitionKind::Inserted => Some(BreakerEventKind::Tripped),
+                TransitionKind::Updated => Some(BreakerEventKind::ReTripped),
+                TransitionKind::Removed => Some(BreakerEventKind::Recovered),
+                TransitionKind::None => None,
+            };
+            if let Some(event) = event_kind {
+                record_breaker_event(
+                    &state.pool,
+                    BreakerEventRow {
+                        channel_name: channel_name.clone(),
+                        target_model: m.clone(),
+                        event,
+                        reason: transition.reason,
+                        backoff_secs: transition.backoff_secs,
+                    },
+                );
+            }
             log_probe(&channel_name, m, &result);
             report.probed += 1;
             if success {

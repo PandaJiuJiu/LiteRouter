@@ -11,6 +11,7 @@
         <el-menu-item v-if="isAdmin" index="/mappings">{{ t('nav.mappings') }}</el-menu-item>
         <el-menu-item index="/usage">{{ t('nav.usage') }}</el-menu-item>
         <el-menu-item index="/logs">{{ t('nav.logs') }}</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/breaker/history">{{ t('nav.breakerHistory') }}</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/users">{{ t('nav.users') }}</el-menu-item>
         <el-menu-item index="/settings">{{ t('nav.settings') }}</el-menu-item>
       </el-menu>

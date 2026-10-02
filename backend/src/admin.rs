@@ -1466,3 +1466,170 @@ pub async fn usage(
 // `into_response` is brought in scope for fetch_models above; using a
 // qualified import keeps the helper file narrower.
 use axum::response::IntoResponse;
+
+// ---------- breaker history ----------
+//
+// The breaker is in-memory only (process restart wipes every key), but the
+// admin panel needs to answer "did this model trip yesterday?" — that question
+// needs durable rows. `breaker_history::record_breaker_event` writes them from
+// the call sites that already observe state changes (proxy / probe / admin
+// reset). These handlers are the read side.
+
+/// Closed-set of valid `event` values, exposed to clients through the
+/// `event` filter on both endpoints. The UI renders the dropdown from this
+/// list so adding a new event type only needs editing one struct + the
+/// i18n files.
+const BREAKER_EVENT_VALUES: &[&str] = &[
+    "tripped",
+    "re-tripped",
+    "recovered",
+    "reset_all",
+    "reset_key",
+];
+
+#[derive(Deserialize)]
+pub struct BreakerHistoryQuery {
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_size")]
+    pub size: i64,
+    /// Time window in hours. `0` = no window (everything).
+    #[serde(default = "default_range_hours")]
+    pub range: i64,
+    /// Exact-match on `channel_name`.
+    #[serde(default)]
+    pub channel: String,
+    /// Exact-match on `target_model`.
+    #[serde(default)]
+    pub model: String,
+    /// Exact-match on `event`. The closed set is [`BREAKER_EVENT_VALUES`];
+    /// anything outside it is silently ignored at the SQL level because
+    /// the column matches no row.
+    #[serde(default)]
+    pub event: String,
+}
+
+/// Build the WHERE clause for `breaker_events` queries. `skip` lets the
+/// filter-options endpoint apply the facet rule: each dropdown is computed
+/// without *its own* filter, so picking `channel=foo` doesn't leave the
+/// channel dropdown offering only `foo`.
+fn breaker_history_where(
+    range: i64,
+    channel: &str,
+    model: &str,
+    event: &str,
+    skip: Option<&str>,
+) -> (String, Vec<LogBind>) {
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<LogBind> = Vec::new();
+    if range > 0 {
+        let since = crate::db::now() - range.min(24 * 365) * 3600;
+        where_parts.push("created_at >= ?".to_string());
+        binds.push(LogBind::Int(since));
+    }
+    let channel = channel.trim();
+    if !channel.is_empty() && skip != Some("channel") {
+        where_parts.push("channel_name = ?".to_string());
+        binds.push(LogBind::Text(channel.to_string()));
+    }
+    let model = model.trim();
+    if !model.is_empty() && skip != Some("model") {
+        where_parts.push("target_model = ?".to_string());
+        binds.push(LogBind::Text(model.to_string()));
+    }
+    let event = event.trim();
+    if !event.is_empty() && skip != Some("event") {
+        where_parts.push("event = ?".to_string());
+        binds.push(LogBind::Text(event.to_string()));
+    }
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    (where_sql, binds)
+}
+
+/// GET /api/breaker/history — paged list of breaker events. Admin only:
+/// the table records which `(channel, model)` is broken, which is itself
+/// infrastructure detail.
+pub async fn list_breaker_history(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<BreakerHistoryQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_admin(&state, &headers)?;
+    let offset = (q.page - 1).max(0) * q.size;
+    let (where_sql, binds) = breaker_history_where(q.range, &q.channel, &q.model, &q.event, None);
+
+    let count_sql = format!("SELECT COUNT(*) FROM breaker_events{where_sql}");
+    let total: i64 = bind_clause!(sqlx::query_scalar(&count_sql), &binds)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let page_sql = format!(
+        "SELECT id, channel_name, target_model, event, reason, backoff_secs, created_at \
+         FROM breaker_events{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+    );
+    let rows = bind_clause!(sqlx::query(&page_sql), &binds)
+        .bind(q.size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<i64, _>("id"),
+                "channel_name": r.get::<String, _>("channel_name"),
+                "target_model": r.get::<String, _>("target_model"),
+                "event": r.get::<String, _>("event"),
+                "reason": r.get::<String, _>("reason"),
+                "backoff_secs": r.get::<i64, _>("backoff_secs"),
+                "created_at": r.get::<i64, _>("created_at"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "events": events, "total": total })))
+}
+
+/// GET /api/breaker/history/filter-options — the dropdown values the
+/// channel and model filters can take. `event` is a closed set rendered
+/// straight from the i18n / BREAKER_EVENT_VALUES on the client, so it
+/// isn't recomputed here.
+pub async fn breaker_history_filter_options(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<BreakerHistoryQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    require_admin(&state, &headers)?;
+    let mut out = serde_json::Map::new();
+
+    for (column, key, skip) in [
+        ("channel_name", "channel", Some("channel")),
+        ("target_model", "model", Some("model")),
+    ] {
+        let (where_sql, binds) =
+            breaker_history_where(q.range, &q.channel, &q.model, &q.event, skip);
+        let sql = format!(
+            "SELECT DISTINCT {column} AS v FROM breaker_events{where_sql} \
+             ORDER BY v LIMIT {LOG_OPTION_ROW_CAP}"
+        );
+        let values: Vec<String> = bind_clause!(sqlx::query_scalar(&sql), &binds)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .filter(|v: &String| !v.is_empty())
+            .collect();
+        out.insert(key.to_string(), json!(values));
+    }
+    // Closed set; the client renders these as the source of truth so any
+    // new event kind only needs editing BREAKER_EVENT_VALUES + the i18n
+    // files, with no schema migration in between.
+    out.insert("event".to_string(), json!(BREAKER_EVENT_VALUES));
+
+    Ok(Json(Value::Object(out)))
+}

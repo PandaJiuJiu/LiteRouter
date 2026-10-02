@@ -60,6 +60,7 @@ describe('sidebar', () => {
       zhCN.nav.mappings,
       zhCN.nav.usage,
       zhCN.nav.logs,
+      zhCN.nav.breakerHistory,
       zhCN.nav.users,
       zhCN.nav.settings,
     ])

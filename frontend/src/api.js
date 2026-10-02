@@ -160,5 +160,15 @@ export const resetBreaker = () =>
 // the fresh snapshot too, so the caller can re-render without a second call.
 export const probeBreakerNow = () =>
   api.post('/breaker/probe-now').then((r) => r.data)
+// Append-only history (tripped / re-tripped / recovered / reset_all /
+// reset_key). Same shape as the logs endpoint: { events, total }.
+export const listBreakerHistory = (page = 1, size = 20, range = 1, filters = {}) =>
+  api.get('/breaker/history', { params: { page, size, range, ...filters } }).then((r) => r.data)
+// Dropdown values for the channel / model filters; `event` is a closed set
+// rendered straight from i18n on the client.
+export const listBreakerHistoryFilterOptions = (range = 1, filters = {}) =>
+  api
+    .get('/breaker/history/filter-options', { params: { range, ...filters } })
+    .then((r) => r.data)
 
 export default api

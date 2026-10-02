@@ -18,6 +18,7 @@
 
 use crate::admin;
 use crate::breaker::{self, Outcome};
+use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
 use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::state::AppState;
@@ -1042,6 +1043,9 @@ pub(crate) async fn read_error_detail(resp: reqwest::Response) -> Option<String>
 /// out-of-credit, 404 model-gone, 405 protocol-mismatch) — is treated
 /// as an upstream health signal and trips the breaker for the next
 /// `base_delay` seconds.
+///
+/// Side effect: appends a `tripped` / `re-tripped` history row when the
+/// breaker actually changes state (fire-and-forget, never blocks).
 async fn record_outcome_in_breaker(
     state: &AppState,
     breaker_key: &str,
@@ -1061,10 +1065,30 @@ async fn record_outcome_in_breaker(
             Some(d) => format!("HTTP {code}: {d}"),
             None => format!("HTTP {code}"),
         };
-        state
+        let transition = state
             .breaker
             .record(breaker_key, Outcome::Failure(reason))
             .await;
+        let event_kind = match transition.kind {
+            breaker::TransitionKind::Inserted => Some(BreakerEventKind::Tripped),
+            breaker::TransitionKind::Updated => Some(BreakerEventKind::ReTripped),
+            breaker::TransitionKind::Removed | breaker::TransitionKind::None => None,
+        };
+        if let Some(event) = event_kind {
+            // Splits on the first `|`, so a model name containing `|`
+            // round-trips correctly (see `breaker::split_key_owned` test).
+            let (channel, model) = breaker::split_key_owned(breaker_key);
+            record_breaker_event(
+                &state.pool,
+                BreakerEventRow {
+                    channel_name: channel,
+                    target_model: model,
+                    event,
+                    reason: transition.reason,
+                    backoff_secs: transition.backoff_secs,
+                },
+            );
+        }
     }
 }
 

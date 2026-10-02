@@ -45,6 +45,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::auth::require_admin;
+use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
 use crate::state::AppState;
 
 /// Tunables. Defaults are loaded from the `settings` table at startup.
@@ -85,6 +86,34 @@ pub enum Outcome {
     /// or a probe-side message. Surfaced in the admin snapshot so an
     /// operator can tell an outage from a bad key without reading logs.
     Failure(String),
+}
+
+/// One transition the breaker made after `record()` ran, returned to the
+/// caller so an upstream module can decide what history row to append without
+/// re-querying internal state. `disabled → None` is its own case so the
+/// hot path can short-circuit cleanly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// Breaker disabled — record() was a no-op.
+    None,
+    /// Closed → Open: first failure for this key.
+    Inserted,
+    /// Open → Open: subsequent failure, backoff doubled (capped).
+    Updated,
+    /// Open → Closed: success removed the entry.
+    Removed,
+}
+
+/// Carries the kind of transition plus the data the caller needs to record
+/// it: the current backoff (in seconds) and the reason string the breaker
+/// has on file. `backoff_secs` is `0` for `None` / `Removed` (where no
+/// backoff is in effect at the moment of the transition); the latest
+/// incoming reason is what the breaker is about to (or just) stored.
+#[derive(Clone, Debug)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    pub backoff_secs: u64,
+    pub reason: String,
 }
 
 /// Upstream errors are unbounded strings — a provider's error `message` can
@@ -192,10 +221,18 @@ impl Breaker {
 
     /// Feed one outcome back into the breaker. Called from both the relay
     /// (user-driven attempts) and the probe task (synthetic probes).
-    pub async fn record(&self, key: &str, outcome: Outcome) {
+    ///
+    /// Returns the [`Transition`] that was applied, so an upstream module
+    /// can append a history row without re-querying internal state. When
+    /// `enabled == false` the transition is [`TransitionKind::None`].
+    pub async fn record(&self, key: &str, outcome: Outcome) -> Transition {
         let cfg = self.cfg.read().await.clone();
         if !cfg.enabled {
-            return;
+            return Transition {
+                kind: TransitionKind::None,
+                backoff_secs: 0,
+                reason: String::new(),
+            };
         }
         let now = Instant::now();
         let mut guard = self.inner.write().await;
@@ -204,17 +241,23 @@ impl Breaker {
                 // Drop the entry entirely — the next failure, if any,
                 // starts a fresh ladder at `base_delay`.
                 guard.remove(key);
+                Transition {
+                    kind: TransitionKind::Removed,
+                    backoff_secs: 0,
+                    reason: String::new(),
+                }
             }
             Outcome::Failure(reason) => {
                 let reason = clip_reason(&reason);
-                let backoff = match guard.entry(key.to_owned()) {
+                let (kind, backoff) = match guard.entry(key.to_owned()) {
                     Entry::Occupied(o) => {
-                        o.get().current_backoff.saturating_mul(2).min(cfg.max_delay)
+                        let backoff = o.get().current_backoff.saturating_mul(2).min(cfg.max_delay);
+                        (TransitionKind::Updated, backoff)
                     }
                     Entry::Vacant(v) => {
                         let deadline = now.checked_add(cfg.base_delay).unwrap_or(now);
                         v.insert(BreakerState::open(cfg.base_delay, deadline, reason.clone()));
-                        cfg.base_delay
+                        (TransitionKind::Inserted, cfg.base_delay)
                     }
                 };
                 let entry = guard.get_mut(key).expect("just inserted");
@@ -223,7 +266,12 @@ impl Breaker {
                 }
                 entry.deadline = now.checked_add(entry.current_backoff).unwrap_or(now);
                 // Latest failure wins — see `BreakerSnapshotRow::reason`.
-                entry.reason = reason;
+                entry.reason = reason.clone();
+                Transition {
+                    kind,
+                    backoff_secs: backoff.as_secs(),
+                    reason,
+                }
             }
         }
     }
@@ -276,9 +324,15 @@ impl Breaker {
         out
     }
 
-    pub async fn reset(&self) {
+    /// Clear every key. Returns the `(channel, target_model)` pairs that were
+    /// dropped so the caller (the admin HTTP handler) can append one
+    /// `reset_all` history row per pair. Order matches the map's iteration
+    /// order; the panel doesn't care and the history page is sorted by time.
+    pub async fn reset(&self) -> Vec<(String, String)> {
         let mut guard = self.inner.write().await;
+        let keys: Vec<(String, String)> = guard.keys().map(|k| split_key_owned(k)).collect();
         guard.clear();
+        keys
     }
 
     /// Drop a single key. Used by the probe task when its channel row
@@ -290,7 +344,11 @@ impl Breaker {
     }
 }
 
-fn split_key_owned(key: &str) -> (String, String) {
+/// Split a `"{channel}|{model}"` key back into the two halves. Splits on
+/// the first `|` only, so a model name containing `|` round-trips
+/// correctly (covered by the unit test below). `pub` so call sites that
+/// just recorded an outcome can log the pair without re-reading the map.
+pub fn split_key_owned(key: &str) -> (String, String) {
     match key.split_once('|') {
         Some((c, m)) => (c.to_string(), m.to_string()),
         None => (String::new(), key.to_string()),
@@ -313,6 +371,9 @@ pub async fn http_snapshot(
 
 /// POST /api/breaker/reset — clear every key's state. Useful after a known
 /// upstream incident to bring everything back to CLOSED immediately.
+///
+/// Each cleared pair gets a `reset_all` row appended to the history so an
+/// admin can tell "the probe recovered this" from "I just hit the button".
 pub async fn http_reset(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -320,7 +381,19 @@ pub async fn http_reset(
     if require_admin(&state, &headers).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    state.breaker.reset().await;
+    let cleared = state.breaker.reset().await;
+    for (channel, target_model) in cleared {
+        record_breaker_event(
+            &state.pool,
+            BreakerEventRow {
+                channel_name: channel,
+                target_model,
+                event: BreakerEventKind::ResetAll,
+                reason: String::new(),
+                backoff_secs: 0,
+            },
+        );
+    }
     Json(json!({ "ok": true })).into_response()
 }
 

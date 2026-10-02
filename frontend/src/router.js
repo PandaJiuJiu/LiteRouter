@@ -16,6 +16,7 @@ const routes = [
       { path: 'mappings', component: () => import('./views/Mappings.vue') },
       { path: 'logs', component: () => import('./views/Logs.vue') },
       { path: 'logs/:id', component: () => import('./views/LogDetail.vue') },
+      { path: 'breaker/history', component: () => import('./views/BreakerHistory.vue') },
       { path: 'users', component: () => import('./views/Users.vue') },
       { path: 'settings', component: () => import('./views/Settings.vue') },
     ],

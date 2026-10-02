@@ -127,6 +127,7 @@
             @click="onProbeNow"
           >{{ t('mappings.breaker.probeNow') }}</el-button>
           <el-button size="small" type="danger" plain @click="onResetBreaker">{{ t('mappings.breaker.reset') }}</el-button>
+          <el-button size="small" @click="onViewHistory">{{ t('mappings.breaker.viewHistory') }}</el-button>
         </div>
         <div class="hint breaker-desc">{{ t('mappings.breaker.desc', breakerParams) }}</div>
         <el-table
@@ -158,8 +159,10 @@ import { translate } from '../i18n'
 import { listMappings, createMapping, updateMapping, deleteMapping, listChannelModels, getBreakerConfig } from '../api'
 import { loadSession, session } from '../session'
 import { breaker, loadBreakerSnapshot, resetAllBreakers, probeBreakersNow } from '../breaker'
+import { useRouter } from 'vue-router'
 
 const { t } = useI18n()
+const router = useRouter()
 
 const mappings = ref([])
 const channelModels = ref([])
@@ -217,6 +220,13 @@ async function onProbeNow() {
   } else {
     ElMessage.success(t('mappings.breaker.probeDone', { probed, recovered }))
   }
+}
+
+function onViewHistory() {
+  // Sibling page under the admin layout — the breaker panel is the natural
+  // entry point because the table there is what makes "why is this tripped?"
+  // a question worth answering with a history.
+  router.push('/breaker/history')
 }
 
 function newTarget() {

@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod auth;
 pub mod breaker;
+pub mod breaker_history;
 pub mod breaker_probe;
 pub mod config_backup;
 pub mod config_backup_routes;
@@ -109,6 +110,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/breaker/snapshot", get(breaker::http_snapshot))
         .route("/api/breaker/reset", post(breaker::http_reset))
         .route("/api/breaker/probe-now", post(breaker::http_probe_now))
+        .route("/api/breaker/history", get(admin::list_breaker_history))
+        .route(
+            "/api/breaker/history/filter-options",
+            get(admin::breaker_history_filter_options),
+        )
         .route(
             "/api/config/export",
             post(config_backup_routes::export_config),
