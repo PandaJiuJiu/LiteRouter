@@ -3,14 +3,38 @@
     <div class="toolbar">
       <span>{{ t('logs.title') }}</span>
       <div class="filters">
-        <el-radio-group v-model="range" @change="reload">
+        <el-radio-group v-model="range" @change="applyFilters">
           <el-radio-button :value="1">{{ t('logs.range.hour') }}</el-radio-button>
           <el-radio-button :value="24">{{ t('logs.range.day') }}</el-radio-button>
           <el-radio-button :value="168">{{ t('logs.range.week') }}</el-radio-button>
           <el-radio-button :value="0">{{ t('logs.range.all') }}</el-radio-button>
         </el-radio-group>
-        <el-button @click="load">{{ t('common.refresh') }}</el-button>
+        <el-button @click="refresh">{{ t('common.refresh') }}</el-button>
       </div>
+    </div>
+    <div class="filter-row">
+      <el-select
+        v-for="f in FILTER_FIELDS"
+        :key="f.key"
+        v-model="filters[f.key]"
+        size="small"
+        filterable
+        clearable
+        :loading="optionsLoading"
+        :placeholder="t(f.label)"
+        :class="f.cls"
+        @change="applyFilters"
+      >
+        <el-option
+          v-for="v in options[f.key] || []"
+          :key="String(v)"
+          :label="String(v)"
+          :value="v"
+        />
+      </el-select>
+      <el-button size="small" :disabled="!hasFilters" @click="resetFilters">
+        {{ t('logs.filter.reset') }}
+      </el-button>
     </div>
     <el-table :data="logs" v-loading="loading" @row-click="open">
       <el-table-column :label="t('logs.col.time')" width="165" show-overflow-tooltip>
@@ -105,10 +129,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { listLogs } from '../api'
+import { listLogFilterOptions, listLogs } from '../api'
 import { loadSession, session } from '../session'
 import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
 
@@ -121,6 +145,70 @@ const page = ref(1)
 const size = ref(20)
 // Window in hours; 0 = all time. Default 1h to match the backend default.
 const range = ref(1)
+// The five dropdowns. `key` is both the query-param name and the field the
+// option list arrives under, so the row renders itself; `upstream_model` is the
+// one snake_case key, which is why `filters` uses it verbatim.
+const FILTER_FIELDS = [
+  { key: 'ip', label: 'logs.filter.ip', cls: 'f-ip' },
+  { key: 'token', label: 'logs.filter.token', cls: 'f-token' },
+  { key: 'model', label: 'logs.filter.model', cls: 'f-model' },
+  { key: 'upstream_model', label: 'logs.filter.upstreamModel', cls: 'f-model' },
+  { key: 'status', label: 'logs.filter.status', cls: 'f-status' },
+]
+// Selection state, applied on change — there's nothing to type, so a dropdown
+// pick *is* the intent. `''` means "no filter".
+const filters = reactive({ ip: '', token: '', model: '', upstream_model: '', status: '' })
+// Values each dropdown may offer, refetched whenever the filters or the window
+// change: the server computes every dropdown without its own filter, so
+// narrowing by token narrows the IP list too (facet rule) — an option that had
+// no matching row left is never offered.
+const options = ref({})
+const optionsLoading = ref(false)
+const hasFilters = computed(() => FILTER_FIELDS.some((f) => filters[f.key] !== ''))
+
+/** The current selection as query params. Unset boxes are dropped rather than
+ *  sent empty — `status=` would deserialize to nothing server-side and 400 the
+ *  whole list. */
+function filterParams() {
+  const params = {}
+  for (const { key } of FILTER_FIELDS) {
+    const v = filters[key]
+    if (v !== '' && v !== null && v !== undefined) params[key] = v
+  }
+  return params
+}
+
+function applyFilters() {
+  reload()
+  loadOptions()
+}
+
+// Plain refresh keeps the current page — unlike `applyFilters`, it isn't a
+// change of result set. The dropdowns still refresh: new traffic in the window
+// means new values to offer.
+function refresh() {
+  load()
+  loadOptions()
+}
+
+function resetFilters() {
+  for (const { key } of FILTER_FIELDS) filters[key] = ''
+  applyFilters()
+}
+
+async function loadOptions() {
+  optionsLoading.value = true
+  try {
+    options.value = await listLogFilterOptions(range.value, filterParams())
+  } catch (_) {
+    // Keep the previous options: an empty list would leave every dropdown blank
+    // and hide the fact that anything was ever selectable. The interceptor
+    // surfaces the 403/500.
+  } finally {
+    optionsLoading.value = false
+  }
+}
+
 // The debug switch is admin-only server-side; regular users don't see it.
 const isAdmin = computed(() => session.isAdmin)
 
@@ -133,7 +221,8 @@ async function onDebugToggle(v) {
 }
 
 // Switching the window invalidates the current page number — page 4 of the
-// old window is meaningless in the new one.
+// old window is meaningless in the new one. The filter dropdowns go with it:
+// their options are scoped to the window, so they have to be refetched too.
 function reload() {
   page.value = 1
   load()
@@ -142,7 +231,7 @@ function reload() {
 async function load() {
   loading.value = true
   try {
-    const data = await listLogs(page.value, size.value, range.value)
+    const data = await listLogs(page.value, size.value, range.value, filterParams())
     logs.value = data.logs
     total.value = data.total
     // A stale page (e.g. after deletions) can leave us past the last page.
@@ -182,6 +271,8 @@ onMounted(async () => {
     loadDebugLogging()
   }
   load()
+  // The dropdowns are scoped to the window, so they move with it.
+  loadOptions()
 })
 </script>
 
@@ -190,6 +281,26 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+/* Fixed-ish widths rather than flex:1 — the five boxes should read as one
+   toolbar, and equal stretch makes the 3-digit status box as wide as the IP
+   one. */
+.f-ip,
+.f-token {
+  width: 170px;
+}
+.f-model {
+  width: 190px;
+}
+.f-status {
+  width: 110px;
 }
 .ip {
   font-size: 12px;
