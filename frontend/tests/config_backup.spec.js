@@ -19,8 +19,16 @@ const router = createRouter({
 
 const wrappers = []
 
-async function mountBackup() {
-  const w = mount(ConfigBackup, { global: { plugins: [ElementPlus, i18n, router] } })
+// `dialogs` lets a spec open one of the two dialogs up-front, so the
+// buttons inside the dialog (which the assertions look up via
+// `findAll('button')`) are actually mounted in jsdom. Default keeps
+// both closed — most tests drive logic through the exposed helpers and
+// only need the dialog open when they're asserting on rendered DOM.
+async function mountBackup(dialogs = {}) {
+  const w = mount(ConfigBackup, {
+    props: { exportVisible: !!dialogs.export, importVisible: !!dialogs.import },
+    global: { plugins: [ElementPlus, i18n, router] },
+  })
   wrappers.push(w)
   await flushPromises()
   return w
@@ -39,7 +47,7 @@ beforeEach(() => {
 
 describe('ConfigBackup — export', () => {
   it('blocks the button until a passphrase is long enough and matches', async () => {
-    const w = await mountBackup()
+    const w = await mountBackup({ export: true })
     const button = w.findAll('button').find((b) => b.text().includes('导出'))
     expect(button.exists()).toBe(true)
     // Length < 8: still off.
@@ -53,7 +61,7 @@ describe('ConfigBackup — export', () => {
   })
 
   it('rejects mismatched passphrases with a visible error', async () => {
-    const w = await mountBackup()
+    const w = await mountBackup({ export: true })
     w.vm.setExport({ pass: 'aaaaaaaa', confirm: 'bbbbbbbb' })
     // Button is disabled when invalid; doExport still surfaces the error.
     await w.vm.doExport()
@@ -104,7 +112,7 @@ describe('ConfigBackup — import preview + commit', () => {
 
   it('shows create/update/skip/keep_both counts and a per-row picker', async () => {
     previewImport.mockResolvedValue(PLAN)
-    const w = await mountBackup()
+    const w = await mountBackup({ import: true })
     // Set the import up before triggering.
     w.vm.setImport({ bytes: 'AAAA', name: 'backup.lrbak', pass: 'aaaaaaaa' })
     await w.vm.doPreview()
@@ -122,7 +130,7 @@ describe('ConfigBackup — import preview + commit', () => {
   it('refuses commit when a conflict has no decision', async () => {
     previewImport.mockResolvedValue(PLAN)
     commitImport.mockResolvedValue({ created: 0, updated: 0, skipped: 0, kept_both: 0 })
-    const w = await mountBackup()
+    const w = await mountBackup({ import: true })
     w.vm.setImport({ bytes: 'AAAA', name: 'backup.lrbak', pass: 'aaaaaaaa' })
     await w.vm.doPreview()
     const apply = w.findAll('button').find((b) => b.text().includes('应用'))
@@ -136,7 +144,7 @@ describe('ConfigBackup — import preview + commit', () => {
   it('sends a keep_both action when the user picks it', async () => {
     previewImport.mockResolvedValue(PLAN)
     commitImport.mockResolvedValue({ created: 0, updated: 0, skipped: 0, kept_both: 1 })
-    const w = await mountBackup()
+    const w = await mountBackup({ import: true })
     w.vm.setImport({ bytes: 'AAAA', name: 'backup.lrbak', pass: 'aaaaaaaa' })
     await w.vm.doPreview()
     // jsdom can't drive el-radio-button's change handler; poke the
@@ -151,7 +159,7 @@ describe('ConfigBackup — import preview + commit', () => {
     previewImport.mockRejectedValue({
       response: { data: { error: '密码不对' } },
     })
-    const w = await mountBackup()
+    const w = await mountBackup({ import: true })
     w.vm.setImport({ bytes: 'AAAA', name: 'backup.lrbak', pass: 'aaaaaaaa' })
     await w.vm.doPreview()
     expect(w.text()).toContain('密码不对')

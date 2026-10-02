@@ -339,13 +339,17 @@ export default {
     backup: {
       title: '配置备份 / 还原',
       desc: '把渠道、令牌、模型路由导出到一个加密文件。文件里包含明文的 api key 和 sk-… 令牌，密码是唯一保护。',
+      buttons: {
+        export: '备份',
+        import: '还原',
+      },
       section: {
         channels: '渠道',
         tokens: '令牌',
         mappings: '模型路由',
       },
       export: {
-        title: '导出',
+        title: '备份',
         desc: '下载一个 `.lrbak` 文件，包含所选段。请设置密码，至少 8 位。',
         passPlaceholder: '密码',
         passConfirmPlaceholder: '再输一次',
@@ -354,7 +358,7 @@ export default {
         button: '导出',
       },
       import: {
-        title: '导入',
+        title: '还原',
         desc: '选择导出的 `.lrbak` 文件并输入密码。预览会列出每个冲突的行，每行单独决定；只有你确认后才会真正写入。',
         pickFile: '选择文件',
         passPlaceholder: '密码',

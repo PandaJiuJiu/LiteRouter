@@ -349,13 +349,17 @@ export default {
     backup: {
       title: 'Config backup / restore',
       desc: 'Export channels, tokens and model mappings to an encrypted file. The file holds api keys and sk-… tokens in plaintext inside the ciphertext, so the passphrase is the only thing protecting them.',
+      buttons: {
+        export: 'Backup',
+        import: 'Restore',
+      },
       section: {
         channels: 'Channels',
         tokens: 'Tokens',
         mappings: 'Model mappings',
       },
       export: {
-        title: 'Export',
+        title: 'Backup',
         desc: 'Download a `.lrbak` file containing the selected sections. Choose a passphrase — at least 8 characters.',
         passPlaceholder: 'Passphrase',
         passConfirmPlaceholder: 'Confirm passphrase',
@@ -364,7 +368,7 @@ export default {
         button: 'Export',
       },
       import: {
-        title: 'Import',
+        title: 'Restore',
         desc: 'Pick an exported `.lrbak` file and enter the passphrase. The preview lists every conflicting row with a choice for each; commit only writes after you confirm.',
         pickFile: 'Pick a file',
         passPlaceholder: 'Passphrase',

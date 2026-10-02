@@ -34,10 +34,26 @@
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
 
-    <!-- Encrypted backup/restore. Lives in its own component because the
-         preview/commit flow has a lot of UI state, and a sibling spec keeps
-         the existing Settings spec from having to mock the whole pipeline. -->
-    <ConfigBackup v-if="isAdmin" />
+    <!-- 备份 / 还原只是一个入口行——所有交互（段位、密码、文件、预览、
+         冲突解决、提交统计）都在 ConfigBackup 的弹窗里。 -->
+    <div class="row" v-if="isAdmin">
+      <div class="row-label">{{ t('settings.backup.title') }}</div>
+      <div class="row-control row-actions">
+        <el-button @click="importDialogVisible = true">
+          {{ t('settings.backup.buttons.import') }}
+        </el-button>
+        <el-button type="primary" @click="exportDialogVisible = true">
+          {{ t('settings.backup.buttons.export') }}
+        </el-button>
+      </div>
+    </div>
+    <div class="row-desc" v-if="isAdmin">{{ t('settings.backup.desc') }}</div>
+
+    <ConfigBackup
+      v-if="isAdmin"
+      v-model:exportVisible="exportDialogVisible"
+      v-model:importVisible="importDialogVisible"
+    />
   </el-card>
 </template>
 
@@ -89,6 +105,12 @@ async function onRetentionChange(days) {
   }
 }
 
+// Both dialogs are controlled here so closing them from inside the child
+// (`invalidates clear here`) and reopening from these buttons stays in
+// sync via v-model.
+const exportDialogVisible = ref(false)
+const importDialogVisible = ref(false)
+
 onMounted(() => {
   if (isAdmin.value) loadRetention()
 })
@@ -115,6 +137,11 @@ onMounted(() => {
 }
 .row-control {
   width: 200px;
+}
+.row-actions {
+  display: flex;
+  gap: 8px;
+  width: auto;
 }
 /* 说明挂在控件下面而不是标题里，一行只放一个设置，标题保持干净。 */
 .row-desc {
