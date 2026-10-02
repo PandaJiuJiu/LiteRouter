@@ -22,9 +22,8 @@
 
 use crate::breaker::{self, Outcome, TransitionKind};
 use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
-use crate::proxy;
+use crate::probe::ProbeOutcome;
 use crate::state::AppState;
-use serde_json::json;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -157,7 +156,7 @@ async fn sweep(
                 continue;
             }
             let result = probe_one(state, &ch, m).await;
-            let success = matches!(result, ProbeResult::Success);
+            let success = result.is_success();
             let transition = state
                 .breaker
                 .record(
@@ -165,7 +164,7 @@ async fn sweep(
                     if success {
                         Outcome::Success
                     } else {
-                        Outcome::Failure(probe_reason(&result))
+                        Outcome::Failure(result.reason())
                     },
                 )
                 .await;
@@ -219,112 +218,55 @@ pub async fn probe_now(state: &AppState) -> Result<ProbeReport, String> {
 /// Pick the right base URL for the channel: OpenAI style first, fall back
 /// to Anthropic. We probe once per channel regardless of how many models
 /// are listed — the protocol doesn't change between models.
-async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeResult {
-    let (url, headers) = if !ch.base_url_anthropic.is_empty() {
+async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeOutcome {
+    // The Authorization value is the one thing that can't be a `&str`
+    // borrowed from `ch` — it has to be interpolated with the key first.
+    // Kept in an owned binding that outlives the `&[(&str, &str)]` below.
+    let bearer = format!("Bearer {}", ch.api_key);
+    let (url, headers): (String, Vec<(&str, &str)>) = if !ch.base_url_anthropic.is_empty() {
         // Two-protocol channel: prefer OpenAI for probing (cheaper for most
         // providers) but fall back to Anthropic if OpenAI URL is missing.
         if !ch.base_url.is_empty() {
-            let url = format!("{}/chat/completions", ch.base_url.trim_end_matches('/'));
-            let h = vec![(
-                "Authorization".to_string(),
-                format!("Bearer {}", ch.api_key),
-            )];
-            (url, h)
+            (
+                format!("{}/chat/completions", ch.base_url.trim_end_matches('/')),
+                vec![("Authorization", bearer.as_str())],
+            )
         } else {
-            let url = format!(
-                "{}/v1/messages",
-                ch.base_url_anthropic.trim_end_matches('/')
-            );
-            let h = vec![
-                ("x-api-key".to_string(), ch.api_key.clone()),
-                ("anthropic-version".to_string(), "2023-06-01".to_string()),
-            ];
-            (url, h)
+            (
+                format!(
+                    "{}/v1/messages",
+                    ch.base_url_anthropic.trim_end_matches('/')
+                ),
+                vec![
+                    ("x-api-key", ch.api_key.as_str()),
+                    ("anthropic-version", "2023-06-01"),
+                ],
+            )
         }
     } else if !ch.base_url.is_empty() {
-        let url = format!("{}/chat/completions", ch.base_url.trim_end_matches('/'));
-        let h = vec![(
-            "Authorization".to_string(),
-            format!("Bearer {}", ch.api_key),
-        )];
-        (url, h)
+        (
+            format!("{}/chat/completions", ch.base_url.trim_end_matches('/')),
+            vec![("Authorization", bearer.as_str())],
+        )
     } else {
-        return ProbeResult::Error("channel has no base_url".into());
+        return ProbeOutcome::Misconfigured("channel has no base_url".into());
     };
 
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-    });
-
-    let mut req = state.http.post(&url).timeout(PROBE_TIMEOUT);
-    for (k, v) in &headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = match req.json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => return ProbeResult::Transport(proxy::describe_transport_error(&e)),
-    };
-    let status = resp.status().as_u16();
-    if (200..300).contains(&status) {
-        ProbeResult::Success
-    } else {
-        ProbeResult::Http {
-            status,
-            detail: proxy::read_error_detail(resp).await,
-        }
-    }
+    crate::probe::send(state, &url, &headers, model, PROBE_TIMEOUT).await
 }
 
-#[derive(Debug)]
-enum ProbeResult {
-    Success,
-    Http {
-        status: u16,
-        /// Upstream's own wording, same as the relay path. `None` when the
-        /// body was empty or unreadable.
-        detail: Option<String>,
-    },
-    Transport(String),
-    Error(String),
-}
-
-/// One-line cause for the breaker panel. Mirrors the relay-side strings so
-/// the two look alike in the snapshot: `HTTP 429: <detail>` /
-/// `transport: <kind>`. The transport string arrives already formatted by
-/// `describe_transport_error`, so it passes through untouched.
-fn probe_reason(r: &ProbeResult) -> String {
-    match r {
-        ProbeResult::Success => String::new(),
-        ProbeResult::Http { status, detail } => match detail {
-            Some(d) => format!("HTTP {status}: {d}"),
-            None => format!("HTTP {status}"),
-        },
-        ProbeResult::Transport(e) => e.clone(),
-        ProbeResult::Error(e) => e.clone(),
-    }
-}
-
-fn log_probe(channel: &str, model: &str, result: &ProbeResult) {
-    // One info line per probe. Sample:
-    //   breaker probe channel=openrouter model=gpt-4 result=success latency=...ms
-    match result {
-        ProbeResult::Success => {
-            println!("breaker probe channel={channel} model={model} result=success")
-        }
-        ProbeResult::Http { status, .. } => {
-            println!("breaker probe channel={channel} model={model} result=failure status={status}")
-        }
+/// One info line per probe. Sample:
+///   breaker probe channel=openrouter model=gpt-4 result=success
+///   breaker probe channel=huoshan model=glm-5.3 result=failure status=429
+fn log_probe(channel: &str, model: &str, result: &ProbeOutcome) {
+    let status = match result {
+        ProbeOutcome::Success => "result=success".to_string(),
+        ProbeOutcome::Http { status, .. } => format!("result=failure status={status}"),
         // Already carries its own `transport: ` prefix from
         // `describe_transport_error` — don't add a second one.
-        ProbeResult::Transport(e) => {
-            println!("breaker probe channel={channel} model={model} result=failure error={e}")
-        }
-        ProbeResult::Error(e) => {
-            println!("breaker probe channel={channel} model={model} result=failure error={e}")
-        }
-    }
+        other => format!("result=failure error={}", other.reason()),
+    };
+    println!("breaker probe channel={channel} model={model} {status}");
 }
 
 async fn load_probe_channel(

@@ -368,36 +368,44 @@ pub async fn test_model(
     }
     let openai_base = req.base_url.trim_end_matches('/');
     let anthropic_base = req.base_url_anthropic.trim_end_matches('/');
-    let minimal_body = json!({
-        "model": req.model,
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "."}],
-    });
     let timeout = model_test_timeout(&state.pool).await;
+    let bearer = format!("Bearer {}", req.api_key);
 
     let mut protocols = serde_json::Map::new();
 
+    // Both protocols go through the same helper the breaker's recovery
+    // probe uses, so a model can't be green on this page and red in the
+    // breaker for the same upstream at the same moment. See `probe.rs`.
+    //
     // OpenAI-compatible attempt
     if !openai_base.is_empty() {
         let url = format!("{}/chat/completions", openai_base);
-        let r = state
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", req.api_key))
-            .json(&minimal_body);
-        protocols.insert("openai".to_string(), probe(r, timeout).await);
+        let v = run_model_test(
+            &state,
+            &url,
+            &[("Authorization", bearer.as_str())],
+            &req.model,
+            timeout,
+        )
+        .await;
+        protocols.insert("openai".to_string(), v);
     }
 
     // Anthropic-compatible attempt
     if !anthropic_base.is_empty() {
         let url = format!("{}/v1/messages", anthropic_base);
-        let r = state
-            .http
-            .post(&url)
-            .header("x-api-key", &req.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&minimal_body);
-        protocols.insert("anthropic".to_string(), probe(r, timeout).await);
+        let v = run_model_test(
+            &state,
+            &url,
+            &[
+                ("x-api-key", req.api_key.as_str()),
+                ("anthropic-version", "2023-06-01"),
+            ],
+            &req.model,
+            timeout,
+        )
+        .await;
+        protocols.insert("anthropic".to_string(), v);
     }
 
     let any_ok = protocols
@@ -436,27 +444,26 @@ async fn model_test_timeout(pool: &SqlitePool) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Fire one minimal request and describe the outcome for the model card:
+/// Fire one probe and describe the outcome for the model card:
 /// `{ ok, ms }` on success, `{ ok: false, ms, error }` otherwise.
 ///
-/// `ms` is wall-clock from send to response headers read, so the UI can show a
-/// latency next to the checkmark instead of a bare "Available".
-async fn probe(r: reqwest::RequestBuilder, timeout: Duration) -> Value {
+/// `ms` is wall-clock from send to response read, so the UI can show a
+/// latency next to the checkmark instead of a bare "Available". The request
+/// itself and the verdict both come from [`crate::probe`] — the same code
+/// the breaker's recovery ticker uses.
+async fn run_model_test(
+    state: &AppState,
+    url: &str,
+    headers: &[(&str, &str)],
+    model: &str,
+    timeout: Duration,
+) -> Value {
     let started = std::time::Instant::now();
-    let outcome = match r.timeout(timeout).send().await {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => {
-            let st = resp.status().as_u16();
-            let raw = resp.text().await.unwrap_or_default();
-            Err(format!("HTTP {}: {}", st, extract_error_msg(&raw)))
-        }
-        Err(e) if e.is_timeout() => Err(format!("请求超时（> {}s）", timeout.as_secs())),
-        Err(e) => Err(format!("请求失败: {}", e)),
-    };
+    let outcome = crate::probe::send(state, url, headers, model, timeout).await;
     let ms = started.elapsed().as_millis();
     match outcome {
-        Ok(()) => json!({ "ok": true, "ms": ms }),
-        Err(e) => json!({ "ok": false, "ms": ms, "error": e }),
+        crate::probe::ProbeOutcome::Success => json!({ "ok": true, "ms": ms }),
+        other => json!({ "ok": false, "ms": ms, "error": other.reason() }),
     }
 }
 
