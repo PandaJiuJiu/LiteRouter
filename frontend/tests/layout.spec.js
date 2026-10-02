@@ -56,6 +56,7 @@ describe('sidebar', () => {
     const w = await mountLayout()
     expect(navLabels(w)).toEqual([
       zhCN.nav.channels,
+      zhCN.nav.models,
       zhCN.nav.tokens,
       zhCN.nav.mappings,
       zhCN.nav.usage,

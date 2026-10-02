@@ -7,6 +7,7 @@
       <div class="logo"><img src="/logo-wordmark.svg" alt="LiteRouter" /></div>
       <el-menu :default-active="$route.path" router class="menu">
         <el-menu-item v-if="isAdmin" index="/channels">{{ t('nav.channels') }}</el-menu-item>
+        <el-menu-item v-if="isAdmin" index="/models">{{ t('nav.models') }}</el-menu-item>
         <el-menu-item index="/tokens">{{ t('nav.tokens') }}</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/mappings">{{ t('nav.mappings') }}</el-menu-item>
         <el-menu-item index="/usage">{{ t('nav.usage') }}</el-menu-item>

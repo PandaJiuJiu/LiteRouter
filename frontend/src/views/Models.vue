@@ -1,16 +1,56 @@
 <template>
   <el-card v-loading="loading">
     <div class="toolbar">
-      <span>{{ channelId ? t('models.headerForChannel', { name: channelName }) : t('models.headerAll') }}</span>
-      <div>
+      <div class="toolbar-title">
+        <span v-if="channelId">{{ t('models.headerForChannel', { name: channelName }) }}</span>
+        <template v-else>
+          <span class="title">{{ t('models.pageTitle') }}</span>
+          <span class="subtitle">{{ t('models.subtitle') }}</span>
+        </template>
+      </div>
+      <div class="toolbar-actions">
         <el-button v-if="channelId" @click="back">{{ t('models.backToChannels') }}</el-button>
         <el-button v-else @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
-    <el-empty v-if="!channels.length && !loading" :description="t('models.emptyNoChannels')" />
+    <div v-if="!channelId" class="filters">
+      <el-input
+        v-model="search"
+        :placeholder="t('models.searchPlaceholder')"
+        clearable
+        size="small"
+        class="filter-search"
+      />
+      <el-select
+        v-model="filterChannelId"
+        :placeholder="t('models.filterByChannel')"
+        clearable
+        size="small"
+        class="filter-channel"
+      >
+        <el-option v-for="ch in channels" :key="ch.id" :label="ch.name" :value="ch.id" />
+      </el-select>
+      <span class="filter-toggle">
+        <span class="filter-toggle-label">{{ t('models.showDisabledOnly') }}</span>
+        <el-switch v-model="disabledOnly" />
+      </span>
+      <div class="summary">
+        <el-tag size="small" effect="plain">{{ t('models.summaryModels', { count: totalModels }) }}</el-tag>
+        <el-tag size="small" effect="plain" type="info">{{ t('models.summaryChannels', { count: channels.length }) }}</el-tag>
+        <el-tag v-if="totalDisabled" size="small" effect="plain" type="warning">
+          {{ t('models.summaryDisabled', { count: totalDisabled }) }}
+        </el-tag>
+      </div>
+    </div>
 
-    <el-card v-for="ch in channels" :key="ch.id" class="channel-card" shadow="never">
+    <el-empty v-if="!channels.length && !loading" :description="t('models.emptyNoChannels')" />
+    <el-empty
+      v-else-if="!channelId && !matchedChannels.length"
+      :description="t('models.noMatchAll')"
+    />
+
+    <el-card v-for="ch in matchedChannels" :key="ch.id" class="channel-card" shadow="never">
       <div class="channel-head">
         <div>
           <span class="channel-name">{{ ch.name }}</span>
@@ -29,6 +69,11 @@
             {{ t('models.fetchList') }}
           </el-button>
           <el-button size="small" @click="openManual(ch)">{{ t('models.manualAdd') }}</el-button>
+          <el-button
+            size="small"
+            v-if="!channelId"
+            @click="router.push('/models?channel=' + ch.id)"
+          >{{ t('models.focusChannel') }}</el-button>
         </div>
       </div>
 
@@ -160,6 +205,53 @@ const loading = ref(false)
 // 切换启用/停用把模型在 ch.models 和 ch.disabled_models 之间挪动，不动 known —
 // 刷新页面后，停用的卡片还在，可以再开回来。删除按钮才会从 known 里抹掉。
 const known = reactive({})
+
+// Toolbar filters — only meaningful on the un-focused view. `search` matches
+// against either enabled or disabled models; `disabledOnly` narrows to
+// channels that actually have a disabled entry; `filterChannelId` pins the
+// list to one channel without leaving the page. All three are local, no URL
+// state: a refresh resets them, which is the right call for a debugging page.
+const search = ref('')
+const filterChannelId = ref(null)
+const disabledOnly = ref(false)
+
+function channelModelStrings(ch) {
+  // Models that this channel *could* show — enabled + disabled, normalized
+  // (trim, dedup, drop empty / '*').
+  const all = [...splitModels(ch.models), ...splitModels(ch.disabled_models)]
+  return [...new Set(all.map((m) => m.trim()).filter((m) => m && m !== '*'))]
+}
+
+function channelHasDisabled(ch) {
+  return splitModels(ch.disabled_models).length > 0
+}
+
+const matchedChannels = computed(() => {
+  // Pinned by the query string → skip the filter, render just that one.
+  if (channelId.value) {
+    return channels.value.filter((c) => c.id === channelId.value)
+  }
+  const q = search.value.trim().toLowerCase()
+  return channels.value.filter((ch) => {
+    if (filterChannelId.value && ch.id !== filterChannelId.value) return false
+    if (disabledOnly.value && !channelHasDisabled(ch)) return false
+    if (q) {
+      const haystack = channelModelStrings(ch).join('\n').toLowerCase()
+      if (!haystack.includes(q)) return false
+    }
+    return true
+  })
+})
+
+// Toolbar chips — counts taken across every channel, not the filtered subset, so
+// the admin sees the whole picture at a glance and the chips don't flicker
+// when they type in the search box.
+const totalModels = computed(() =>
+  channels.value.reduce((acc, ch) => acc + channelModelStrings(ch).length, 0),
+)
+const totalDisabled = computed(() =>
+  channels.value.reduce((acc, ch) => acc + splitModels(ch.disabled_models).length, 0),
+)
 
 const manualVisible = ref(false)
 const manualInput = ref('')
@@ -494,6 +586,58 @@ onMounted(load)
 </script>
 
 <style scoped>
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.toolbar-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.toolbar-title .title {
+  font-size: 16px;
+  font-weight: 600;
+}
+.toolbar-title .subtitle {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.filter-search {
+  width: 220px;
+}
+.filter-channel {
+  width: 200px;
+}
+.filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+}
+.filter-toggle-label {
+  white-space: nowrap;
+}
+.summary {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+}
 .channel-card {
   margin-bottom: 12px;
   border: 1px solid #e4e7ed;

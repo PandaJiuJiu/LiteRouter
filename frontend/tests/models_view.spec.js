@@ -179,3 +179,60 @@ describe('test all', () => {
     expect(testModel).not.toHaveBeenCalled()
   })
 })
+
+describe('toolbar filters', () => {
+  // Three channels with disjoint model names: a search for "gpt" must surface
+  // ark + azure but not mistral; "disabled only" must keep azure alone.
+  const override = (overrides) => ({ ...CHANNEL, ...overrides })
+  const CHANNELS = () => [
+    override({ id: 1, name: 'ark', models: 'gpt-4o', disabled_models: '' }),
+    override({ id: 2, name: 'azure', models: 'gpt-4o-mini', disabled_models: 'gpt-4' }),
+    override({ id: 3, name: 'mistral', models: 'mistral-large', disabled_models: '' }),
+  ]
+
+  const visibleCards = (w) =>
+    w.findAll('.channel-card').map((c) => c.find('.channel-name').text())
+
+  beforeEach(() => {
+    listChannels.mockResolvedValue(CHANNELS())
+  })
+
+  it('summary counts models across every channel regardless of filter', async () => {
+    // 1 + 2 + 1 = 4 models (enabled + disabled, deduped), 3 channels,
+    // 1 disabled — the chips reflect the *whole* DB, not the filtered view,
+    // so they don't flicker while the admin types in the search box.
+    const w = await mountModels()
+    await flushPromises()
+
+    const text = w.find('.summary').text()
+    expect(text).toContain(zhCN.models.summaryModels.replace('{count}', '4'))
+    expect(text).toContain(zhCN.models.summaryChannels.replace('{count}', '3'))
+    expect(text).toContain(zhCN.models.summaryDisabled.replace('{count}', '1'))
+  })
+
+  it('search filters channels whose models match (case-insensitive)', async () => {
+    // A "GPT" search must surface the two gpt-* channels but not mistral.
+    // "gpt-4" lives in azure's disabled list, so that channel shows up too —
+    // the filter is across both lists, not just the enabled set.
+    const w = await mountModels()
+    await flushPromises()
+
+    await w.find('.filter-search input').setValue('GPT')
+    await flushPromises()
+
+    const visible = visibleCards(w)
+    expect(visible).toContain('ark')
+    expect(visible).toContain('azure')
+    expect(visible).not.toContain('mistral')
+  })
+
+  it('disabledOnly hides channels that have no disabled model', async () => {
+    const w = await mountModels()
+    await flushPromises()
+
+    await w.find('.filter-toggle .el-switch').trigger('click')
+    await flushPromises()
+
+    expect(visibleCards(w)).toEqual(['azure'])
+  })
+})
