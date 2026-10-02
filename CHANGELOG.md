@@ -6,6 +6,54 @@
 
 ---
 
+## [0.0.4] - 2026-10-02
+
+自 v0.0.3 起共 17 个提交。
+
+### 新增
+
+- **配置备份 / 还原**：设置页新增加密导出与还原，三段（渠道 / 令牌 / 模型路由）可按行三选一，口令派生密钥加密成 `.lrbak` 文件；`users` 表刻意不可导出。管理员专属——文件里的 `api_keys` 与 `sk-…` 令牌在密文中是明文
+- **熔断器历史**：熔断事件落库，新增「熔断器历史」页按时间倒序展示每个 (渠道, 模型) 的 tripped / re-tripped / recovered / reset 序列，含触发原因与退避时长。此前熔断器只活在内存里，进程重启即清空，运维无法回答"哪个模型什么时候熔断过、什么时候恢复"
+- **日志耗时列**：日志列表新增请求耗时（秒）
+- **日志筛选**：列表页接上 `/api/logs/filter-options`，时间 / 状态 / 渠道 / 令牌 / IP 五个下拉
+- **日志详情 · 上游响应捕获**：新增 `GET /api/logs/:id/debug`，日志详情页按需加载捕获到的上游响应体，JSON 美化显示、失败回退原文，标注截断与字节数
+- **模型管理**：新增侧栏入口与顶部工具条，工具条开关改为"只看已启用"
+- **获取模型列表超时**：`fetch-models` 复用 `model_test_timeout_secs`（默认 10s），不再继承共享 client 的 600s
+- **熔断手动探测**：`POST /api/breaker/probe-now` 立即探测所有熔断中的 (渠道, 模型) 组合，不等退避 cooldown 走完；熔断面板新增「立即探测」按钮
+- **日志保留天数可配置**：从硬编码改为设置项下拉，落库到 `settings.log_retention_days`
+
+### 修复
+
+- **中继不再伪装成功**：`try_upstream` 对 2xx 按协议做形状校验（anthropic 需 `type=="message"`，openai 需 `choices[0].message`）。中转站用 `200 {"error":...}` 回答自己的内部故障时，此前被当作成功透传给客户端，现在和 4xx/5xx/transport error 一样走 failover。流式路径无法缓冲 body，改为只看 Content-Type：2xx 但 `application/json` 即判失败，且在客户端拿到任何字节之前拒绝
+- **调试开关对非流式请求完全无效**：`AppState.debug_logging` 从 `bool` 改为 `AtomicBool`，每次从 state 读实时值
+- **`resp.json` 永远 0 字节**：`passthrough_stream` 与 `converted_stream` 现在真的写 capture
+- **SSE 协议违规**：`OpenAiToAnthropicStream::finish()` 在上游开了流却未发出任何 payload 就 EOF 时，吐出 `message_delta` + `message_stop` 而没有 `message_start`
+- **失败请求无条件捕获响应体**：不再赌调试开关当时开没开。删除 `req.json`——从不存请求体是迁移 0014 的策略，现在做成结构性事实
+- **用量页渠道维度**：过滤掉「全部候选均失败」的空渠道名分组（那种请求的 `channel_name` 刻意留空，不属于任何渠道）
+- **侧栏**：移除「熔断器历史」菜单项（改从熔断面板进入）
+
+### 数据库变更
+
+- `0028_log_retention_days` — 新增 `settings` 中的 `log_retention_days`
+- `0029_breaker_history` — 新增 `breaker_events` 表（append-only，按时间倒序查询）
+
+两个迁移都是 `INSERT OR IGNORE` / `CREATE TABLE IF NOT EXISTS` 语义，可安全重放。
+
+### 测试
+
+后端 250 → 327 例，前端 138 → 172 例（i18n 351 key 双语齐平）：
+
+- `relay_contract.rs` 新增 12 例：2xx 错误体触发 failover、混合 429+坏 200 落到 502（非 429）、非法 200 会熔断、关开关时失败请求仍落盘、成功请求关开关时不落盘、`req.json` 不存在、流式拒 JSON 200、超 256 KB 截断标注、两条流式路径 capture 非空
+- `manage_data.rs` 新增 4 例覆盖 `/api/logs/:id/debug` 的越权 404 / 无捕获 200 / 未登录 401 / 默认响应未新增字段
+- `stream_convert.rs` 新增 2 例钉住 `finish()` 的修复；`model_probe.rs` 新增 3 例（超时 / 正常 / 超时回落）
+- 前端新增 `config_backup.spec.js`、`breaker_history.spec.js`、`logs_view.spec.js`、`log_detail.spec.js`
+
+### 文档
+
+- 重写部署章节，GHCR 预构建镜像作为推荐路径
+
+---
+
 ## [0.0.3] - 2026-10-01
 
 自 v0.0.2 起共 29 个提交。
@@ -76,6 +124,7 @@
 
 ---
 
+[0.0.4]: https://github.com/qihangkong/LiteRouter/releases/tag/v0.0.4
 [0.0.3]: https://github.com/qihangkong/LiteRouter/releases/tag/v0.0.3
 [0.0.2]: https://github.com/qihangkong/LiteRouter/releases/tag/v0.0.2
 [0.0.1]: https://github.com/qihangkong/LiteRouter/releases/tag/v0.0.1
