@@ -686,10 +686,47 @@ fn parse_usage(body: &[u8]) -> Option<convert::Usage> {
     Some(u)
 }
 
-fn error_response(status: StatusCode, message: &str, retry_after: Option<&str>) -> Response {
-    let body = json!({
-        "error": { "message": message, "type": "literouter_error" }
-    });
+/// The `error.type` an Anthropic client expects for a given status.
+///
+/// The Messages API spec fixes a closed set of these and SDKs key retry
+/// behavior off them, so a gateway on `/v1/messages` has to speak them rather
+/// than inventing its own string.
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+/// The error envelope for `protocol`.
+///
+/// The two protocols disagree on the shape, not just the wording: Anthropic
+/// wraps the error in a top-level `"type": "error"` discriminator, while the
+/// OpenAI-compatible shape is what `/v1/*` clients have always seen. Handing
+/// an Anthropic caller the OpenAI shape still yields a readable message (SDKs
+/// fall back to a generic `APIError`), but the `type` is then unusable for the
+/// retry decisions it exists to drive.
+fn error_response(
+    protocol: &str,
+    status: StatusCode,
+    message: &str,
+    retry_after: Option<&str>,
+) -> Response {
+    let body = if protocol == "anthropic" {
+        json!({
+            "type": "error",
+            "error": { "type": anthropic_error_type(status), "message": message }
+        })
+    } else {
+        json!({
+            "error": { "message": message, "type": "literouter_error" }
+        })
+    };
     let mut resp = (status, Json(body)).into_response();
     // Pass through the upstream's Retry-After when we know the failure is a
     // rate-limit (429). Other libraries don't deserve the hint.
@@ -1320,7 +1357,9 @@ fn passthrough_stream(
             usage_for_drop,
             capture,
         )))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
+        .unwrap_or_else(|_| {
+            error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+        })
 }
 
 /// Convert an upstream SSE byte stream to the client's protocol, line by
@@ -1413,7 +1452,9 @@ fn converted_stream(
             conv,
             capture,
         )))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None))
+        .unwrap_or_else(|_| {
+            error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+        })
 }
 
 /// Everything about the client request that stays constant across candidates.
@@ -1542,9 +1583,9 @@ async fn respond_from_upstream(
             h.insert(axum::http::header::CONTENT_TYPE, ct);
         }
     }
-    let resp = builder
-        .body(Body::from(out_bytes))
-        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "body build failed", None));
+    let resp = builder.body(Body::from(out_bytes)).unwrap_or_else(|_| {
+        error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+    });
     (resp, attempt)
 }
 
@@ -1567,22 +1608,38 @@ async fn relay(
     // 1. internal token auth
     let key = match extract_token(headers) {
         Some(k) => k,
-        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", None),
+        None => {
+            return error_response(
+                protocol,
+                StatusCode::UNAUTHORIZED,
+                "missing bearer token",
+                None,
+            )
+        }
     };
     let token_name = match auth_token(state, &key).await {
         Ok(n) => n,
-        Err((s, msg)) => return error_response(s, msg, None),
+        Err((s, msg)) => return error_response(protocol, s, msg, None),
     };
     let client_info = extract_client_info(headers, direct_ip);
 
     // 2. parse body to find model + streaming flag
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body", None),
+        Err(_) => {
+            return error_response(protocol, StatusCode::BAD_REQUEST, "invalid JSON body", None)
+        }
     };
     let model = match req_json.get("model").and_then(|m| m.as_str()) {
         Some(m) => m.to_string(),
-        None => return error_response(StatusCode::BAD_REQUEST, "missing model in request", None),
+        None => {
+            return error_response(
+                protocol,
+                StatusCode::BAD_REQUEST,
+                "missing model in request",
+                None,
+            )
+        }
     };
     let targets = resolve_targets(state, &model).await;
     let is_streaming = req_json
@@ -1606,6 +1663,13 @@ async fn relay(
     let mut all_errors: Vec<String> = Vec::new();
     let mut relay_retry_after: Option<String> = None;
     let mut attempted = 0usize;
+    // Hops that actually reached an upstream, i.e. `attempted` minus the ones
+    // the breaker skipped. The final-status decision below compares the
+    // 429/transport tallies against this rather than `attempted`: a skip is
+    // not evidence about *how* the upstreams failed, so letting it dilute the
+    // denominator would turn "everything that answered was rate-limited" into
+    // a 502 and drop the `Retry-After` the client needs to back off.
+    let mut upstream_attempts = 0usize;
     let mut retriable_429_count = 0usize;
     let mut transport_err_count = 0usize;
     // Every upstream attempt so far, in order. Recorded as child rows of the
@@ -1620,7 +1684,7 @@ async fn relay(
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
                 Ok(c) => c,
-                Err(s) => return error_response(s, "internal error", None),
+                Err(s) => return error_response(protocol, s, "internal error", None),
             }
         } else {
             match pinned_channel(state, pin_channel, protocol).await {
@@ -1684,6 +1748,7 @@ async fn relay(
                 continue;
             }
             attempted += 1;
+            upstream_attempts += 1;
             let outcome = try_upstream(
                 state,
                 cand,
@@ -1848,18 +1913,27 @@ async fn relay(
             user_agent: client_info.user_agent.clone(),
         };
         let _ = log_request(&state.pool, &entry).await;
-        return error_response(StatusCode::NOT_FOUND, &err, None);
+        return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
     }
     // Pick the most informative status code:
+    //   - nothing reached an upstream (every hop was a breaker skip) -> 502;
+    //     there is no tally to read, and 429/504 would both be invented
     //   - all retriable failures were 429 -> 429 (so SDKs that honor 429's
     //     Retry-After can back off correctly instead of blind exponential)
     //   - all failures were transport-level -> 504 (none of the upstreams
     //     even responded)
     //   - anything else (5xx mix, 429+5xx mix) -> 502 (gateway saw responses
     //     but couldn't serve the request)
-    let final_status = if retriable_429_count == attempted {
+    //
+    // The denominators are `upstream_attempts`, not `attempted`: breaker skips
+    // are recorded as hops but never contacted anyone, so counting them would
+    // downgrade an otherwise-uniform 429 to a bare 502 and lose the
+    // `Retry-After` pass-through below.
+    let final_status = if upstream_attempts == 0 {
+        StatusCode::BAD_GATEWAY
+    } else if retriable_429_count == upstream_attempts {
         StatusCode::TOO_MANY_REQUESTS
-    } else if transport_err_count == attempted {
+    } else if transport_err_count == upstream_attempts {
         StatusCode::GATEWAY_TIMEOUT
     } else {
         StatusCode::BAD_GATEWAY
@@ -1906,7 +1980,7 @@ async fn relay(
             write_debug_log(&state.pool, id, &capture).await;
         }
     }
-    error_response(final_status, &err, relay_retry_after.as_deref())
+    error_response(protocol, final_status, &err, relay_retry_after.as_deref())
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible relay.
@@ -1933,10 +2007,17 @@ pub async fn anthropic_messages(
 pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let key = match extract_token(&headers) {
         Some(k) => k,
-        None => return error_response(StatusCode::UNAUTHORIZED, "missing bearer token", None),
+        None => {
+            return error_response(
+                "openai",
+                StatusCode::UNAUTHORIZED,
+                "missing bearer token",
+                None,
+            )
+        }
     };
     if let Err((s, msg)) = auth_token(&state, &key).await {
-        return error_response(s, msg, None);
+        return error_response("openai", s, msg, None);
     }
     // only external channels serve relay traffic (see candidate_channels)
     let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
@@ -1944,7 +2025,14 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
         .await
     {
         Ok(r) => r,
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "db error", None),
+        Err(_) => {
+            return error_response(
+                "openai",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db error",
+                None,
+            )
+        }
     };
     let mut models: Vec<String> = Vec::new();
     for row in rows {

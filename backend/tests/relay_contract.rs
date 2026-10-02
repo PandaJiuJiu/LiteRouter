@@ -580,6 +580,113 @@ async fn an_all_failed_request_still_writes_a_log_row() {
     assert_eq!(row.get::<i64, _>("status_code"), 502);
 }
 
+/// Force `channel`'s breaker for `model` open, so the next request skips it
+/// without touching the network.
+async fn trip(h: &Harness, channel: &str, model: &str) {
+    h.breaker
+        .record(
+            &literouter::breaker::breaker_key(channel, model),
+            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_breaker_skip_does_not_flatten_a_uniform_429_into_a_502() {
+    // A skip is a hop that never reached an upstream, so it is no evidence
+    // about how the ones that did answer failed. Letting it sit in the
+    // denominator used to turn "every upstream that responded was rate-limited"
+    // into a bare 502 — and with it went the Retry-After the client needs.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let b = MockServer::start().await;
+    upstream_status(&b, 429).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+    trip(&h, "first", "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": "gpt-4o", "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap()),
+        Some("42"),
+        "the rate-limit hint is the whole point of choosing 429"
+    );
+    assert_eq!(
+        a.received_requests().await.unwrap().len(),
+        0,
+        "the skipped channel must still burn no quota"
+    );
+}
+
+#[tokio::test]
+async fn a_breaker_skip_does_not_flatten_uniform_transport_failures_into_a_502() {
+    let (h, key) = all_fail("http://127.0.0.1:1").await;
+    trip(&h, "first", "gpt-4o").await;
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn a_breaker_skip_alongside_a_genuine_mix_still_surfaces_as_502() {
+    // The counterpart to the two above: excluding skips from the denominator
+    // must not manufacture a "uniform" verdict out of a real mix.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let b = MockServer::start().await;
+    upstream_status(&b, 500).await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+    trip(&h, "first", "gpt-4o").await;
+
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn an_anthropic_client_gets_an_anthropic_error_envelope() {
+    // `/v1/messages` speaks Anthropic, so its failures have to come back in
+    // Anthropic's shape: the top-level `"type": "error"` discriminator and an
+    // `error.type` drawn from the spec's closed set, which is what SDKs read
+    // to decide whether to retry.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+
+    let (status, body) = anthropic_chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["type"], "error", "{body}");
+    assert_eq!(body["error"]["type"], "rate_limit_error", "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("429"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_openai_client_keeps_the_openai_error_envelope() {
+    // The Anthropic reshape must not leak onto the OpenAI-compatible routes,
+    // where downstream SDKs are written against the flatter form.
+    let a = MockServer::start().await;
+    upstream_status(&a, 429).await;
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
+
+    let (status, body) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(
+        body.get("type").is_none(),
+        "no Anthropic discriminator on an OpenAI route: {body}"
+    );
+    assert_eq!(body["error"]["type"], "literouter_error", "{body}");
+}
+
 // ===================== circuit breaker =====================
 
 #[tokio::test]
