@@ -30,7 +30,6 @@ export default {
     logs: '调用日志',
     users: '用户管理',
     settings: '设置',
-    breakerHistory: '熔断器历史',
     adminBadge: '管理员',
     github: '项目 GitHub',
     logout: '退出登录',

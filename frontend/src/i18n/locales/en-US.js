@@ -29,7 +29,6 @@ export default {
     logs: 'Logs',
     users: 'Users',
     settings: 'Settings',
-    breakerHistory: 'Breaker history',
     adminBadge: 'Admin',
     github: 'Project GitHub',
     logout: 'Sign out',
