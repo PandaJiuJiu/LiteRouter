@@ -170,3 +170,41 @@ describe('log filter dropdowns', () => {
     expect(selects(w)).toHaveLength(5)
   })
 })
+
+describe('status tag', () => {
+  // Three rows that exercise the three visible combinations: a clean success,
+  // a real upstream failure (non-2xx status), and a 200 whose body carried
+  // an error event. The last one is the case B / A add — it has to read as
+  // a failure even though the client received 200.
+  const rows = [
+    { id: 1, token_name: 't', model: 'gpt-4o', channel_name: 'ch', upstream_model: 'gpt-4o',
+      status_code: 200, latency_ms: 100, total_tokens: 5, failed_count: 0,
+      created_at: 0, protocol: 'openai', stream: 0, convert: 'none', error: '' },
+    { id: 2, token_name: 't', model: 'gpt-4o', channel_name: 'ch', upstream_model: 'gpt-4o',
+      status_code: 502, latency_ms: 100, total_tokens: 0, failed_count: 1,
+      created_at: 0, protocol: 'openai', stream: 0, convert: 'none', error: '...' },
+    { id: 3, token_name: 't', model: 'gpt-4o', channel_name: 'ch', upstream_model: 'gpt-4o',
+      status_code: 200, latency_ms: 100, total_tokens: 0, failed_count: 1,
+      created_at: 0, protocol: 'anthropic', stream: 1, convert: 'none', error: 'upstream error event inside a 200 stream' },
+  ]
+  beforeEach(() => {
+    listLogs.mockResolvedValue({ logs: rows, total: rows.length })
+  })
+
+  it('colours a 200 only when nothing actually failed', async () => {
+    const w = await mountLogs()
+    const tags = w.findAll('.el-table__row .el-tag')
+    expect(tags.length).toBeGreaterThanOrEqual(3)
+    // Element Plus applies the type as a class on the root element of the tag.
+    const types = tags.map((t) => {
+      const cls = t.classes().join(' ')
+      if (cls.includes('el-tag--success')) return 'success'
+      if (cls.includes('el-tag--danger')) return 'danger'
+      return cls
+    })
+    // Each row has *two* tags (status + the per-attempt "fail-badge"); flatten
+    // by counting them in document order. We expect: success, danger, danger.
+    const statusTypes = types.filter((t) => t === 'success' || t === 'danger')
+    expect(statusTypes).toEqual(['success', 'danger', 'danger'])
+  })
+})
