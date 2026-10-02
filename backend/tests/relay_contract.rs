@@ -1299,10 +1299,20 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
 // failure — but the hop has to stop being counted as a success, or the log
 // shows a green 200 and the breaker records Success forever.
 
-/// A harness with one admin, one `sk-` token, and a channel whose Anthropic
-/// upstream is `base_url_anthropic`. Used to test the passthrough-Anthropic
-/// stream path, where the error frame reaches the client verbatim instead of
-/// being mangled by the converter.
+/// A harness with one admin, one `sk-` token, and two Anthropic-speaking
+/// channels registered in order. Both advertise the same model so the relay
+/// walks them in registration order. Used by the stream-failover tests.
+async fn two_channels_anthropic(a: &str, b: &str, models: &str) -> (Harness, String) {
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "first", "", a, models, true).await;
+    support::insert_channel(h.pool(), "second", "", b, models, true).await;
+    (h, token.key)
+}
 async fn relay_ready_anthropic(base_url_anthropic: &str, models: &str) -> (Harness, String) {
     let h = Harness::with_admin().await;
     let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
@@ -1312,6 +1322,24 @@ async fn relay_ready_anthropic(base_url_anthropic: &str, models: &str) -> (Harne
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
     support::insert_channel(h.pool(), "ch", "", base_url_anthropic, models, true).await;
     (h, token.key)
+}
+
+/// An SSE stream whose very first frame is an error event — the failure mode
+/// the pre-commit peek exists to catch, so the next candidate can be tried
+/// before the client has seen anything.
+async fn upstream_stream_first_frame_error(server: &MockServer) {
+    let sse = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"provider_unavailable\"}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(server)
+        .await;
 }
 
 /// A 200 SSE stream that opens normally and then gives up mid-flight.
@@ -1521,6 +1549,168 @@ async fn a_clean_stream_is_still_logged_as_a_success() {
             .await,
         "a clean stream must leave the breaker closed"
     );
+}
+
+#[tokio::test]
+async fn a_stream_that_opens_with_an_error_frame_fails_over_before_responding() {
+    // The pre-commit peek exists for this case: the *first* SSE frame is an
+    // error, so the relay can walk to the next candidate before a single byte
+    // has been flushed to the client. Without the peek the client would see
+    // a 200 with an error event inside and no recovery.
+    let a = MockServer::start().await;
+    upstream_stream_first_frame_error(&a).await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-2\",\"type\":\"message\"}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                )),
+        )
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels_anthropic(&a.uri(), &b.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("\"text\":\"ok\""),
+        "the client must receive the second channel's content, not the first channel's error: {text}"
+    );
+    assert!(
+        !text.contains("event: error"),
+        "the failed first channel's error frame must not reach the client: {text}"
+    );
+    assert_eq!(
+        a.received_requests().await.unwrap().len(),
+        1,
+        "the first channel was tried"
+    );
+    assert_eq!(
+        b.received_requests().await.unwrap().len(),
+        1,
+        "the second channel was tried after the first failed"
+    );
+}
+
+#[tokio::test]
+async fn the_pre_commit_peek_records_the_first_channel_as_invalid_body_in_the_log() {
+    let a = MockServer::start().await;
+    upstream_stream_first_frame_error(&a).await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-2\",\"type\":\"message\"}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                )),
+        )
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels_anthropic(&a.uri(), &b.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    // The failed hop is recorded inline in relay(), but the winning hop's
+    // log_attempts row is written by LogOnEnd::drop, which only fires after
+    // the body is dropped (here, at end of the test). Poll until both rows
+    // exist.
+    let mut rows: Vec<(String, String, i64)> = Vec::new();
+    for _ in 0..100 {
+        if let Ok(r) =
+            sqlx::query_as("SELECT channel_name, error, ok FROM log_attempts ORDER BY id ASC")
+                .fetch_all(h.pool())
+                .await
+        {
+            if r.len() == 2 {
+                rows = r;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows.len(), 2, "both channels should appear in attempts");
+    assert_eq!(rows[0].0, "first", "the failed channel is recorded first");
+    assert!(
+        rows[0]
+            .1
+            .contains("stream opened with an upstream error event"),
+        "the first channel's verdict is the new peek-time wording, got {:?}",
+        rows[0].1
+    );
+    assert_eq!(rows[0].2, 0, "the failed channel is not ok");
+    assert_eq!(
+        rows[1].0, "second",
+        "the winning channel is recorded second"
+    );
+    assert_eq!(rows[1].2, 1, "the winning channel is ok");
+}
+
+#[tokio::test]
+async fn a_stream_with_no_event_within_the_peek_deadline_is_committed_anyway() {
+    // A provider that stalls before its first event must not be punished: the
+    // client still gets a stream, just one with an extra few ms of latency.
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                // A body that takes longer than the peek deadline to produce
+                // its first frame is approximated here by delaying the
+                // response. Even a 200 OK with no body yet is enough to
+                // exercise the deadline path.
+                .set_delay(std::time::Duration::from_millis(200)),
+        )
+        .mount(&a)
+        .await;
+    let (h, key) = relay_ready_anthropic(&a.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
 }
 
 // ============ 2xx body validation ============

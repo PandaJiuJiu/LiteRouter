@@ -816,8 +816,16 @@ enum UpstreamBody {
         content_type: Option<axum::http::HeaderValue>,
         bytes: Bytes,
     },
-    /// Streaming: untouched, so the SSE pump can forward it without buffering.
-    Live(reqwest::Response),
+    /// Streaming: untouched from where `peek` left off, so the SSE pump can
+    /// forward it without buffering. `prefix` holds whatever bytes the peek
+    /// already consumed from `resp`; the pump seeds its line-scanning buffer
+    /// with these so the very first frame isn't lost, but does not re-emit
+    /// them to the client (the upstream already sent them; the gateway hasn't
+    /// yet flushed headers).
+    Live {
+        resp: reqwest::Response,
+        prefix: Vec<u8>,
+    },
 }
 
 /// Does this JSON body look like a real response in `protocol`?
@@ -887,7 +895,7 @@ async fn try_upstream(
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
                 if is_streaming {
-                    return upstream_2xx_streaming(resp, status);
+                    return upstream_2xx_streaming_peek(resp, status).await;
                 }
                 return upstream_2xx_buffered(resp, status, upstream_protocol).await;
             }
@@ -906,27 +914,110 @@ async fn try_upstream(
     }
 }
 
-/// A 2xx on a streaming request. We can't inspect the body, so the only
-/// usable signal is the header: a JSON content-type on a stream request
-/// means the upstream answered with a complete document instead of SSE, which
-/// is never what was asked for.
-fn upstream_2xx_streaming(resp: reqwest::Response, status: u16) -> UpstreamOutcome {
-    let is_json = resp
+/// Read enough of a streaming response to know whether to commit it or fail
+/// over to the next candidate.
+///
+/// The status line is already on the wire by the time the client is waiting,
+/// so once we commit headers we cannot change our mind. To avoid handing the
+/// client an SSE stream that is going to do nothing but emit an error event,
+/// we look at the *first complete SSE frame* before flushing anything. Three
+/// outcomes:
+///
+/// - The first frame is an error (`event: error`, or a `data:` payload shaped
+///   like an error envelope) — return `InvalidBody` so the relay walks the
+///   next candidate, identical to how a buffered 200-with-error-body is
+///   handled.
+/// - The first frame is content / `[DONE]` / blank-only — return `Live` with
+///   the peeked bytes as a prefix; the pump drains them into its line buffer
+///   before forwarding later chunks.
+/// - The peek limit is hit without a frame — return `Live` with whatever was
+///   buffered. Some providers batch their first event with the body and would
+///   never trip a fast check; missing a slow first frame is less wrong than
+///   burning the request because of it.
+///
+/// The limit is 8 KiB / 1.5 s. Most providers emit `message_start` or the
+/// first chunk within milliseconds; anything slower is unusual enough that
+/// failing over on a guess is more wrong than right.
+async fn upstream_2xx_streaming_peek(mut resp: reqwest::Response, status: u16) -> UpstreamOutcome {
+    if resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(is_json_content_type)
-        .unwrap_or(false);
-    if is_json {
+        .unwrap_or(false)
+    {
+        // Kept identical to the pre-peek behaviour: a stream request that
+        // got back a complete JSON document instead of an event stream is
+        // always wrong, with no need to wait for a frame.
         return UpstreamOutcome::InvalidBody {
             status,
             detail: "HTTP 200 but a streaming request got a JSON response, not an event stream",
-            // Nothing to capture: the body is still owned by `resp`, which is
-            // dropped here without being read.
             body: DebugCapture::new(),
         };
     }
-    UpstreamOutcome::Ok(UpstreamBody::Live(resp))
+    let mut buf: Vec<u8> = Vec::new();
+    let capture = DebugCapture::new();
+    const PEEK_MAX: usize = 8 * 1024;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+    loop {
+        if buf.len() >= PEEK_MAX {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
+                capture.push(&bytes);
+                buf.extend_from_slice(&bytes);
+                if let Some(end) = sse_frame_end(&buf) {
+                    let frame = &buf[..end];
+                    let mut is_error = false;
+                    for raw in frame.split(|b| *b == b'\n') {
+                        let line = std::str::from_utf8(raw).unwrap_or("");
+                        if sse_line_error(line.trim_end_matches('\r')).is_some() {
+                            is_error = true;
+                            break;
+                        }
+                    }
+                    if is_error {
+                        return UpstreamOutcome::InvalidBody {
+                            status,
+                            // Fixed wording; the upstream's own message is in
+                            // the capture and the breaker reason.
+                            detail: "HTTP 200 but stream opened with an upstream error event",
+                            body: capture,
+                        };
+                    }
+                    break;
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    UpstreamOutcome::Ok(UpstreamBody::Live { resp, prefix: buf })
+}
+
+/// Locate the byte index just past the end of the first complete SSE frame
+/// in `buf`. A frame ends at `\n\n` or `\r\n\r\n`; everything after is the
+/// next frame (or a partial one this function ignores). Returns `None` when
+/// `buf` does not yet contain a full frame boundary, which the caller treats
+/// as "read more".
+fn sse_frame_end(buf: &[u8]) -> Option<usize> {
+    if let Some(pos) = find_subsequence(buf, b"\n\n") {
+        return Some(pos + 2);
+    }
+    find_subsequence(buf, b"\r\n\r\n").map(|pos| pos + 4)
+}
+
+/// Small, dependency-free subsequence search. `memchr` would be faster but
+/// isn't worth a new dep for two calls per stream.
+fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return if needle.is_empty() { Some(0) } else { None };
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// A 2xx on a non-streaming request: read it, then check it's actually a
@@ -1412,6 +1503,7 @@ fn sse_line_error(line: &str) -> Option<String> {
 /// `data:` lines on the side so we can record token usage when the stream
 /// ends. Same drop-cancels-upstream property as the converted stream.
 fn passthrough_stream(
+    prefix: Vec<u8>,
     resp: reqwest::Response,
     status: StatusCode,
     content_type: Option<axum::http::HeaderValue>,
@@ -1422,10 +1514,16 @@ fn passthrough_stream(
     let usage_for_drop = Arc::clone(&usage);
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_for_pump = Arc::clone(&stream_error);
+    // The first unfold iteration is dedicated to forwarding whatever bytes
+    // the peek already consumed from `resp`. Without this, the client would
+    // see only the chunks that arrive *after* the prefix was buffered (in
+    // tests where the upstream serves the whole body in a single chunk, the
+    // client would see an empty stream). After the prefix is flushed, the
+    // loop falls into the normal chunk-by-chunk path.
     let body_stream = stream::unfold(
         (
             resp,
-            Vec::<u8>::new(),
+            prefix,
             Arc::clone(&usage),
             capture.clone(),
             err_for_pump,
@@ -1433,6 +1531,30 @@ fn passthrough_stream(
         |mut st| async move {
             let (resp, buf, usage_ref, capture, err_ref) =
                 (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4);
+            if !buf.is_empty() {
+                let prefix_bytes = std::mem::take(buf);
+                capture.push(&prefix_bytes);
+                // The prefix was assembled during the peek, so we have to
+                // re-scan its lines for both usage and the in-stream error
+                // detector; passthrough's normal chunk loop wouldn't see
+                // these bytes again.
+                let mut scan = prefix_bytes.clone();
+                while let Some(pos) = scan.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = scan.drain(..=pos).collect();
+                    let trimmed = std::str::from_utf8(&line)
+                        .unwrap_or("")
+                        .trim_end_matches('\r');
+                    if let Some(reason) = sse_line_error(trimmed) {
+                        note_stream_error(err_ref, reason);
+                    }
+                    if let Some(payload) = trimmed.strip_prefix("data:") {
+                        if let Some(u) = usage_from_sse_payload(payload.trim()) {
+                            *usage_ref.lock().unwrap() = Some(u);
+                        }
+                    }
+                }
+                return Some((Ok::<Bytes, reqwest::Error>(Bytes::from(prefix_bytes)), st));
+            }
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
                     // Capture the raw upstream bytes for the debug log, then
@@ -1489,6 +1611,7 @@ fn passthrough_stream(
 /// stream ends — the converter already tracks usage as a side-effect of
 /// translating each chunk, so we don't need a second SSE parser here.
 fn converted_stream(
+    prefix: Vec<u8>,
     resp: reqwest::Response,
     conv: Box<dyn SseConverter>,
     log: StreamLog,
@@ -1505,7 +1628,7 @@ fn converted_stream(
     }
     let state = (
         resp,
-        String::new(),
+        String::from_utf8_lossy(&prefix).into_owned(),
         Arc::clone(&conv),
         false,
         capture.clone(),
@@ -1645,7 +1768,7 @@ async fn respond_from_upstream(
             content_type,
             bytes,
         } => (status, content_type, bytes),
-        UpstreamBody::Live(resp) => {
+        UpstreamBody::Live { resp, prefix } => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = resp.headers().get("content-type").cloned();
@@ -1659,18 +1782,23 @@ async fn respond_from_upstream(
                 entry,
                 breaker_key: breaker::breaker_key(&cand.name, model),
             };
+            // The bytes the peek already consumed get captured here so the
+            // debug log shows the full stream the upstream actually sent, with
+            // no gap at the start. The pump will *not* re-emit them; only
+            // chunks arriving after the prefix reach the client.
             let capture = DebugCapture::new();
+            capture.push(&prefix);
             let response = match cand.convert {
                 ConvertMode::None => {
-                    passthrough_stream(resp, status, content_type, log, capture.clone())
+                    passthrough_stream(prefix, resp, status, content_type, log, capture.clone())
                 }
                 ConvertMode::ToOpenAI => {
                     let conv = convert::OpenAiToAnthropicStream::new(model);
-                    converted_stream(resp, Box::new(conv), log, capture.clone())
+                    converted_stream(prefix, resp, Box::new(conv), log, capture.clone())
                 }
                 ConvertMode::ToAnthropic => {
                     let conv = convert::AnthropicToOpenAiStream::new(model);
-                    converted_stream(resp, Box::new(conv), log, capture.clone())
+                    converted_stream(prefix, resp, Box::new(conv), log, capture.clone())
                 }
             };
             return (response, attempt);
@@ -2631,5 +2759,29 @@ mod tests {
             Some(STREAM_ERROR_DETAIL.to_string()),
             "a non-object error value is still an error envelope"
         );
+    }
+
+    // ---------- sse_frame_end ----------
+
+    #[test]
+    fn frame_end_locates_the_first_complete_frame_in_lf_and_crlf_streams() {
+        assert_eq!(
+            sse_frame_end(b"event: error\ndata: x\n\nrest"),
+            Some(b"event: error\ndata: x\n\n".len())
+        );
+        assert_eq!(
+            sse_frame_end(b"event: error\r\ndata: x\r\n\r\nrest"),
+            Some(b"event: error\r\ndata: x\r\n\r\n".len())
+        );
+        assert_eq!(sse_frame_end(b"event: error\ndata: half"), None);
+        assert_eq!(sse_frame_end(b""), None);
+    }
+
+    #[test]
+    fn subsequence_search_handles_empty_needles_and_short_haystacks() {
+        assert_eq!(find_subsequence(b"abc", b""), Some(0));
+        assert_eq!(find_subsequence(b"", b"x"), None);
+        assert_eq!(find_subsequence(b"ab", b"abc"), None);
+        assert_eq!(find_subsequence(b"abcabc", b"bc"), Some(1));
     }
 }
