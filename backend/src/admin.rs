@@ -1237,6 +1237,10 @@ pub async fn get_log(
             })
         })
         .collect();
+    // Whether the relay captured an upstream body for this request. Just a
+    // flag here — the body itself stays behind `get_log_debug` so the log
+    // list and detail page don't ship a couple hundred KB they don't render.
+    let has_debug = proxy::debug_log_exists(&state.pool, id).await;
     Ok(Json(json!({
         "log": {
             "id": row.get::<i64, _>("id"),
@@ -1258,6 +1262,7 @@ pub async fn get_log(
             "error": row.get::<String, _>("error"),
             "failed_count": row.try_get("failed_count").unwrap_or(0),
             "attempts": attempts,
+            "has_debug": has_debug,
             "created_at": row.get::<i64, _>("created_at"),
             "client_ip": row.get::<String, _>("client_ip"),
             "user_agent": row.get::<String, _>("user_agent"),

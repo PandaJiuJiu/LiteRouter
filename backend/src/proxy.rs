@@ -462,6 +462,17 @@ pub async fn read_debug_log(pool: &sqlx::SqlitePool, log_id: i64) -> Option<Debu
     Some(DebugCaptureFile { bytes, truncated })
 }
 
+/// Whether a debug capture exists for this log id, without reading the body.
+/// The detail page uses it to decide whether to render the section at all, so
+/// a request that captured nothing costs one `stat` instead of a button and a
+/// round trip that comes back empty.
+pub async fn debug_log_exists(pool: &sqlx::SqlitePool, log_id: i64) -> bool {
+    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
+    tokio::fs::metadata(format!("{dir}/resp.json"))
+        .await
+        .is_ok()
+}
+
 /// Delete the debug log directory for a given log_id. Idempotent —
 /// directory may not exist. Called by `db::cleanup_old_logs` so the files
 /// under a purged `logs` row go with it.

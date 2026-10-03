@@ -263,9 +263,6 @@ export default {
     sectionRequest: 'Request',
     sectionTokens: 'Token usage',
     sectionChain: 'Forwarding chain',
-    sectionDebug: 'Captured upstream response',
-    debugPrivacy:
-      'Only the upstream response body is recorded — request bodies are never stored (see migration 0014).',
     debugLoad: 'Show captured response',
     debugReload: 'Refresh',
     debugNone: 'Nothing was captured for this request.',

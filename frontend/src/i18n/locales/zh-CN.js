@@ -255,8 +255,6 @@ export default {
     sectionRequest: '请求',
     sectionTokens: 'Token 消耗',
     sectionChain: '转发链路',
-    sectionDebug: '捕获到的上游响应',
-    debugPrivacy: '仅记录上游响应体，请求体从不落盘（见迁移 0014）。',
     debugLoad: '查看捕获到的响应',
     debugReload: '刷新',
     debugNone: '本次请求没有捕获到任何内容。',

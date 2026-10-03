@@ -34,6 +34,7 @@ const LOG = {
   client_ip: '127.0.0.1',
   user_agent: 'test',
   attempts: [],
+  has_debug: true,
 }
 
 const wrappers = []
@@ -80,11 +81,31 @@ function findLoadButton(w) {
 }
 
 describe('LogDetail — captured upstream response', () => {
-  it('shows the privacy hint and a button when no capture has been fetched', async () => {
+  it('hides the whole section when the log carries no capture', async () => {
+    getLog.mockResolvedValue({ ...LOG, has_debug: false })
+    const w = await mountDetail()
+    await flushPromises()
+    // Not just the body — the button goes with it, so a request that captured
+    // nothing doesn't leave a dead control behind.
+    expect(w.text()).not.toMatch(/Show captured response|查看捕获到的响应/)
+    expect(w.find('pre.debug-body').exists()).toBe(false)
+    // And nothing was fetched to find that out.
+    expect(getLogDebug).not.toHaveBeenCalled()
+  })
+
+  it('shows just the button, no heading or explainer, when a capture exists', async () => {
+    const w = await mountDetail()
+    await flushPromises()
+    expect(w.text()).toMatch(/Show captured response|查看捕获到的响应/)
+    // Nothing narrates the section — the button says it all.
+    expect(w.text()).not.toMatch(/Captured upstream response|捕获到的上游响应/)
+    expect(w.text()).not.toMatch(/Only the upstream response body is recorded|仅记录上游响应体/)
+  })
+
+  it('shows the button when no capture has been fetched yet', async () => {
     getLogDebug.mockResolvedValue({ log_id: 7, available: false })
     const w = await mountDetail()
     await flushPromises()
-    expect(w.text()).toMatch(/Only the upstream response body is recorded|仅记录上游响应体/)
     expect(w.text()).toMatch(/Show captured response|查看捕获到的响应/)
     // Body is not rendered yet — the button is.
     expect(w.find('pre.debug-body').exists()).toBe(false)

@@ -85,11 +85,10 @@
         </p>
       </section>
 
-      <!-- 捕获到的上游响应体。仅上游响应被落盘，请求体从不落盘
-           （见 migration 0014）。失败请求自动捕获；健康请求需要打开 debug 开关。 -->
-      <section>
-        <h3>{{ t('logDetail.sectionDebug') }}</h3>
-        <p class="hint">{{ t('logDetail.debugPrivacy') }}</p>
+      <!-- 捕获到的上游响应体。不讲前情——有捕获就只有一个按钮，点开才是
+           那一大段。整段挂在 log.has_debug 上（get_log 里一次 stat），所以
+           没捕获的请求连按钮都不出现。 -->
+      <section v-if="log.has_debug">
         <div v-if="debug.loading" class="hint">{{ t('common.loading') }}</div>
         <div v-else-if="debug.error" class="hint">
           {{ t('common.error') }}: {{ debug.error }}

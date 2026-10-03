@@ -1339,6 +1339,63 @@ async fn get_log_debug_returns_available_false_when_no_capture_exists() {
 }
 
 #[tokio::test]
+async fn get_log_reports_has_debug_false_when_nothing_was_captured() {
+    // The detail page keys the whole "捕获到的上游响应" section off this flag,
+    // so a log with no capture on disk must report false rather than leaving
+    // the SPA to probe the debug endpoint and render an empty section.
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let now = literouter::db::now();
+    let id = insert_log(h.pool(), "bob-token", now, 1).await;
+    let (status, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["log"]["has_debug"], false);
+}
+
+#[tokio::test]
+async fn get_log_reports_has_debug_true_once_a_capture_exists() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let now = literouter::db::now();
+    let id = insert_log(h.pool(), "bob-token", now, 1).await;
+    // Lay down the capture file the relay would have written.
+    let dir = support::debug_log_dir(h.pool()).join(id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("resp.json"), b"{\"error\":\"boom\"}").unwrap();
+
+    let (status, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["log"]["has_debug"], true);
+
+    // The flag is a hint, not the payload — the body itself still comes from
+    // the dedicated endpoint, and agrees.
+    let (dstatus, dbody) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{id}/debug"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(dstatus, StatusCode::OK);
+    assert_eq!(dbody["available"], true);
+}
+
+#[tokio::test]
 async fn get_log_debug_requires_auth() {
     let h = Harness::with_admin().await;
     let now = literouter::db::now();
