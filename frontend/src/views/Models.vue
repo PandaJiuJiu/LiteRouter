@@ -54,7 +54,7 @@
       <div class="channel-head">
         <div>
           <span class="channel-name">{{ ch.name }}</span>
-          <el-tag v-if="ch.use_proxy" size="small" type="primary" effect="light" class="proxy-tag">
+          <el-tag v-if="ch.use_proxy" size="small" type="warning" effect="light" class="proxy-tag">
             <el-icon><Connection /></el-icon>
             <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
           </el-tag>
