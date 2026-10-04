@@ -22,6 +22,7 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
         "models": row.get::<String, _>("models"),
         "disabled_models": row.get::<String, _>("disabled_models"),
         "enabled": row.get::<i64, _>("enabled"),
+        "use_proxy": row.get::<i64, _>("use_proxy"),
         "created_at": row.get::<i64, _>("created_at"),
     })
 }
@@ -114,6 +115,9 @@ pub struct ChannelReq {
     pub models: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Whether to use the global proxy for this channel. Default false.
+    #[serde(default)]
+    pub use_proxy: bool,
 }
 fn default_true() -> bool {
     true
@@ -126,6 +130,9 @@ pub struct FetchModelsReq {
     #[serde(default)]
     pub base_url_anthropic: String,
     pub api_key: String,
+    /// Whether to use the global proxy for this test. Default false.
+    #[serde(default)]
+    pub use_proxy: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +143,26 @@ pub struct TestModelReq {
     pub base_url_anthropic: String,
     pub api_key: String,
     pub model: String,
+    /// Whether to use the global proxy for this test. Default false.
+    /// Accepts 0/1 or true/false from the frontend (DB stores integer).
+    #[serde(default, deserialize_with = "deserialize_use_proxy")]
+    pub use_proxy: bool,
+}
+
+fn deserialize_use_proxy<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ProxyVal {
+        Bool(bool),
+        Int(i64),
+    }
+    match ProxyVal::deserialize(deserializer)? {
+        ProxyVal::Bool(b) => Ok(b),
+        ProxyVal::Int(i) => Ok(i != 0),
+    }
 }
 
 /// Body for `POST /api/channels/:id/models` — set the enabled + disabled
@@ -172,7 +199,7 @@ pub async fn create_channel(
     if req.base_url.trim().is_empty() && req.base_url_anthropic.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    sqlx::query("INSERT INTO channels (name, website, base_url, base_url_anthropic, api_key, models, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO channels (name, website, base_url, base_url_anthropic, api_key, models, enabled, use_proxy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&req.name)
         .bind(req.website.trim())
         .bind(req.base_url.trim_end_matches('/'))
@@ -180,6 +207,7 @@ pub async fn create_channel(
         .bind(&req.api_key)
         .bind(req.models.unwrap_or_default())
         .bind(req.enabled as i64)
+        .bind(req.use_proxy as i64)
         .bind(now())
         .execute(&state.pool)
         .await
@@ -208,7 +236,7 @@ pub async fn update_channel(
             .map(|r| r.get::<String, _>("models"))
             .unwrap_or_default(),
     };
-    sqlx::query("UPDATE channels SET name=?, website=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=? WHERE id=?")
+    sqlx::query("UPDATE channels SET name=?, website=?, base_url=?, base_url_anthropic=?, api_key=?, models=?, enabled=?, use_proxy=? WHERE id=?")
         .bind(&req.name)
         .bind(req.website.trim())
         .bind(req.base_url.trim_end_matches('/'))
@@ -216,6 +244,7 @@ pub async fn update_channel(
         .bind(&req.api_key)
         .bind(&models)
         .bind(req.enabled as i64)
+        .bind(req.use_proxy as i64)
         .bind(id)
         .execute(&state.pool)
         .await
@@ -268,6 +297,8 @@ pub async fn fetch_models(
     if let Err(s) = require_admin(&state, &headers) {
         return (s, Json(json!({ "error": "unauthorized" }))).into_response();
     }
+    // Select the appropriate client based on use_proxy flag
+    let client = state.client_for_channel(req.use_proxy);
     // try each configured base URL: OpenAI style (Bearer) then Anthropic
     // style (x-api-key), return the first successful response
     let mut last_err = String::new();
@@ -288,7 +319,7 @@ pub async fn fetch_models(
         if base.is_empty() {
             continue;
         }
-        let mut r = state.http.get(format!("{}/models", base));
+        let mut r = client.get(format!("{}/models", base));
         if style == "x-api-key" {
             r = r.header("x-api-key", &req.api_key);
         } else {
@@ -371,6 +402,9 @@ pub async fn test_model(
     let timeout = model_test_timeout(&state.pool).await;
     let bearer = format!("Bearer {}", req.api_key);
 
+    // Select the appropriate client based on use_proxy flag
+    let client = state.client_for_channel(req.use_proxy);
+
     let mut protocols = serde_json::Map::new();
 
     // Both protocols go through the same helper the breaker's recovery
@@ -381,7 +415,7 @@ pub async fn test_model(
     if !openai_base.is_empty() {
         let url = format!("{}/chat/completions", openai_base);
         let v = run_model_test(
-            &state,
+            &client,
             &url,
             &[("Authorization", bearer.as_str())],
             &req.model,
@@ -395,7 +429,7 @@ pub async fn test_model(
     if !anthropic_base.is_empty() {
         let url = format!("{}/v1/messages", anthropic_base);
         let v = run_model_test(
-            &state,
+            &client,
             &url,
             &[
                 ("x-api-key", req.api_key.as_str()),
@@ -418,7 +452,7 @@ pub async fn test_model(
 }
 
 /// Fallback when the `model_test_timeout_secs` row is missing or unusable.
-const DEFAULT_TEST_PROBE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TEST_PROBE_TIMEOUT_SECS: u64 = 30;
 
 /// How long a single upstream click-and-wait action may take before it's
 /// called a failure. Shared by `test_model` and `fetch_models` — both are
@@ -452,14 +486,14 @@ async fn model_test_timeout(pool: &SqlitePool) -> Duration {
 /// itself and the verdict both come from [`crate::probe`] — the same code
 /// the breaker's recovery ticker uses.
 async fn run_model_test(
-    state: &AppState,
+    client: &reqwest::Client,
     url: &str,
     headers: &[(&str, &str)],
     model: &str,
     timeout: Duration,
 ) -> Value {
     let started = std::time::Instant::now();
-    let outcome = crate::probe::send(state, url, headers, model, timeout).await;
+    let outcome = crate::probe::send(client, url, headers, model, timeout).await;
     let ms = started.elapsed().as_millis();
     match outcome {
         crate::probe::ProbeOutcome::Success => json!({ "ok": true, "ms": ms }),

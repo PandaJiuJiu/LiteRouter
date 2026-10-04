@@ -339,3 +339,79 @@ pub async fn set_breaker_config(
         "probe_interval_secs": cfg.probe_interval.as_secs(),
     })))
 }
+
+// ---------- proxy settings ----------
+
+#[derive(Deserialize)]
+pub struct ProxySettingsReq {
+    /// Proxy host/IP. Empty = no proxy.
+    #[serde(default)]
+    pub host: String,
+    /// Proxy port. 0 = no proxy.
+    #[serde(default = "default_zero")]
+    pub port: u16,
+}
+fn default_zero() -> u16 {
+    0
+}
+
+/// GET /api/settings/proxy — admin only. Returns current proxy configuration.
+pub async fn get_proxy_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    let _user = require_admin(&state, &headers)?;
+    let host: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let port: Option<i64> = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok());
+    Ok(Json(json!({
+        "host": host.unwrap_or_default(),
+        "port": port.unwrap_or(0),
+    })))
+}
+
+/// PUT /api/settings/proxy — admin only. Updates proxy host/port and rebuilds the proxied client.
+pub async fn set_proxy_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ProxySettingsReq>,
+) -> Result<Json<Value>, StatusCode> {
+    let _user = require_admin(&state, &headers)?;
+
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('proxy_host', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(req.host.trim())
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('proxy_port', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(req.port.to_string())
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Build the full proxy URL and hot-swap the proxied client.
+    // Both host and port empty/0 -> no proxy.
+    let proxy_url = if !req.host.trim().is_empty() && req.port > 0 {
+        Some(format!("http://{}:{}", req.host.trim(), req.port))
+    } else {
+        None
+    };
+    state.set_proxied_client(proxy_url.as_deref());
+
+    Ok(Json(json!({ "host": req.host, "port": req.port })))
+}

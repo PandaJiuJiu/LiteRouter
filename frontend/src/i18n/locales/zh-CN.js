@@ -76,6 +76,7 @@ export default {
       openaiUrlPlaceholder: '兼容 OpenAI 协议的地址（含完整路径，如 https://api.openai.com/v1）',
       anthropicUrlPlaceholder: '兼容 Anthropic 协议的地址（含完整路径，如 https://api.anthropic.com/v1）',
       apiKeyPlaceholder: '上游渠道密钥',
+      useProxy: '使用代理',
       enabled: '启用',
     },
     nameKeyRequired: '名称、API Key 不能为空',
@@ -382,6 +383,12 @@ export default {
           keptBoth: '已并存 {n}',
         },
       },
+    },
+    proxy: {
+      title: '网络代理',
+      desc: '配置 HTTP 代理（host:port）。留空则不使用代理。渠道页的「使用代理」开关依赖此处配置。',
+      hostPlaceholder: '代理主机名或 IP（如 127.0.0.1）',
+      portPlaceholder: '代理端口（如 7890）',
     },
   },
   users: {

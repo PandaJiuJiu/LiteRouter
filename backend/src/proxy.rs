@@ -143,6 +143,7 @@ struct Candidate {
     base_url: String,
     api_key: String,
     convert: ConvertMode,
+    use_proxy: bool,
 }
 
 /// All enabled *external* channels that claim to serve `model` on `protocol`.
@@ -158,7 +159,7 @@ async fn candidate_channels(
     protocol: &str,
 ) -> Result<Vec<Candidate>, StatusCode> {
     let rows = sqlx::query(
-        "SELECT name, base_url, base_url_anthropic, api_key, models FROM channels WHERE enabled=1",
+        "SELECT name, base_url, base_url_anthropic, api_key, models, use_proxy FROM channels WHERE enabled=1",
     )
     .fetch_all(&state.pool)
     .await
@@ -200,6 +201,7 @@ async fn candidate_channels(
             base_url,
             api_key: row.get("api_key"),
             convert,
+            use_proxy: row.get::<i64, _>("use_proxy") != 0,
         });
     }
     Ok(out)
@@ -260,7 +262,7 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
 /// neither protocol.
 async fn pinned_channel(state: &AppState, name: &str, protocol: &str) -> Option<Candidate> {
     let row = sqlx::query(
-        "SELECT name, base_url, base_url_anthropic, api_key FROM channels WHERE name=? AND enabled=1",
+        "SELECT name, base_url, base_url_anthropic, api_key, use_proxy FROM channels WHERE name=? AND enabled=1",
     )
     .bind(name)
     .fetch_optional(&state.pool)
@@ -289,6 +291,7 @@ async fn pinned_channel(state: &AppState, name: &str, protocol: &str) -> Option<
         base_url,
         api_key: row.get("api_key"),
         convert,
+        use_proxy: row.get::<i64, _>("use_proxy") != 0,
     })
 }
 
@@ -757,7 +760,7 @@ fn error_response(
 /// `upstream_protocol` is the protocol the upstream actually speaks (which
 /// may differ from the client's when converting).
 fn build_request(
-    state: &AppState,
+    client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     upstream_protocol: &str,
@@ -768,14 +771,12 @@ fn build_request(
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("2023-06-01");
-        state
-            .http
+        client
             .post(format!("{}/v1/messages", base_url))
             .header("x-api-key", api_key)
             .header("anthropic-version", version)
     } else {
-        state
-            .http
+        client
             .post(format!("{}/chat/completions", base_url))
             .header("Authorization", format!("Bearer {}", api_key))
     };
@@ -886,7 +887,7 @@ fn invalid_body_detail(protocol: &str) -> &'static str {
 /// (never forwarded anywhere) and for `Transport` there is nothing to read,
 /// because the next target gets a fresh attempt either way.
 async fn try_upstream(
-    state: &AppState,
+    client: &reqwest::Client,
     cand: &Candidate,
     upstream_protocol: &str,
     body: Vec<u8>,
@@ -894,7 +895,7 @@ async fn try_upstream(
     is_streaming: bool,
 ) -> UpstreamOutcome {
     let req = build_request(
-        state,
+        client,
         &cand.base_url,
         &cand.api_key,
         upstream_protocol,
@@ -2019,8 +2020,9 @@ async fn relay(
             }
             attempted += 1;
             upstream_attempts += 1;
+            let client = state.client_for_channel(cand.use_proxy);
             let outcome = try_upstream(
-                state,
+                &client,
                 cand,
                 upstream_protocol,
                 target_body,

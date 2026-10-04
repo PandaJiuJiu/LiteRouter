@@ -34,6 +34,30 @@
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
 
+    <!-- 网络代理：仅管理员可改。代理地址为空则不启用代理。渠道页的“使用代理”开关依赖这里配置。 -->
+    <div class="row" v-if="isAdmin">
+      <div class="row-label">{{ t('settings.proxy.title') }}</div>
+      <div class="row-control row-actions" style="gap: 12px; width: auto;">
+        <el-input
+          v-model="proxyHost"
+          :disabled="proxySaving"
+          :placeholder="t('settings.proxy.hostPlaceholder')"
+          style="width: 200px;"
+          @change="onProxyChange"
+        />
+        <el-input-number
+          v-model="proxyPort"
+          :disabled="proxySaving"
+          :min="1"
+          :max="65535"
+          :placeholder="t('settings.proxy.portPlaceholder')"
+          style="width: 120px;"
+          @change="onProxyChange"
+        />
+      </div>
+    </div>
+    <div class="row-desc" v-if="isAdmin">{{ t('settings.proxy.desc') }}</div>
+
     <!-- 备份 / 还原只是一个入口行——所有交互（段位、密码、文件、预览、
          冲突解决、提交统计）都在 ConfigBackup 的弹窗里。 -->
     <div class="row" v-if="isAdmin">
@@ -62,7 +86,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { LANGUAGES } from '../i18n'
 import { languageSaving, locale, switchLanguage } from '../language'
-import { getLogRetention, setLogRetention } from '../api'
+import { getLogRetention, setLogRetention, getProxySettings, setProxySettings } from '../api'
 import { session } from '../session'
 import ConfigBackup from './ConfigBackup.vue'
 
@@ -105,6 +129,30 @@ async function onRetentionChange(days) {
   }
 }
 
+// Proxy settings: host + port. Both empty/0 = no proxy.
+const proxyHost = ref('')
+const proxyPort = ref(0)
+const proxySaving = ref(false)
+
+async function loadProxy() {
+  try {
+    const data = await getProxySettings()
+    proxyHost.value = data.host || ''
+    proxyPort.value = data.port || 0
+  } catch (_) {
+    // ignore
+  }
+}
+
+async function onProxyChange() {
+  proxySaving.value = true
+  try {
+    await setProxySettings(proxyHost.value.trim(), proxyPort.value)
+  } finally {
+    proxySaving.value = false
+  }
+}
+
 // Both dialogs are controlled here so closing them from inside the child
 // (`invalidates clear here`) and reopening from these buttons stays in
 // sync via v-model.
@@ -112,7 +160,10 @@ const exportDialogVisible = ref(false)
 const importDialogVisible = ref(false)
 
 onMounted(() => {
-  if (isAdmin.value) loadRetention()
+  if (isAdmin.value) {
+    loadRetention()
+    loadProxy()
+  }
 })
 </script>
 

@@ -77,6 +77,7 @@ export default {
       anthropicUrlPlaceholder:
         'Anthropic-compatible endpoint (with full path, e.g. https://api.anthropic.com/v1)',
       apiKeyPlaceholder: 'Upstream API key',
+      useProxy: 'Use Proxy',
       enabled: 'Enabled',
     },
     nameKeyRequired: 'Name and API key are required',
@@ -391,6 +392,12 @@ export default {
           keptBoth: 'Kept both {n}',
         },
       },
+    },
+    proxy: {
+      title: 'Network Proxy',
+      desc: 'Configure HTTP proxy (host:port). Leave empty to disable proxy. The "Use Proxy" toggle on the Channels page depends on this setting.',
+      hostPlaceholder: 'Proxy host or IP (e.g. 127.0.0.1)',
+      portPlaceholder: 'Proxy port (e.g. 7890)',
     },
   },
   users: {

@@ -44,6 +44,8 @@ struct ProbeChannel {
     base_url_anthropic: String,
     /// Raw `models` field from the DB (comma-separated, may contain `*`).
     models_csv: String,
+    /// Whether to use the global proxy for this channel.
+    use_proxy: bool,
 }
 
 /// Cached model list for a single channel. `models_csv` is a verbatim copy
@@ -252,7 +254,8 @@ async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeOut
         return ProbeOutcome::Misconfigured("channel has no base_url".into());
     };
 
-    crate::probe::send(state, &url, &headers, model, PROBE_TIMEOUT).await
+    let client = state.client_for_channel(ch.use_proxy);
+    crate::probe::send(&client, &url, &headers, model, PROBE_TIMEOUT).await
 }
 
 /// One info line per probe. Sample:
@@ -274,7 +277,7 @@ async fn load_probe_channel(
     name: &str,
 ) -> Result<Option<ProbeChannel>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT name, api_key, base_url, base_url_anthropic, models, enabled FROM channels WHERE name = ?",
+        "SELECT name, api_key, base_url, base_url_anthropic, models, enabled, use_proxy FROM channels WHERE name = ?",
     )
     .bind(name)
     .fetch_optional(&state.pool)
@@ -290,6 +293,7 @@ async fn load_probe_channel(
         base_url: row.get("base_url"),
         base_url_anthropic: row.get("base_url_anthropic"),
         models_csv: row.get("models"),
+        use_proxy: row.get::<i64, _>("use_proxy") != 0,
     }))
 }
 
@@ -344,7 +348,8 @@ async fn fetch_models_from_upstream(state: &AppState, ch: &ProbeChannel) -> Opti
     } else {
         return None;
     };
-    let mut req = state.http.get(&url).timeout(PROBE_TIMEOUT);
+    let client = state.client_for_channel(ch.use_proxy);
+    let mut req = client.get(&url).timeout(PROBE_TIMEOUT);
     if url.contains("/v1/messages") || url.starts_with(&ch.base_url_anthropic) {
         req = req
             .header("x-api-key", &ch.api_key)

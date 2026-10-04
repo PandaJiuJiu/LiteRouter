@@ -34,7 +34,6 @@
 //! exempts very short inputs would otherwise let an exhausted account
 //! report healthy. It stays short enough to cost a fraction of a cent.
 
-use crate::state::AppState;
 use serde_json::{json, Value};
 
 /// What we ask the model to say. Short, but several characters long so a
@@ -106,13 +105,13 @@ impl ProbeOutcome {
 /// protocol per channel, while the admin UI tests both and reports them
 /// side by side, so the choice of endpoint is not ours to make here.
 pub async fn send(
-    state: &AppState,
+    client: &reqwest::Client,
     url: &str,
     headers: &[(&str, &str)],
     model: &str,
     timeout: std::time::Duration,
 ) -> ProbeOutcome {
-    let mut req = state.http.post(url).timeout(timeout);
+    let mut req = client.post(url).timeout(timeout);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }

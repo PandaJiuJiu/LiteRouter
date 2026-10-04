@@ -119,6 +119,11 @@ export const getLogRetention = () =>
 export const setLogRetention = (days) =>
   api.put('/settings/log-retention-days', { days }).then((r) => r.data.days)
 
+// Global HTTP/HTTPS proxy (host:port). Admin only.
+export const getProxySettings = () => api.get('/settings/proxy').then((r) => r.data)
+export const setProxySettings = (host, port) =>
+  api.put('/settings/proxy', { host, port }).then((r) => r.data)
+
 // ---------- config backup / restore ----------
 //
 // Admin-only. The export side returns a binary blob with the server-stamped

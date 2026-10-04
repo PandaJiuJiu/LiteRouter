@@ -339,6 +339,7 @@ async function fetchList(ch) {
       base_url: ch.base_url,
       base_url_anthropic: ch.base_url_anthropic,
       api_key: ch.api_key,
+      use_proxy: ch.use_proxy,
     })
     if (!models.length) {
       ElMessage.warning(t('models.emptyUpstream'))
@@ -500,6 +501,7 @@ async function pingModel(ch, m) {
       base_url_anthropic: ch.base_url_anthropic,
       api_key: ch.api_key,
       model: m,
+      use_proxy: ch.use_proxy,
     })
     if (!ch._testResult) ch._testResult = {}
     ch._testResult[m] = r
@@ -537,6 +539,7 @@ async function testAll(ch) {
           base_url_anthropic: ch.base_url_anthropic,
           api_key: ch.api_key,
           model: m,
+          use_proxy: ch.use_proxy,
         })
         if (!ch._testResult) ch._testResult = {}
         ch._testResult[m] = r

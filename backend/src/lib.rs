@@ -41,11 +41,28 @@ pub async fn build_state(pool: SqlitePool) -> Arc<AppState> {
         .unwrap_or(false);
     let breaker_cfg = settings::load_breaker_config(&pool).await;
     let breaker = Arc::new(breaker::Breaker::new(breaker_cfg));
-    let state = Arc::new(AppState::new(pool, breaker));
+    let state = AppState::new(pool, breaker);
     state
         .debug_logging
         .store(debug_logging, std::sync::atomic::Ordering::Relaxed);
-    state
+    // Build proxied client from proxy settings (if any)
+    let host: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let port: Option<i64> = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok());
+    let proxy_url = match (host.filter(|h| !h.is_empty()), port.filter(|p| *p > 0)) {
+        (Some(h), Some(p)) => Some(format!("http://{}:{}", h, p)),
+        _ => None,
+    };
+    state.set_proxied_client(proxy_url.as_deref());
+    Arc::new(state)
 }
 
 /// The full API surface. Deliberately free of I/O beyond the state it is
@@ -107,6 +124,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/settings/log-retention-days",
             get(settings::get_log_retention_days).put(settings::set_log_retention_days),
+        )
+        .route(
+            "/api/settings/proxy",
+            get(settings::get_proxy_settings).put(settings::set_proxy_settings),
         )
         .route("/api/breaker/snapshot", get(breaker::http_snapshot))
         .route("/api/breaker/reset", post(breaker::http_reset))

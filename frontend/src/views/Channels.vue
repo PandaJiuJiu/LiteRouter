@@ -63,6 +63,9 @@
         <el-form-item :label="t('channels.col.apiKey')">
           <el-input v-model="form.api_key" :placeholder="t('channels.form.apiKeyPlaceholder')" show-password />
         </el-form-item>
+        <el-form-item :label="t('channels.form.useProxy')">
+          <el-switch v-model="form.use_proxy" />
+        </el-form-item>
         <el-form-item :label="t('channels.form.enabled')">
           <el-switch v-model="form.enabled" />
         </el-form-item>
@@ -89,7 +92,7 @@ const channels = ref([])
 const loading = ref(false)
 const dialogVisible = ref(false)
 const editing = ref(null)
-const form = ref({ name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true })
+const form = ref({ name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true, use_proxy: false })
 
 async function load() {
   loading.value = true
@@ -109,8 +112,8 @@ function manageModels(row) {
 function openDialog(row) {
   editing.value = row || null
   form.value = row
-    ? { name: row.name, website: row.website || '', base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled }
-    : { name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true }
+    ? { name: row.name, website: row.website || '', base_url: row.base_url, base_url_anthropic: row.base_url_anthropic || '', api_key: row.api_key, models: row.models, enabled: !!row.enabled, use_proxy: !!row.use_proxy }
+    : { name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true, use_proxy: false }
   dialogVisible.value = true
 }
 
