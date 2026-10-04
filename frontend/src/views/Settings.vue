@@ -34,8 +34,10 @@
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
 
-    <!-- 网络代理：分两行——第一行是服务器地址，第二行是独立的全局开关。
-         「使用代理」的渠道开关只有在第二行的总开关开启时才真正走代理。 -->
+    <!-- 网络代理：分两行——
+         第一行：代理服务器地址（host/port）
+         第二行：全局代理开关。开启后所有渠道都走代理；关闭时只有渠道页勾选
+         「使用代理」的渠道走代理。两者是 OR 关系，互不依赖。 -->
     <div class="row" v-if="isAdmin">
       <div class="row-label">{{ t('settings.proxy.title') }}</div>
       <div class="row-control row-actions" style="gap: 12px; width: auto;">

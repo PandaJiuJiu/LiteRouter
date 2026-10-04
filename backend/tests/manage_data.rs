@@ -1624,10 +1624,13 @@ async fn toggling_enabled_does_not_clobber_host_or_port() {
 
 #[tokio::test]
 async fn proxy_state_reflects_effective_combination_in_state() {
-    // The AppState exposes a derived `proxy_effective()` that the channel
-    // listing uses to render the per-channel "代理" tag. It must only
-    // return true when BOTH the global switch AND a valid host/port are
-    // present — pinning this here so the four combinations can't drift.
+    // The AppState exposes `proxy_active_for(channel_use_proxy)` that the
+    // channel listing uses to render the per-channel "代理" tag. It returns
+    // true when (a) the global switch OR (b) the channel's own use_proxy
+    // is on, AND (c) the proxy server itself is configured.
+    //
+    // This is an OR relationship: either global or per-channel is enough to
+    // make the channel go through the proxy. They are independent.
     //
     // Use the harness's state (not `build_state(pool)` again) so the
     // in-process PUT actually writes to the Arc we hold. A second
@@ -1635,9 +1638,11 @@ async fn proxy_state_reflects_effective_combination_in_state() {
     // router never touches, and the assertions would lie.
     let h = Harness::with_admin().await;
     let state = h.state.clone();
-    // nothing configured yet
-    assert!(!state.proxy_effective());
-    // host/port alone: switch still off
+    // nothing configured yet: no proxy server, no global, no channel
+    assert!(!state.proxy_active_for(false));
+    assert!(!state.proxy_active_for(true));
+
+    // Configure proxy server (host/port) — still no global switch, no channel toggle
     let _ = support::call_json(
         &h.router,
         "PUT",
@@ -1646,22 +1651,40 @@ async fn proxy_state_reflects_effective_combination_in_state() {
         Some(&support::login(&h.router, "admin").await),
     )
     .await;
-    state.set_proxy_enabled(false);
+    // Proxy server configured, but neither switch is on. A channel that
+    // didn't opt in stays direct...
+    assert!(!state.proxy_active_for(false));
+    // ...while one that did opts in on its own, without the global switch.
+    // This also proves the PUT above actually rebuilt the cached proxied
+    // client on this Arc (these assertions would be vacuous if it were
+    // still None).
     assert!(
-        !state.proxy_effective(),
-        "host/port alone must not enable the proxy"
+        state.proxy_active_for(true),
+        "channel use_proxy=1 alone is enough once the server is configured"
     );
-    // flip switch on
+
+    // Flip global switch on — now every channel goes through the proxy,
+    // including one that never opted in.
     state.set_proxy_enabled(true);
     assert!(
-        state.proxy_effective(),
-        "switch on + valid config must enable the proxy"
+        state.proxy_active_for(false),
+        "global on → even channel without use_proxy goes through proxy"
     );
-    // flip switch back off
+    assert!(
+        state.proxy_active_for(true),
+        "global on → channel with use_proxy also goes through proxy"
+    );
+
+    // Turn global off again. Per-channel and global are independent: the
+    // opted-in channel keeps its proxy, the rest goes direct.
     state.set_proxy_enabled(false);
     assert!(
-        !state.proxy_effective(),
-        "switch off must disable even with valid config"
+        !state.proxy_active_for(false),
+        "global off, no channel toggle → no proxy"
+    );
+    assert!(
+        state.proxy_active_for(true),
+        "global off, channel use_proxy=1 → this channel still goes through proxy"
     );
 }
 

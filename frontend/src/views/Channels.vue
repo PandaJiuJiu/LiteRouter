@@ -69,6 +69,11 @@
         </el-form-item>
         <el-form-item :label="t('channels.form.useProxy')">
           <el-switch v-model="form.use_proxy" />
+          <!-- Per-channel toggle is an OR with the global switch, not a
+               sub-switch of it: this channel goes through the proxy on its
+               own, and the global switch can force other channels through it.
+               Saying so here is the only place the relationship is visible. -->
+          <div class="form-hint">{{ t('channels.form.useProxyHint') }}</div>
         </el-form-item>
         <el-form-item :label="t('channels.form.enabled')">
           <el-switch v-model="form.enabled" />
@@ -181,5 +186,11 @@ onMounted(load)
 }
 .proxy-text {
   margin-left: 2px;
+}
+.form-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.5;
+  margin-top: 2px;
 }
 </style>

@@ -68,21 +68,31 @@ impl AppState {
         }
     }
 
-    /// The client for an outbound call to a channel: the proxied one only
-    /// when the channel opted in **and** the global proxy is enabled **and**
-    /// a proxy is actually configured, otherwise the direct one.
+    /// The client for an outbound call to a channel: the proxied one when
+    /// the call will actually go through the proxy.
     ///
-    /// Falling back to direct rather than erroring is deliberate. A channel
-    /// with `use_proxy = 1` but no effective proxy (admin oversight, or the
-    /// global switch flipped off) should keep working in a network that
-    /// doesn't need a proxy — hard-failing would instead take the channel
-    /// out of service until someone visits the settings page.
+    /// Two orthogonal reasons the call goes through the proxy:
+    /// - The channel itself opted in via `use_proxy` (per-channel toggle).
+    /// - The global switch is on, in which case every channel goes through
+    ///   the proxy regardless of its own setting.
+    ///
+    /// These combine as **OR**: any one of them being on is enough to route
+    /// this call through the proxy. Per-channel and global are independent
+    /// settings — a channel with `use_proxy = 1` works fine with the global
+    /// switch off, and a channel with `use_proxy = 0` is still proxied when
+    /// the global switch is on. (Earlier the per-channel toggle only took
+    /// effect when global was on; that coupled two unrelated decisions and
+    /// is what this method no longer does.)
+    ///
+    /// On top of either of those, the proxy server itself has to be
+    /// configured (host + port). Falling back to direct rather than erroring
+    /// is deliberate — a misconfiguration should not take a channel out of
+    /// service.
     pub fn client_for_channel(&self, use_proxy: bool) -> Client {
-        if use_proxy
-            && self
-                .proxy_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        let global = self
+            .proxy_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if use_proxy || global {
             if let Ok(guard) = self.http_proxied.read() {
                 if let Some(c) = guard.as_ref() {
                     return c.clone();
@@ -92,16 +102,17 @@ impl AppState {
         self.http.clone()
     }
 
-    /// Whether an outbound call with `use_proxy = true` will actually be
-    /// routed through the configured proxy. Combines the global enabled
-    /// flag and the cached client — both have to hold. The UI uses this to
-    /// render the per-channel "代理" tag so it doesn't claim a proxy is in
-    /// use when it isn't.
-    pub fn proxy_effective(&self) -> bool {
-        if !self
+    /// Whether this specific channel will actually be routed through the
+    /// proxy at request time. Combines (a) the global switch, (b) the
+    /// channel's own `use_proxy`, and (c) whether the proxy server itself is
+    /// configured — any one of (a)/(b) being on plus (c) is enough. The UI
+    /// uses this to render the per-channel "代理" tag so it doesn't claim a
+    /// proxy is in use when it isn't.
+    pub fn proxy_active_for(&self, channel_use_proxy: bool) -> bool {
+        let global = self
             .proxy_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !channel_use_proxy && !global {
             return false;
         }
         self.http_proxied
@@ -110,9 +121,21 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// Flip the global proxy enable switch. Independent of the cached
-    /// proxied client — `set_proxied_client` is for host/port changes, this
-    /// is for the on/off switch.
+    /// Whether the global proxy switch is on. Read on every outbound call
+    /// via [`Self::client_for_channel`], so flipping it from the settings
+    /// handler takes effect without rebuilding the cached client.
+    /// Independent of host/port: configuring a proxy server does NOT
+    /// implicitly enable it — the admin has to flip this on.
+    /// Atomic because the admin handler mutates it without a lock and
+    /// requests are reading it concurrently.
+    pub fn proxy_enabled(&self) -> bool {
+        self.proxy_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flip the global proxy switch. Independent of the cached proxied
+    /// client — `set_proxied_client` is for host/port changes, this is for
+    /// the on/off switch.
     pub fn set_proxy_enabled(&self, enabled: bool) {
         self.proxy_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
