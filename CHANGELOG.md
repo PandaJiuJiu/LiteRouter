@@ -8,18 +8,23 @@
 
 ## [0.0.5] - 2026-10-04
 
-自 v0.0.4 起共 10 个提交。
+自 v0.0.4 起共 19 个提交。
 
 ### 新增
 
-- **全局 HTTP/HTTPS 代理**：设置页新增「代理」段，分两层——
-  - **代理服务器配置**（`proxy_host` / `proxy_port`）：只是地址，不启用代理
-  - **全局启用开关**（`proxy_enabled`）：必须显式开启后，代理才会被实际使用（默认关）
+- **全局 HTTP/HTTPS 代理**：设置页新增「代理」段，拆成两行独立配置——
+  - **代理服务器地址**（`proxy_host` / `proxy_port`）：只是地址，填了**不会**隐式启用代理
+  - **全局启用开关**（`proxy_enabled`）：独立的总开关（默认关），打开后所有渠道都走代理
 
-  渠道级别的 `use_proxy` 开关只有在全局开关开启、且代理地址非空时才真正走代理。`AppState::proxy_effective()` 综合两者（开关 + 缓存的代理客户端）判断当前是否生效，渠道列表与模型页的「代理」标签也基于此判定——避免出现「渠道页说在走代理、实际却在直连」的不一致。熔断主动探测与模型测试同样受全局开关控制。迁移 `0032_proxy_enabled` 默认值 0，保证已有实例在升级后不会突然开始走代理
+  渠道级的 `use_proxy` 开关与全局开关是 **OR** 关系，互不依赖：全局开关是一键让所有渠道走代理，渠道开关则只管自己（全局关掉时，单独勾了照样走代理）。最终判定为 `(全局开关 OR 渠道 use_proxy) AND 代理服务器已配置`。`AppState::proxy_active_for(channel_use_proxy)` 承担这一判定，六个调用点（relay 候选链、渠道测试、半开探测）各自传入对应渠道的 `use_proxy`——failover 时每个候选各判各的；渠道列表与模型页的「代理」标签也基于此判定，避免出现「渠道页说在走代理、实际却在直连」的不一致
+
+  `PUT /api/settings/proxy` 的三个字段全部改为可选的部分更新（`host` / `port` / `enabled` 缺省即保持原值），切换开关不再顺手覆盖地址。设置页代理段的界面提示同步说明两个开关的 OR 关系，渠道页 `use_proxy` 开关下也补了一行说明——这是新语义在界面上唯一可见的地方
+
+  迁移 `0032_proxy_enabled` 默认值 0，保证已有实例在升级后不会突然开始走代理
 
 ### 修复
 
+- **全局开关与渠道开关被错误耦合**：原先渠道的 `use_proxy` 只有在全局开关开启时才生效，两个本不相干的决策被绑在一起——管理员在渠道页勾了「使用代理」，还得再去设置页开总开关才有用；总开关一开，又会给所有渠道强加代理。判定改为 `(全局 OR 渠道) AND 已配置`（`proxy_effective()` 更名为 `proxy_active_for(channel_use_proxy)`），语义由「全局 && 配置」变成按渠道求值
 - **死 provider 在客户端看到之前就 failover**：流式响应在 commit 之前先 peek 首条完整 SSE 帧（8 KiB / 1.5 s）。首帧是 `event: error` 或 OpenAI 风格 error envelope 时，hop 分类为 `InvalidBody` 并尝试下一候选；首帧是 content 时，peek 的字节作为响应体开头转发，后续流接续。否则一个只发 `event: error` 的流会落到客户端再无回退
 - **流式响应里的 error 事件不再误记为成功**：SSE pump 扫描每一行，识别 `event: error`（Anthropic）与 `data:` 里携带 error envelope（OpenAI 风格 relay），hop 记为失败并喂给熔断 `Outcome::Failure(upstream_message)`。否则 relay 用 `200` + 立即死亡会让熔断器永远不退避
 - **熔断跳过不再污染最终状态码**：被熔断器 skip 的候选在日志里是 hop，但不计入「所有候选都失败」的分母——它们从未真正打到上游，对下游如何失败没有发言权。错误信封按客户端协议成形：`/v1/messages` 返回 Anthropic 形态的 `{"type":"error","error":{…}}` 带 spec `error.type`，`/v1/chat/completions` 保持 OpenAI 形态
@@ -38,10 +43,10 @@
 
 ### 测试
 
-后端 327 → 353 例，前端 172 → 175 例（i18n 351 → 359 key 双语齐平）：
+后端 327 → 353 例，前端 172 → 175 例（i18n 351 → 360 key 双语齐平）：
 
 - `relay_contract.rs` 新增 16 例：流式首帧 error 触发 failover、首帧 content 不丢字节、协议转换路径上的 peek、错误信封按协议成形、被熔断 skip 不污染最终状态（502 vs 429 vs 504）
-- `manage_data.rs` 新增 10 例覆盖代理设置（普通用户不可见、默认未启用、配置不隐式启用、enabled 不破坏 host/port、`proxy_effective` 四种组合、helper 回环）+ 4 例 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应
+- `manage_data.rs` 新增 10 例覆盖代理设置（普通用户不可见、默认未配置且未启用、配置地址不隐式启用、切 `enabled` 不破坏 host/port、`proxy_active_for` 四种组合、helper 回环）+ 4 例 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应。其中 `proxy_state_reflects_effective_combination_in_state` 此前有两条断言在 OR 语义下自相矛盾（全局关闭后先断言该渠道不走代理，紧接着又断言同样条件的渠道走代理），测试当时是红的——按新语义重排为四种组合
 - `logs_view.spec.js` 新增流式 200 不显示为绿色的用例；`log_detail.spec.js` 新增「无捕获则不渲染按钮 / 有捕获则渲染按钮」的用例
 
 ### 其他
