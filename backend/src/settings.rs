@@ -341,79 +341,153 @@ pub async fn set_breaker_config(
 }
 
 // ---------- proxy settings ----------
+//
+// Three keys in the `settings` table: `proxy_host` + `proxy_port` describe
+// the proxy server, `proxy_enabled` is an independent on/off switch.
+// Configuring a server does NOT enable the proxy — the admin has to flip
+// the switch separately. This keeps the proxy dormant when an admin fills
+// in the server but hasn't decided to route through it yet, and keeps the
+// per-channel `use_proxy` toggle meaningful (it gates the channel's intent;
+// the global switch gates the system-wide decision to actually proxy).
 
 #[derive(Deserialize)]
 pub struct ProxySettingsReq {
-    /// Proxy host/IP. Empty = no proxy.
-    #[serde(default)]
-    pub host: String,
-    /// Proxy port. 0 = no proxy.
-    #[serde(default = "default_zero")]
-    pub port: u16,
-}
-fn default_zero() -> u16 {
-    0
+    /// Proxy host/IP. None = leave as-is.
+    pub host: Option<String>,
+    /// Proxy port. None = leave as-is.
+    pub port: Option<u16>,
+    /// Whether to actually use the configured proxy. None = leave as-is.
+    /// Flipping this takes effect on the next outbound request without a
+    /// restart; the cached proxied client is left in place.
+    pub enabled: Option<bool>,
 }
 
-/// GET /api/settings/proxy — admin only. Returns current proxy configuration.
+/// Read one proxy field, returning `None` if the row is missing or unreadable.
+/// Per-key, so a partially-corrupt row only loses one field instead of all.
+async fn read_proxy_field(pool: &sqlx::SqlitePool, key: &str) -> Option<String> {
+    db::get_setting(pool, key).await.ok().flatten()
+}
+
+/// Read all three proxy fields. Defaults: host = "", port = 0, enabled = false.
+/// `enabled` defaults to false (NOT enabled) so a fresh install never silently
+/// routes through a proxy — see the module comment.
+pub async fn current_proxy_settings(pool: &sqlx::SqlitePool) -> (String, u16, bool) {
+    let host = read_proxy_field(pool, "proxy_host")
+        .await
+        .unwrap_or_default();
+    let port = read_proxy_field(pool, "proxy_port")
+        .await
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(0);
+    let enabled = read_proxy_field(pool, "proxy_enabled")
+        .await
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    (host, port, enabled)
+}
+
+/// Build the full proxy URL from host + port, or `None` if either is empty.
+pub fn proxy_url_from(host: &str, port: u16) -> Option<String> {
+    let trimmed = host.trim();
+    if !trimmed.is_empty() && port > 0 {
+        Some(format!("http://{}:{}", trimmed, port))
+    } else {
+        None
+    }
+}
+
+/// GET /api/settings/proxy — admin only. Returns current proxy configuration
+/// including the global on/off switch.
 pub async fn get_proxy_settings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     let _user = require_admin(&state, &headers)?;
-    let host: Option<String> =
-        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten();
-    let port: Option<i64> =
-        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok());
+    let (host, port, enabled) = current_proxy_settings(&state.pool).await;
     Ok(Json(json!({
-        "host": host.unwrap_or_default(),
-        "port": port.unwrap_or(0),
+        "host": host,
+        "port": port,
+        "enabled": enabled,
     })))
 }
 
-/// PUT /api/settings/proxy — admin only. Updates proxy host/port and rebuilds the proxied client.
+/// PUT /api/settings/proxy — admin only. Each field is optional; absent
+/// fields keep their current value. Updates the DB and hot-swaps state:
+///
+/// - `host` / `port` change: rebuild the cached proxied client.
+/// - `enabled` change: flip the atomic switch. The cached client (if any)
+///   is reused — toggling on/off does not require rebuilding.
+///
+/// All three keys are written (idempotent UPSERT) so reading the row back
+/// after a partial PUT yields the same state the user sees in the UI.
 pub async fn set_proxy_settings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<ProxySettingsReq>,
-) -> Result<Json<Value>, StatusCode> {
-    let _user = require_admin(&state, &headers)?;
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _user = require_admin(&state, &headers)
+        .map_err(|s| (s, json!({"error": "需要管理员权限"}).into()))?;
+
+    let (cur_host, cur_port, cur_enabled) = current_proxy_settings(&state.pool).await;
+    let new_host = req.host.as_deref().map(str::trim).unwrap_or(&cur_host);
+    let new_port = req.port.unwrap_or(cur_port);
+    let new_enabled = req.enabled.unwrap_or(cur_enabled);
 
     sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('proxy_host', ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
-    .bind(req.host.trim())
+    .bind(new_host)
     .execute(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "db error"}).into(),
+        )
+    })?;
 
     sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('proxy_port', ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
-    .bind(req.port.to_string())
+    .bind(new_port.to_string())
     .execute(&state.pool)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "db error"}).into(),
+        )
+    })?;
 
-    // Build the full proxy URL and hot-swap the proxied client.
-    // Both host and port empty/0 -> no proxy.
-    let proxy_url = if !req.host.trim().is_empty() && req.port > 0 {
-        Some(format!("http://{}:{}", req.host.trim(), req.port))
-    } else {
-        None
-    };
-    state.set_proxied_client(proxy_url.as_deref());
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('proxy_enabled', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(if new_enabled { "1" } else { "0" })
+    .execute(&state.pool)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "db error"}).into(),
+        )
+    })?;
 
-    Ok(Json(json!({ "host": req.host, "port": req.port })))
+    // Rebuild the cached client only if host/port actually changed — the
+    // toggle flip is cheap and goes through the atomic.
+    if req.host.is_some() || req.port.is_some() {
+        let proxy_url = proxy_url_from(new_host, new_port);
+        state.set_proxied_client(proxy_url.as_deref());
+    }
+    if req.enabled.is_some() {
+        state.set_proxy_enabled(new_enabled);
+    }
+
+    Ok(Json(json!({
+        "host": new_host,
+        "port": new_port,
+        "enabled": new_enabled,
+    })))
 }

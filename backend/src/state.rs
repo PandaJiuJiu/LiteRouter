@@ -30,6 +30,15 @@ pub struct AppState {
     /// a lock + clone, and `reqwest::Client` clones are an `Arc` bump — this
     /// is not on any hot path that cares.
     http_proxied: RwLock<Option<Client>>,
+    /// Whether the configured proxy should actually be used. Read on every
+    /// outbound call via [`Self::client_for_channel`], so flipping it from
+    /// the settings handler takes effect without rebuilding the cached client
+    /// (and without touching the host/port config). Independent of host/port:
+    /// configuring a proxy server does NOT implicitly enable it — the admin
+    /// has to flip this on, otherwise the configured host/port is dormant.
+    /// Atomic because the admin handler mutates it without a lock and
+    /// requests are reading it concurrently.
+    proxy_enabled: std::sync::atomic::AtomicBool,
     /// session token -> metadata
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     /// Whether request/response bodies are captured to disk. Held on the
@@ -52,23 +61,28 @@ impl AppState {
                 .build()
                 .expect("build http client"),
             http_proxied: RwLock::new(None),
+            proxy_enabled: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             debug_logging: std::sync::atomic::AtomicBool::new(false),
             breaker,
         }
     }
 
-    /// The client for an outbound call to a channel: the proxied one when the
-    /// channel opted in **and** a proxy is actually configured, otherwise the
-    /// direct one.
+    /// The client for an outbound call to a channel: the proxied one only
+    /// when the channel opted in **and** the global proxy is enabled **and**
+    /// a proxy is actually configured, otherwise the direct one.
     ///
     /// Falling back to direct rather than erroring is deliberate. A channel
-    /// with `use_proxy = 1` and no proxy configured is an admin oversight, and
-    /// silently going direct at least keeps the request working in a network
-    /// that doesn't need a proxy — hard-failing would instead take the channel
+    /// with `use_proxy = 1` but no effective proxy (admin oversight, or the
+    /// global switch flipped off) should keep working in a network that
+    /// doesn't need a proxy — hard-failing would instead take the channel
     /// out of service until someone visits the settings page.
     pub fn client_for_channel(&self, use_proxy: bool) -> Client {
-        if use_proxy {
+        if use_proxy
+            && self
+                .proxy_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             if let Ok(guard) = self.http_proxied.read() {
                 if let Some(c) = guard.as_ref() {
                     return c.clone();
@@ -78,22 +92,42 @@ impl AppState {
         self.http.clone()
     }
 
-    /// Whether a proxied client is currently configured. The UI reads this to
-    /// tell the admin that `use_proxy` on a channel is currently a no-op.
-    pub fn has_proxied_client(&self) -> bool {
+    /// Whether an outbound call with `use_proxy = true` will actually be
+    /// routed through the configured proxy. Combines the global enabled
+    /// flag and the cached client — both have to hold. The UI uses this to
+    /// render the per-channel "代理" tag so it doesn't claim a proxy is in
+    /// use when it isn't.
+    pub fn proxy_effective(&self) -> bool {
+        if !self
+            .proxy_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
         self.http_proxied
             .read()
             .map(|g| g.is_some())
             .unwrap_or(false)
     }
 
+    /// Flip the global proxy enable switch. Independent of the cached
+    /// proxied client — `set_proxied_client` is for host/port changes, this
+    /// is for the on/off switch.
+    pub fn set_proxy_enabled(&self, enabled: bool) {
+        self.proxy_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Install (or clear) the proxied client. Called on startup from
-    /// `build_state` and by the admin proxy-settings endpoint, so a config
-    /// change takes effect without a restart.
+    /// `build_state` and by the admin proxy-settings endpoint when
+    /// host/port change, so a config change takes effect without a
+    /// restart.
     ///
     /// `proxy_url` is the full URL, scheme included — `reqwest` needs to know
     /// whether it's talking HTTP CONNECT or SOCKS5, and a bare `host:port`
     /// would be parsed as an unknown scheme. `None` clears the client.
+    /// Note: this only sets/clears the cached client; whether it actually
+    /// gets used is gated by [`Self::set_proxy_enabled`].
     pub fn set_proxied_client(&self, proxy_url: Option<&str>) {
         let mut guard = self.http_proxied.write().unwrap_or_else(|e| e.into_inner());
         match proxy_url {

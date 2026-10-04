@@ -11,7 +11,13 @@ use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
+fn row_channel(row: &sqlx::sqlite::SqliteRow, state: &AppState) -> Value {
+    let use_proxy: i64 = row.get("use_proxy");
+    // Per-channel `use_proxy` is the channel's *intent*; `proxy_effective`
+    // is what actually happens at request time — both the global switch AND
+    // a valid host/port config have to be on. The UI gates the "代理" tag
+    // on this so it doesn't claim a proxy is in use when it isn't.
+    let proxy_effective = use_proxy != 0 && state.proxy_effective();
     json!({
         "id": row.get::<i64, _>("id"),
         "name": row.get::<String, _>("name"),
@@ -22,7 +28,8 @@ fn row_channel(row: &sqlx::sqlite::SqliteRow) -> Value {
         "models": row.get::<String, _>("models"),
         "disabled_models": row.get::<String, _>("disabled_models"),
         "enabled": row.get::<i64, _>("enabled"),
-        "use_proxy": row.get::<i64, _>("use_proxy"),
+        "use_proxy": use_proxy,
+        "proxy_effective": proxy_effective,
         "created_at": row.get::<i64, _>("created_at"),
     })
 }
@@ -188,7 +195,7 @@ pub async fn list_channels(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({
-        "channels": rows.iter().map(row_channel).collect::<Vec<_>>()
+        "channels": rows.iter().map(|r| row_channel(r, &state)).collect::<Vec<_>>()
     })))
 }
 

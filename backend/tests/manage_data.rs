@@ -1538,6 +1538,151 @@ async fn the_sweeps_cleanup_helpers_to_what_the_endpoint_returns() {
     assert_eq!(days, 14);
 }
 
+// ============ /api/settings/proxy ============
+//
+// Three keys: `proxy_host` + `proxy_port` describe the proxy server,
+// `proxy_enabled` is an independent global on/off switch. Configuring a
+// server does NOT enable the proxy — the admin has to flip the switch.
+// Each is partial-updatable: absent fields keep their current value.
+
+#[tokio::test]
+async fn regular_users_do_not_see_the_proxy_setting() {
+    let h = Harness::with_admin().await;
+    let (_, bob) = two_users(&h).await;
+    let (status, _) =
+        support::call_json(&h.router, "GET", "/api/settings/proxy", None, Some(&bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_proxy_default_is_unconfigured_and_disabled() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/api/settings/proxy", None, Some(&admin)).await;
+    assert_eq!(body["host"], "");
+    assert_eq!(body["port"], 0);
+    // Critical: a fresh DB must not silently route through a proxy the
+    // admin hasn't configured AND enabled.
+    assert_eq!(body["enabled"], false);
+}
+
+#[tokio::test]
+async fn setting_proxy_host_does_not_implicitly_enable_the_proxy() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    let (status, _) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/proxy",
+        Some(json!({ "host": "127.0.0.1", "port": 7890 })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Server config lands in the row, but `enabled` stays false. Without
+    // this guarantee, the per-channel `use_proxy` toggle becomes
+    // meaningless — a freshly-configured proxy would suddenly start
+    // routing requests for any channel the admin had previously opted in.
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/api/settings/proxy", None, Some(&admin)).await;
+    assert_eq!(body["host"], "127.0.0.1");
+    assert_eq!(body["port"], 7890);
+    assert_eq!(body["enabled"], false);
+}
+
+#[tokio::test]
+async fn toggling_enabled_does_not_clobber_host_or_port() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/proxy",
+        Some(json!({ "host": "proxy.example", "port": 8888 })),
+        Some(&admin),
+    )
+    .await;
+    // Flip just the switch — host/port must survive the round-trip.
+    let (_, body) = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/proxy",
+        Some(json!({ "enabled": true })),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(body["host"], "proxy.example");
+    assert_eq!(body["port"], 8888);
+    assert_eq!(body["enabled"], true);
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/api/settings/proxy", None, Some(&admin)).await;
+    assert_eq!(body["host"], "proxy.example");
+    assert_eq!(body["port"], 8888);
+    assert_eq!(body["enabled"], true);
+}
+
+#[tokio::test]
+async fn proxy_state_reflects_effective_combination_in_state() {
+    // The AppState exposes a derived `proxy_effective()` that the channel
+    // listing uses to render the per-channel "代理" tag. It must only
+    // return true when BOTH the global switch AND a valid host/port are
+    // present — pinning this here so the four combinations can't drift.
+    //
+    // Use the harness's state (not `build_state(pool)` again) so the
+    // in-process PUT actually writes to the Arc we hold. A second
+    // `build_state` call would produce an independent state that the
+    // router never touches, and the assertions would lie.
+    let h = Harness::with_admin().await;
+    let state = h.state.clone();
+    // nothing configured yet
+    assert!(!state.proxy_effective());
+    // host/port alone: switch still off
+    let _ = support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/proxy",
+        Some(json!({ "host": "127.0.0.1", "port": 7890 })),
+        Some(&support::login(&h.router, "admin").await),
+    )
+    .await;
+    state.set_proxy_enabled(false);
+    assert!(
+        !state.proxy_effective(),
+        "host/port alone must not enable the proxy"
+    );
+    // flip switch on
+    state.set_proxy_enabled(true);
+    assert!(
+        state.proxy_effective(),
+        "switch on + valid config must enable the proxy"
+    );
+    // flip switch back off
+    state.set_proxy_enabled(false);
+    assert!(
+        !state.proxy_effective(),
+        "switch off must disable even with valid config"
+    );
+}
+
+#[tokio::test]
+async fn proxy_settings_round_trip_through_the_helper() {
+    let h = Harness::with_admin().await;
+    let admin = support::login(&h.router, "admin").await;
+    support::call_json(
+        &h.router,
+        "PUT",
+        "/api/settings/proxy",
+        Some(json!({ "host": "p.example", "port": 1234, "enabled": true })),
+        Some(&admin),
+    )
+    .await;
+    let (host, port, enabled) = literouter::settings::current_proxy_settings(h.pool()).await;
+    assert_eq!(host, "p.example");
+    assert_eq!(port, 1234);
+    assert!(enabled);
+}
+
 // ============ /api/config/{export,import/preview,import/commit} ============
 //
 // End-to-end: write some rows, export, drop everything, re-import, check the
