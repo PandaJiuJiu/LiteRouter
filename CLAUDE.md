@@ -199,7 +199,7 @@ cd backend && cargo test --all-targets   # unit + integration
 cd frontend && npm test                  # locale parity + vitest suites (see below)
 ```
 
-**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 14 suites / 156 tests):
+**Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 16 suites / 186 tests):
 
 - `npm test` = `check:i18n` then `test:unit`. Both must pass before committing.
 - `scripts/check-i18n.mjs` is zero-dependency and fails when en-US and zh-CN key sets drift, when a zh-CN value is empty, or when both locales carry the identical string. vue-i18n falls back silently on a missing key, so nothing else would catch it.
