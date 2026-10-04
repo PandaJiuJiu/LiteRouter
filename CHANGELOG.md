@@ -38,7 +38,7 @@
 
 ### 测试
 
-后端 327 → 353 例，前端 172 → 175 例（i18n 351 → 357 key 双语齐平）：
+后端 327 → 353 例，前端 172 → 175 例（i18n 351 → 359 key 双语齐平）：
 
 - `relay_contract.rs` 新增 16 例：流式首帧 error 触发 failover、首帧 content 不丢字节、协议转换路径上的 peek、错误信封按协议成形、被熔断 skip 不污染最终状态（502 vs 429 vs 504）
 - `manage_data.rs` 新增 10 例覆盖代理设置（普通用户不可见、默认未启用、配置不隐式启用、enabled 不破坏 host/port、`proxy_effective` 四种组合、helper 回环）+ 4 例 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应
