@@ -1161,6 +1161,29 @@ async fn a_wildcard_alias_expands_to_the_pinned_channels_model_list() {
     );
 }
 
+#[tokio::test]
+async fn a_wildcard_alias_expands_in_the_channels_stored_model_order() {
+    let a = MockServer::start().await;
+    upstream_ok(&a).await;
+    // Deliberately NOT alphabetical: the admin's drag-to-reorder on the models
+    // page is only meaningful if this order survives, so the first CSV entry
+    // must be the first hop. The UI writes this string verbatim.
+    let (h, key) = relay_ready(&a.uri(), "gpt-4o-mini,gpt-4o").await;
+    support::insert_mapping_targets(h.pool(), "any", &json!([{"channel": "ch", "model": "*"}]))
+        .await;
+
+    let (status, _) = chat(&h, &key, "any", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let reqs = a.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    // reqs[0] is deterministic: the mock answers 200 on the first hop, so
+    // there is no failover and only one upstream request.
+    assert_eq!(
+        sent["model"], "gpt-4o-mini",
+        "first hop is the first CSV entry"
+    );
+}
+
 // ===================== streaming =====================
 
 #[tokio::test]

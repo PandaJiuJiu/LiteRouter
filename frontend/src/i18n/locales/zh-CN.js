@@ -136,6 +136,8 @@ export default {
     summary: '{channel}：{ok} 个可用，{fail} 个不可用',
     needOneModel: '请输入至少一个模型名',
     manualAdded: '已添加 {count} 个模型',
+    dragHint: '拖动模型卡片可调整顺序，后端按此顺序路由',
+    dragLabel: '拖动排序：{model}',
   },
   tokens: {
     description: '内部令牌：内部服务使用这些 key 访问统一 API',

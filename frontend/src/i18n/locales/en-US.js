@@ -139,6 +139,8 @@ export default {
     summary: '{channel}: {ok} available, {fail} unavailable',
     needOneModel: 'Enter at least one model name',
     manualAdded: 'Added {count} models',
+    dragHint: 'Drag a model card to reorder — the backend routes in this order',
+    dragLabel: 'Drag to reorder: {model}',
   },
   tokens: {
     description: 'Internal tokens — services use these keys to reach the unified API',

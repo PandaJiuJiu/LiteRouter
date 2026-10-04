@@ -88,9 +88,21 @@
       </div>
 
       <!-- 模型卡片网格 -->
-      <div v-if="modelList(ch).length" class="model-grid">
+      <div v-if="modelList(ch).length" class="model-grid"
+           :title="t('models.dragHint')"
+           @dragover.prevent="onDragOver(ch, $event)"
+           @dragleave="onDragLeave(ch, $event)"
+           @drop.prevent="onDrop(ch, $event)">
         <div v-for="m in modelList(ch)" :key="m" class="model-card"
-             :class="{ 'is-enabled': isSelected(ch, m), 'is-disabled': !isSelected(ch, m), 'is-testing': ch._testingModel === m }">
+             :data-model="m"
+             :draggable="canDrag(ch)"
+             :aria-label="t('models.dragLabel', { model: m })"
+             :class="{ 'is-enabled': isSelected(ch, m), 'is-disabled': !isSelected(ch, m), 'is-testing': ch._testingModel === m,
+                       'is-dragging': dragState.model === m && dragState.channelId === ch.id,
+                       'drop-before': dragHintFor(ch).model === m && !dragHintFor(ch).after,
+                       'drop-after': dragHintFor(ch).model === m && dragHintFor(ch).after }"
+             @dragstart="onDragStart(ch, m, $event)"
+             @dragend="onDragEnd">
           <div class="model-card-top">
             <div class="model-name" :title="m">{{ m }}</div>
             <el-switch :model-value="isSelected(ch, m)"
@@ -211,6 +223,155 @@ const loading = ref(false)
 // 切换启用/停用把模型在 ch.models 和 ch.disabled_models 之间挪动，不动 known —
 // 刷新页面后，停用的卡片还在，可以再开回来。删除按钮才会从 known 里抹掉。
 const known = reactive({})
+
+// ——— 拖拽排序 ———
+// 拖起来的模型放在这里，而不是 dataTransfer：Firefox 对无载荷的拖拽
+// 根本不派发 dragover，而 jsdom 里压根没有 DataTransfer——靠它就没法测。
+const dragState = reactive({
+  channelId: null,  // 这次拖拽属于哪个渠道的网格
+  model: null,      // 被拖起的模型
+  overModel: null,  // 落点标记画在哪张卡上
+  overAfter: false, // 标记画在那张卡的右缘还是左缘
+})
+
+// 网格是 repeat(auto-fill, minmax(260px, 1fr))，列数由视口决定、JS 拿不到，
+// 而且随窗口宽度变。所以不去算列数：找离指针最近的卡片，再在真正区分两个
+// 槽位的那根轴上决定前插还是后插。返回插入下标 + 标记要画在哪张卡上。
+function insertionIndex(cards, list, x, y, dragging) {
+  let best = -1
+  let bestDist = Infinity
+  for (let i = 0; i < cards.length; i++) {
+    if (list[i] === dragging) continue // 落在自己身上 = 无操作
+    const r = cards[i].getBoundingClientRect()
+    const dx = x - (r.left + r.width / 2)
+    const dy = y - (r.top + r.height / 2)
+    const d = dx * dx + dy * dy
+    if (d < bestDist) {
+      bestDist = d
+      best = i
+    }
+  }
+  if (best < 0) return { index: list.length, overModel: null, after: false }
+  const r = cards[best].getBoundingClientRect()
+  // 指针落在这一行的行带内 → 跟同一行的卡片比左右；否则（行与行之间）
+  // 比上下。网格里列是横着排的，两种情况都出现过。
+  const inRowBand = y >= r.top && y <= r.bottom
+  const after = inRowBand ? x > r.left + r.width / 2 : y > r.top + r.height / 2
+  return { index: after ? best + 1 : best, overModel: list[best], after }
+}
+
+function applyMove(list, from, to) {
+  const next = list.slice()
+  const [moved] = next.splice(from, 1)
+  // 落点是按「还含被拖卡片」的列表算出来的，移除后要往前挪一格。
+  next.splice(from < to ? to - 1 : to, 0, moved)
+  return next
+}
+
+function canDrag(ch) {
+  return !ch._reordering && modelList(ch).length > 1
+}
+
+function onDragStart(ch, m, e) {
+  if (!canDrag(ch)) {
+    e.preventDefault()
+    return
+  }
+  dragState.channelId = ch.id
+  dragState.model = m
+  // Firefox 需要有载荷才会派发 dragover/drop；别处是无害的。
+  e.dataTransfer?.setData?.('text/plain', m)
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+}
+
+function onDragOver(ch, e) {
+  if (dragState.channelId !== ch.id || !dragState.model) return
+  const cards = [...e.currentTarget.querySelectorAll('.model-card')]
+  const hit = insertionIndex(cards, modelList(ch), e.clientX, e.clientY, dragState.model)
+  dragState.overModel = hit.overModel
+  dragState.overAfter = hit.after
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+function onDragLeave(ch, e) {
+  // dragleave 对每个子元素也会触发，只在真的离开网格时才清标记
+  if (e.currentTarget.contains(e.relatedTarget)) return
+  dragState.overModel = null
+}
+
+function onDrop(ch, e) {
+  const list = modelList(ch)
+  const from = list.indexOf(dragState.model)
+  const hit = insertionIndex(
+    [...e.currentTarget.querySelectorAll('.model-card')],
+    list,
+    e.clientX,
+    e.clientY,
+    dragState.model,
+  )
+  onDragEnd()
+  if (from < 0) return
+  persistOrder(ch, from, hit.index)
+}
+
+function onDragEnd() {
+  dragState.channelId = null
+  dragState.model = null
+  dragState.overModel = null
+  dragState.overAfter = false
+}
+
+// class 绑定用的小助手：别的渠道的拖拽不该在本渠道画标记
+function dragHintFor(ch) {
+  if (dragState.channelId !== ch.id) return { model: null, after: false }
+  return { model: dragState.overModel, after: dragState.overAfter }
+}
+
+// 把重排后的并集切回两个存储列表。每个列表内部保持新顺序；两个集合仍然
+// 互斥——一个模型按构造就只会落进其中一个。
+function csvFromOrder(ch, list) {
+  const enabled = []
+  const disabled = []
+  for (const m of list) (isSelected(ch, m) ? enabled : disabled).push(m)
+  // 兜底：万一某个名字存在于 CSV 却不在 known 里（load() 理论上会把两个
+  // 列表都灌进来），裸的分区会把它静默删掉，按原相对顺序补回去。
+  const present = new Set(list)
+  for (const m of splitModels(ch.models)) if (!present.has(m)) { enabled.push(m); present.add(m) }
+  for (const m of splitModels(ch.disabled_models)) if (!present.has(m)) disabled.push(m)
+  return { models: enabled.join(','), disabled: disabled.join(',') }
+}
+
+async function persistOrder(ch, from, to) {
+  const before = modelList(ch).slice()
+  const prevModels = ch.models
+  const prevDisabled = ch.disabled_models
+  const next = applyMove(before, from, to)
+  const { models, disabled } = csvFromOrder(ch, next)
+  // 落回原来的槽位，什么都没变——不花这次 POST
+  if (models === prevModels && disabled === prevDisabled) return
+
+  // 这里是唯一偏离 removeModel「先写库、失败就不动 known」写法的地方：
+  // 那边卡片消失本身就是反馈，可以等服务端；这边卡片「移动了」就是反馈，
+  // 延后改数组会让 drop 感觉失灵。所以先动、失败再回滚。
+  // 整体重新赋值而不是 splice 两次——回滚变成一次赋值，before 也不会
+  // 被后续改动 alias 掉。
+  known[ch.id] = next
+  ch._reordering = true
+  try {
+    await updateChannelModels(ch.id, models, disabled)
+    ch.models = models
+    ch.disabled_models = disabled
+    ElMessage.success(t('models.modelsUpdated', { channel: ch.name }))
+  } catch (e) {
+    known[ch.id] = before
+    ch.models = prevModels
+    ch.disabled_models = prevDisabled
+    const detail = e?.response?.data?.message || e.message || t('common.unknownError')
+    ElMessage.error(t('models.saveFailed', { detail }))
+  } finally {
+    ch._reordering = false
+  }
+}
 
 // Toolbar filters — only meaningful on the un-focused view. `search` matches
 // against either enabled or disabled models; `enabledOnly` narrows to
@@ -729,6 +890,46 @@ onMounted(load)
 .model-card.is-testing {
   opacity: 0.65;
   pointer-events: none;
+}
+
+/* 拖拽排序：整张卡就是拖拽源，不另加手柄元素——.model-card-top 那行
+   已经有模型名和启用开关，再塞一个手柄会挤，而且会碰坏测试依赖的
+   .model-card-top 选择器。 */
+.model-card[draggable='true'] {
+  cursor: grab;
+  /* 没有这条，拖一个长模型名会变成选中文字而不是移动卡片 */
+  user-select: none;
+}
+.model-card[draggable='true']:active {
+  cursor: grabbing;
+}
+.model-card.is-dragging {
+  opacity: 0.4;
+}
+.model-card.is-dragging .model-card-actions {
+  pointer-events: none;
+}
+/* 插入位置标记。网格里槽位的分界是竖的，所以标记也是竖线：3px，正好
+   落在 12px 的列间距里。 */
+.model-card.drop-before,
+.model-card.drop-after {
+  position: relative;
+}
+.model-card.drop-before::before,
+.model-card.drop-after::before {
+  content: '';
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--el-color-primary, #409eff);
+}
+.model-card.drop-before::before {
+  left: -8px;
+}
+.model-card.drop-after::before {
+  right: -8px;
 }
 
 .model-card-top {
