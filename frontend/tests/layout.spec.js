@@ -54,6 +54,7 @@ describe('sidebar', () => {
   it('shows an admin every entry', async () => {
     me.mockResolvedValue({ username: 'ada', is_admin: true })
     const w = await mountLayout()
+    // 设置 lives in the user dropdown, not the nav — see the dropdown suite.
     expect(navLabels(w)).toEqual([
       zhCN.nav.channels,
       zhCN.nav.models,
@@ -62,7 +63,6 @@ describe('sidebar', () => {
       zhCN.nav.usage,
       zhCN.nav.logs,
       zhCN.nav.users,
-      zhCN.nav.settings,
     ])
   })
 
@@ -75,7 +75,6 @@ describe('sidebar', () => {
       zhCN.nav.tokens,
       zhCN.nav.usage,
       zhCN.nav.logs,
-      zhCN.nav.settings,
     ])
   })
 
@@ -126,6 +125,14 @@ describe('language switching', () => {
 })
 
 describe('user menu commands', () => {
+  it('routes to the settings page', async () => {
+    // 设置从侧边栏移到了下拉菜单——入口换了，命令得跟上。
+    me.mockResolvedValue({ username: 'ada', is_admin: false })
+    const w = await mountLayout()
+    await w.vm.onUserCommand('settings')
+    expect(push).toHaveBeenCalledWith('/settings')
+  })
+
   it('ignores commands that are not in the dropdown', async () => {
     me.mockResolvedValue({ username: 'ada', is_admin: false })
     const w = await mountLayout()

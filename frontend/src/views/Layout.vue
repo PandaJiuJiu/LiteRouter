@@ -13,7 +13,6 @@
         <el-menu-item index="/usage">{{ t('nav.usage') }}</el-menu-item>
         <el-menu-item index="/logs">{{ t('nav.logs') }}</el-menu-item>
         <el-menu-item v-if="isAdmin" index="/users">{{ t('nav.users') }}</el-menu-item>
-        <el-menu-item index="/settings">{{ t('nav.settings') }}</el-menu-item>
       </el-menu>
       <div class="user-wrap">
         <el-dropdown trigger="click" placement="top-end" @command="onUserCommand">
@@ -27,6 +26,9 @@
               <el-dropdown-item disabled>
                 <span class="dd-user">{{ username }}</span>
                 <el-tag v-if="isAdmin" size="small" type="success" effect="plain">{{ t('nav.adminBadge') }}</el-tag>
+              </el-dropdown-item>
+              <el-dropdown-item command="settings">
+                <el-icon><Setting /></el-icon>{{ t('nav.settings') }}
               </el-dropdown-item>
               <el-dropdown-item command="github" divided>
                 <el-icon>
@@ -56,7 +58,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { ArrowRight, SwitchButton } from '@element-plus/icons-vue'
+import { ArrowRight, Setting, SwitchButton } from '@element-plus/icons-vue'
 import { logout } from '../api'
 import { loadSession, session } from '../session'
 
@@ -72,6 +74,7 @@ const initial = computed(() => (username.value || '?').charAt(0).toUpperCase())
 
 function onUserCommand(cmd) {
   if (cmd === 'logout') return doLogout()
+  if (cmd === 'settings') return router.push('/settings')
   if (cmd === 'github') window.open(repoUrl, '_blank', 'noopener,noreferrer')
 }
 
