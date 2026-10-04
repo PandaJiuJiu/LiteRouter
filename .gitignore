@@ -16,5 +16,9 @@ data/
 # local credentials
 /log
 .run/
-
 TODO.md
+
+# personal dev scratch
+source.googlekey
+source.netproxy
+testgoogleapi.sh
