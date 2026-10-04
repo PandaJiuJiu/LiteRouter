@@ -201,7 +201,7 @@ cd frontend && npm test                  # locale parity + vitest suites (see be
 
 **Frontend tests** (`frontend/tests/*.spec.js`, vitest + @vue/test-utils + jsdom, 14 suites / 156 tests):
 
-- `npm test` = `check:i18n` then `test:unit`. Both are blocking in CI.
+- `npm test` = `check:i18n` then `test:unit`. Both must pass before committing.
 - `scripts/check-i18n.mjs` is zero-dependency and fails when en-US and zh-CN key sets drift, when a zh-CN value is empty, or when both locales carry the identical string. vue-i18n falls back silently on a missing key, so nothing else would catch it.
 - `src/views/*` and `src/router.js` are loaded with **lazy `import()`**, so a suite that mounts them must `await import(...)` at top level rather than a static `import`. See `tests/layout.spec.js`.
 - `src/router.js` exports a singleton, and vue-router **skips the guard entirely** on a `push` to the path it is already on. Reusing the instance across cases makes any test that revisits the previous test's landing path pass vacuously. `tests/router_guard.spec.js` calls `vi.resetModules()` and re-imports per test.
@@ -211,7 +211,7 @@ cd frontend && npm test                  # locale parity + vitest suites (see be
 - `src/session.js` caches the identity for the whole app, so a suite that mounts a view reading it must call `resetSession()` in `beforeEach` or the first case's admin leaks into the rest. And because it is cached, `Login.vue` must call `resetSession()` after a successful login — the backend issues a new session id that may belong to a different user. Its import has to be `await import('../src/session')` below the `vi.mock` block for the same hoisting reason as the views.
 - Language switching has two entry points (sidebar dropdown, Settings page), both routed through `src/language.js`. That module is deliberately **not** in `src/i18n/index.js` — `api.js` imports `translate` from there, so adding an API call would close an import cycle.
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` as **blocking**; the tree is clean as of 715035b, so keep it that way rather than adding `#[allow]`s.
+There is **no CI** — the GitHub Actions workflow was removed (see TODO.md). `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` used to be blocking gates; nothing enforces them now, so run both by hand before committing. The tree was clean as of 715035b — keep it that way rather than adding `#[allow]`s.
 
 ---
 
@@ -245,5 +245,5 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all
 - **Don't add `reqwest::Client` per request** in `proxy.rs`. There's one shared client in `AppState` for connection pooling — instantiating per request leaks DNS resolvers and burns sockets.
 - **Don't expose `api_key` from `/api/channels` to non-admins.** Note that `row_channel` in `admin.rs` returns `api_key` **in full** — the protection is the endpoint's `require_admin(...)` gate, not redaction. That's deliberate: the edit form prefills the field, so redacting would make it impossible to save a channel without retyping the key. If you add a new code path that returns channel rows, put it behind `require_admin` too.
 - **Frontend dev URL is `localhost:5173`, not `:3000`.** The proxy is the entire point.
-- **Vite 8 (Rolldown-based), so the build needs Node `^20.19` or `>=22.12`.** `build.rollupOptions` is now `build.rolldownOptions` in any warning text you see. One transitive dep — `nopt`, via `js-beautify` ← `@vue/test-utils` — declares Node `^22.22.2`; npm warns `EBADENGINE` on Node 20 but nothing exercises it, and CI pins Node 22.
+- **Vite 8 (Rolldown-based), so the build needs Node `^20.19` or `>=22.12`.** `build.rollupOptions` is now `build.rolldownOptions` in any warning text you see. One transitive dep — `nopt`, via `js-beautify` ← `@vue/test-utils` — declares Node `^22.22.2`; npm warns `EBADENGINE` on Node 20 but nothing exercises it.
 - **Don't use `:` or `;` in usernames** — they go into route paths and SQL params; the setup endpoint validates.
