@@ -12,7 +12,11 @@
 
 ### 新增
 
-- **全局 HTTP/HTTPS 代理**：设置页新增「代理」段，配置 `proxy_host` / `proxy_port` 之后所有上游请求经该代理转发。渠道级别 `use_proxy` 开关控制单条渠道是否走代理（默认 0 直连），全局未配置时该开关无效。`AppState::client_for_channel(use_proxy)` 根据开关返回对应的 reqwest 客户端，因此熔断主动探测与模型测试也走代理。开启代理的渠道在渠道列表与模型页显示「代理」标签
+- **全局 HTTP/HTTPS 代理**：设置页新增「代理」段，分两层——
+  - **代理服务器配置**（`proxy_host` / `proxy_port`）：只是地址，不启用代理
+  - **全局启用开关**（`proxy_enabled`）：必须显式开启后，代理才会被实际使用（默认关）
+
+  渠道级别的 `use_proxy` 开关只有在全局开关开启、且代理地址非空时才真正走代理。`AppState::proxy_effective()` 综合两者（开关 + 缓存的代理客户端）判断当前是否生效，渠道列表与模型页的「代理」标签也基于此判定——避免出现「渠道页说在走代理、实际却在直连」的不一致。熔断主动探测与模型测试同样受全局开关控制。迁移 `0032_proxy_enabled` 默认值 0，保证已有实例在升级后不会突然开始走代理
 
 ### 修复
 
@@ -28,15 +32,16 @@
 
 - `0030_proxy_settings` — `settings` 新增 `proxy_host` / `proxy_port`
 - `0031_channel_use_proxy` — `channels` 新增 `use_proxy INTEGER NOT NULL DEFAULT 0`
+- `0032_proxy_enabled` — `settings` 新增 `proxy_enabled`（默认 `0`）
 
-两个迁移都是 `INSERT OR IGNORE` / `ALTER TABLE ADD COLUMN` 语义，可安全重放。
+三个迁移都是 `INSERT OR IGNORE` / `ALTER TABLE ADD COLUMN` 语义，可安全重放。`proxy_enabled` 默认 0 是设计意图：升级时已有实例不会突然开始走代理
 
 ### 测试
 
-后端 327 → 347 例，前端 172 → 175 例（i18n 351 → 355 key 双语齐平）：
+后端 327 → 353 例，前端 172 → 175 例（i18n 351 → 357 key 双语齐平）：
 
 - `relay_contract.rs` 新增 16 例：流式首帧 error 触发 failover、首帧 content 不丢字节、协议转换路径上的 peek、错误信封按协议成形、被熔断 skip 不污染最终状态（502 vs 429 vs 504）
-- `manage_data.rs` 新增 4 例覆盖 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应
+- `manage_data.rs` 新增 10 例覆盖代理设置（普通用户不可见、默认未启用、配置不隐式启用、enabled 不破坏 host/port、`proxy_effective` 四种组合、helper 回环）+ 4 例 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应
 - `logs_view.spec.js` 新增流式 200 不显示为绿色的用例；`log_detail.spec.js` 新增「无捕获则不渲染按钮 / 有捕获则渲染按钮」的用例
 
 ### 其他
