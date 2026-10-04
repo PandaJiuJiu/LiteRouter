@@ -396,7 +396,9 @@ export default {
     },
     proxy: {
       title: 'Network Proxy',
-      desc: 'Configure the HTTP proxy server (host/port) and independently decide whether to enable it. The switch defaults to off — configuring a server does not implicitly enable the proxy. Per-channel "Use Proxy" only takes effect when the global switch is on.',
+      hostDesc: 'The proxy server address. Filling this in alone does not route through the proxy — pair it with the "Enable Global Network Proxy" switch below to actually use it.',
+      enableTitle: 'Enable Global Network Proxy',
+      enableDesc: 'Master switch. When enabled, channels with "Use Proxy" toggled on will route through the proxy configured above; when disabled, all channels connect directly even if an address is configured. Defaults to off.',
       hostPlaceholder: 'Proxy host or IP (e.g. 127.0.0.1)',
       portPlaceholder: 'Proxy port (e.g. 7890)',
       enabled: 'Enabled',

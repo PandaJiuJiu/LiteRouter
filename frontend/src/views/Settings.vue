@@ -34,9 +34,8 @@
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
 
-    <!-- 网络代理：仅管理员可改。host/port 是代理服务器配置；
-         「启用代理」开关独立控制是否真的走代理（默认关），
-         渠道页的「使用代理」开关在该开关开启时才生效。 -->
+    <!-- 网络代理：分两行——第一行是服务器地址，第二行是独立的全局开关。
+         「使用代理」的渠道开关只有在第二行的总开关开启时才真正走代理。 -->
     <div class="row" v-if="isAdmin">
       <div class="row-label">{{ t('settings.proxy.title') }}</div>
       <div class="row-control row-actions" style="gap: 12px; width: auto;">
@@ -56,6 +55,13 @@
           style="width: 120px;"
           @change="onProxyChange"
         />
+      </div>
+    </div>
+    <div class="row-desc" v-if="isAdmin">{{ t('settings.proxy.hostDesc') }}</div>
+
+    <div class="row" v-if="isAdmin">
+      <div class="row-label">{{ t('settings.proxy.enableTitle') }}</div>
+      <div class="row-control row-actions" style="gap: 12px; width: auto;">
         <el-switch
           v-model="proxyEnabled"
           :disabled="proxySaving"
@@ -67,7 +73,7 @@
         }}</span>
       </div>
     </div>
-    <div class="row-desc" v-if="isAdmin">{{ t('settings.proxy.desc') }}</div>
+    <div class="row-desc" v-if="isAdmin">{{ t('settings.proxy.enableDesc') }}</div>
 
     <!-- 备份 / 还原只是一个入口行——所有交互（段位、密码、文件、预览、
          冲突解决、提交统计）都在 ConfigBackup 的弹窗里。 -->
