@@ -66,7 +66,7 @@ const username = computed(() => session.username)
 const isAdmin = computed(() => session.isAdmin)
 
 // Keep in sync with the `origin` remote / README clone URL.
-const repoUrl = 'https://github.com/qihangkong/LiteRouter'
+const repoUrl = 'https://github.com/PandaJiuJiu/LiteRouter'
 
 const initial = computed(() => (username.value || '?').charAt(0).toUpperCase())
 

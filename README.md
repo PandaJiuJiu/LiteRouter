@@ -33,7 +33,7 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 
 ### Deploy from GHCR (recommended)
 
-Prebuilt images are published to GitHub Container Registry. The list of published tags lives at <https://github.com/qihangkong/literouter/pkgs/container/literouter>; pin a tag in production, or use `latest` if you'd rather track the most recent release:
+Prebuilt images are published to GitHub Container Registry. The list of published tags lives at <https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>; pin a tag in production, or use `latest` if you'd rather track the most recent release:
 
 ```bash
 docker pull ghcr.io/qihangkong/literouter:latest
@@ -50,7 +50,7 @@ Then run it. Save this as `compose.yml` next to your data directory:
 ```yaml
 services:
   literouter:
-    image: ghcr.io/qihangkong/literouter:latest
+    image: ghcr.io/PandaJiuJiu/literouter:latest
     container_name: literouter
     ports:
       - "${PORT:-3000}:3000"
@@ -99,7 +99,7 @@ What to expect:
 ### Building from source
 
 ```bash
-git clone https://github.com/qihangkong/LiteRouter.git
+git clone https://github.com/PandaJiuJiu/LiteRouter.git
 cd LiteRouter
 docker compose up -d --build
 ```
@@ -185,4 +185,4 @@ Admin UI (Bearer session):
 
 ---
 
-[Changelog](CHANGELOG.md) · [Releases](https://github.com/qihangkong/LiteRouter/releases)
+[Changelog](CHANGELOG.md) · [Releases](https://github.com/PandaJiuJiu/LiteRouter/releases)

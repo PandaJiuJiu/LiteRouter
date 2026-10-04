@@ -79,6 +79,7 @@ export default {
       useProxy: '使用代理',
       enabled: '启用',
     },
+    proxyTag: '代理',
     nameKeyRequired: '名称、API Key 不能为空',
     urlRequired: 'OpenAI URL 和 Anthropic URL 至少填写一个',
     toggleFailed: '切换失败：{detail}',

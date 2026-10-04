@@ -33,10 +33,10 @@
 
 ### 从 GHCR 部署（推荐）
 
-预构建镜像发布在 GitHub Container Registry。已发布的标签列表见 <https://github.com/qihangkong/literouter/pkgs/container/literouter>；生产环境建议固定一个标签，想跟随最新版本就用 `latest`：
+预构建镜像发布在 GitHub Container Registry。已发布的标签列表见 <https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>；生产环境建议固定一个标签，想跟随最新版本就用 `latest`：
 
 ```bash
-docker pull ghcr.io/qihangkong/literouter:latest
+docker pull ghcr.io/PandaJiuJiu/literouter:latest
 ```
 
 **该包目前为私有**，需要先用一个带 `read:packages` 权限的 GitHub token 登录（classic PAT 勾选该权限，或 fine-grained PAT 授予本包的读权限）：
@@ -50,7 +50,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --passwor
 ```yaml
 services:
   literouter:
-    image: ghcr.io/qihangkong/literouter:latest
+    image: ghcr.io/PandaJiuJiu/literouter:latest
     container_name: literouter
     ports:
       - "${PORT:-3000}:3000"
@@ -100,7 +100,7 @@ docker compose pull && docker compose up -d
 ### 从源码构建
 
 ```bash
-git clone https://github.com/qihangkong/LiteRouter.git
+git clone https://github.com/PandaJiuJiu/LiteRouter.git
 cd LiteRouter
 docker compose up -d --build
 ```
@@ -186,4 +186,4 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 
 ---
 
-[更新日志](CHANGELOG.md) · [Releases](https://github.com/qihangkong/LiteRouter/releases)
+[更新日志](CHANGELOG.md) · [Releases](https://github.com/PandaJiuJiu/LiteRouter/releases)

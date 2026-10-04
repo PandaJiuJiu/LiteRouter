@@ -5,11 +5,15 @@
       <el-button type="primary" @click="openDialog()">{{ t('channels.add') }}</el-button>
     </div>
     <el-table :data="channels" v-loading="loading">
-      <el-table-column prop="name" :label="t('channels.col.name')" width="160">
+      <el-table-column prop="name" :label="t('channels.col.name')" width="180">
         <template #default="{ row }">
           <a v-if="row.website" :href="row.website" target="_blank" rel="noopener"
             class="name-link">{{ row.name }}<el-icon class="ext-icon"><Link /></el-icon></a>
           <span v-else>{{ row.name }}</span>
+          <el-tag v-if="row.use_proxy" size="small" type="primary" effect="light" class="proxy-tag">
+            <el-icon><Connection /></el-icon>
+            <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
+          </el-tag>
         </template>
       </el-table-column>
       <el-table-column :label="t('channels.col.baseUrl')" min-width="240" show-overflow-tooltip>
@@ -83,7 +87,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import { Link } from '@element-plus/icons-vue'
+import { Link, Connection } from '@element-plus/icons-vue'
 import { listChannels, createChannel, updateChannel, deleteChannel } from '../api'
 
 const { t } = useI18n()
@@ -170,5 +174,12 @@ onMounted(load)
 .ext-icon {
   font-size: 12px;
   opacity: 0.6;
+}
+.proxy-tag {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.proxy-text {
+  margin-left: 2px;
 }
 </style>

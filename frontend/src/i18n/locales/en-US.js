@@ -80,6 +80,7 @@ export default {
       useProxy: 'Use Proxy',
       enabled: 'Enabled',
     },
+    proxyTag: 'Proxy',
     nameKeyRequired: 'Name and API key are required',
     urlRequired: 'Provide at least one of the OpenAI URL and the Anthropic URL',
     toggleFailed: 'Toggle failed: {detail}',

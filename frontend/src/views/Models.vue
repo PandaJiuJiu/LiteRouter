@@ -54,6 +54,10 @@
       <div class="channel-head">
         <div>
           <span class="channel-name">{{ ch.name }}</span>
+          <el-tag v-if="ch.use_proxy" size="small" type="primary" effect="light" class="proxy-tag">
+            <el-icon><Connection /></el-icon>
+            <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
+          </el-tag>
           <el-tag v-if="ch.enabled" type="success" size="small">{{ t('common.enabled') }}</el-tag>
           <el-tag v-else type="danger" size="small">{{ t('common.disabled') }}</el-tag>
           <el-tag v-if="ch.base_url" size="small">OpenAI</el-tag>
@@ -183,7 +187,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import { CircleCheckFilled, CircleCloseFilled, Delete, Refresh } from '@element-plus/icons-vue'
+import { CircleCheckFilled, CircleCloseFilled, Delete, Refresh, Connection } from '@element-plus/icons-vue'
 import { listChannels, updateChannelModels, fetchModels, testModel } from '../api'
 
 const { t } = useI18n()
@@ -654,6 +658,13 @@ onMounted(load)
 .channel-name {
   font-weight: bold;
   margin-right: 8px;
+}
+.proxy-tag {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.proxy-text {
+  margin-left: 2px;
 }
 .model-grid {
   display: grid;

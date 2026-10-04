@@ -116,7 +116,8 @@ pub struct ChannelReq {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Whether to use the global proxy for this channel. Default false.
-    #[serde(default)]
+    /// Accepts 0/1 or true/false from the frontend (DB stores integer).
+    #[serde(default, deserialize_with = "deserialize_use_proxy")]
     pub use_proxy: bool,
 }
 fn default_true() -> bool {
@@ -131,7 +132,8 @@ pub struct FetchModelsReq {
     pub base_url_anthropic: String,
     pub api_key: String,
     /// Whether to use the global proxy for this test. Default false.
-    #[serde(default)]
+    /// Accepts 0/1 or true/false from the frontend (DB stores integer).
+    #[serde(default, deserialize_with = "deserialize_use_proxy")]
     pub use_proxy: bool,
 }
 
