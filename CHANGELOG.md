@@ -6,6 +6,45 @@
 
 ---
 
+## [0.0.5] - 2026-10-04
+
+自 v0.0.4 起共 10 个提交。
+
+### 新增
+
+- **全局 HTTP/HTTPS 代理**：设置页新增「代理」段，配置 `proxy_host` / `proxy_port` 之后所有上游请求经该代理转发。渠道级别 `use_proxy` 开关控制单条渠道是否走代理（默认 0 直连），全局未配置时该开关无效。`AppState::client_for_channel(use_proxy)` 根据开关返回对应的 reqwest 客户端，因此熔断主动探测与模型测试也走代理。开启代理的渠道在渠道列表与模型页显示「代理」标签
+
+### 修复
+
+- **死 provider 在客户端看到之前就 failover**：流式响应在 commit 之前先 peek 首条完整 SSE 帧（8 KiB / 1.5 s）。首帧是 `event: error` 或 OpenAI 风格 error envelope 时，hop 分类为 `InvalidBody` 并尝试下一候选；首帧是 content 时，peek 的字节作为响应体开头转发，后续流接续。否则一个只发 `event: error` 的流会落到客户端再无回退
+- **流式响应里的 error 事件不再误记为成功**：SSE pump 扫描每一行，识别 `event: error`（Anthropic）与 `data:` 里携带 error envelope（OpenAI 风格 relay），hop 记为失败并喂给熔断 `Outcome::Failure(upstream_message)`。否则 relay 用 `200` + 立即死亡会让熔断器永远不退避
+- **熔断跳过不再污染最终状态码**：被熔断器 skip 的候选在日志里是 hop，但不计入「所有候选都失败」的分母——它们从未真正打到上游，对下游如何失败没有发言权。错误信封按客户端协议成形：`/v1/messages` 返回 Anthropic 形态的 `{"type":"error","error":{…}}` 带 spec `error.type`，`/v1/chat/completions` 保持 OpenAI 形态
+- **日志页**：流式失败但 HTTP 状态为 200 的请求不再以绿色显示
+- **日志详情 · 上游响应捕获**：没有捕获就不显示那一段，有捕获也只剩一个「加载上游响应」按钮，没有标题/说明。捕获标志改为一次 `stat`（不读文件）
+- **探针统一**：熔断器主动探测与渠道模型测试改用同一份 `probe.rs`，避免两套实现漂移
+- **UI**：Models 页代理 / 已启用 / OpenAI 标签之间加间距；代理标签从蓝色改为 warning（橙）与 OpenAI 标签区分
+
+### 数据库变更
+
+- `0030_proxy_settings` — `settings` 新增 `proxy_host` / `proxy_port`
+- `0031_channel_use_proxy` — `channels` 新增 `use_proxy INTEGER NOT NULL DEFAULT 0`
+
+两个迁移都是 `INSERT OR IGNORE` / `ALTER TABLE ADD COLUMN` 语义，可安全重放。
+
+### 测试
+
+后端 327 → 347 例，前端 172 → 175 例（i18n 351 → 355 key 双语齐平）：
+
+- `relay_contract.rs` 新增 16 例：流式首帧 error 触发 failover、首帧 content 不丢字节、协议转换路径上的 peek、错误信封按协议成形、被熔断 skip 不污染最终状态（502 vs 429 vs 504）
+- `manage_data.rs` 新增 4 例覆盖 `/api/logs/:id/debug` 的越权 / 无捕获 / 未登录 / 默认响应
+- `logs_view.spec.js` 新增流式 200 不显示为绿色的用例；`log_detail.spec.js` 新增「无捕获则不渲染按钮 / 有捕获则渲染按钮」的用例
+
+### 其他
+
+- GitHub 仓库地址从 `qihangkong/LiteRouter` 迁移到 `PandaJiuJiu/LiteRouter`（README / 侧栏 GitHub 入口 / CHANGELOG 链接全部更新）。`use_proxy` 反序列化同时接受 int（0/1）和 bool，兼容 SQLite 返回 int 的场景
+
+---
+
 ## [0.0.4] - 2026-10-02
 
 自 v0.0.3 起共 17 个提交。
@@ -124,6 +163,7 @@
 
 ---
 
+[0.0.5]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.5
 [0.0.4]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.4
 [0.0.3]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.3
 [0.0.2]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.2
