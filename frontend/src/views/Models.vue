@@ -52,16 +52,18 @@
 
     <el-card v-for="ch in matchedChannels" :key="ch.id" class="channel-card" shadow="never">
       <div class="channel-head">
-        <div>
+        <div class="channel-header">
           <span class="channel-name">{{ ch.name }}</span>
-          <el-tag v-if="ch.use_proxy" size="small" type="warning" effect="light" class="proxy-tag">
-            <el-icon><Connection /></el-icon>
-            <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
-          </el-tag>
-          <el-tag v-if="ch.enabled" type="success" size="small">{{ t('common.enabled') }}</el-tag>
-          <el-tag v-else type="danger" size="small">{{ t('common.disabled') }}</el-tag>
-          <el-tag v-if="ch.base_url" size="small">OpenAI</el-tag>
-          <el-tag v-if="ch.base_url_anthropic" size="small">Anthropic</el-tag>
+          <div class="channel-tags">
+            <el-tag v-if="ch.use_proxy" size="small" type="warning" effect="light" class="proxy-tag">
+              <el-icon><Connection /></el-icon>
+              <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
+            </el-tag>
+            <el-tag v-if="ch.enabled" type="success" size="small">{{ t('common.enabled') }}</el-tag>
+            <el-tag v-else type="danger" size="small">{{ t('common.disabled') }}</el-tag>
+            <el-tag v-if="ch.base_url" size="small">OpenAI</el-tag>
+            <el-tag v-if="ch.base_url_anthropic" size="small">Anthropic</el-tag>
+          </div>
         </div>
         <div>
           <el-button size="small" :loading="ch._testingAll"
@@ -654,6 +656,15 @@ onMounted(load)
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
+}
+.channel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.channel-tags {
+  display: inline-flex;
+  gap: 6px;
 }
 .channel-name {
   font-weight: bold;
