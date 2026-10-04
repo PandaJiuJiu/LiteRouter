@@ -361,17 +361,19 @@ pub async fn get_proxy_settings(
     headers: HeaderMap,
 ) -> Result<Json<Value>, StatusCode> {
     let _user = require_admin(&state, &headers)?;
-    let host: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten();
-    let port: Option<i64> = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok());
+    let host: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let port: Option<i64> =
+        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok());
     Ok(Json(json!({
         "host": host.unwrap_or_default(),
         "port": port.unwrap_or(0),

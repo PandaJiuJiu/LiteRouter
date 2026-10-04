@@ -95,10 +95,7 @@ impl AppState {
     /// whether it's talking HTTP CONNECT or SOCKS5, and a bare `host:port`
     /// would be parsed as an unknown scheme. `None` clears the client.
     pub fn set_proxied_client(&self, proxy_url: Option<&str>) {
-        let mut guard = self
-            .http_proxied
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.http_proxied.write().unwrap_or_else(|e| e.into_inner());
         match proxy_url {
             None => *guard = None,
             Some(url) => match reqwest::Proxy::all(url) {

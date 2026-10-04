@@ -46,17 +46,19 @@ pub async fn build_state(pool: SqlitePool) -> Arc<AppState> {
         .debug_logging
         .store(debug_logging, std::sync::atomic::Ordering::Relaxed);
     // Build proxied client from proxy settings (if any)
-    let host: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten();
-    let port: Option<i64> = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok());
+    let host: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'proxy_host'")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let port: Option<i64> =
+        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = 'proxy_port'")
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok());
     let proxy_url = match (host.filter(|h| !h.is_empty()), port.filter(|p| *p > 0)) {
         (Some(h), Some(p)) => Some(format!("http://{}:{}", h, p)),
         _ => None,
