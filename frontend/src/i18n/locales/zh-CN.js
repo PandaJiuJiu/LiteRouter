@@ -387,9 +387,11 @@ export default {
     },
     proxy: {
       title: '网络代理',
-      desc: '配置 HTTP 代理（host:port）。留空则不使用代理。渠道页的「使用代理」开关依赖此处配置。',
+      desc: '配置 HTTP 代理服务器（host/port），并独立通过开关决定是否启用。开关默认关——配置了代理服务器不会自动启用。渠道页的「使用代理」开关只在全局开关开启时才会真正走代理。',
       hostPlaceholder: '代理主机名或 IP（如 127.0.0.1）',
       portPlaceholder: '代理端口（如 7890）',
+      enabled: '已启用',
+      disabled: '未启用',
     },
   },
   users: {

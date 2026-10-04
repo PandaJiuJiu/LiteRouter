@@ -34,7 +34,9 @@
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.logRetention.desc') }}</div>
 
-    <!-- 网络代理：仅管理员可改。代理地址为空则不启用代理。渠道页的“使用代理”开关依赖这里配置。 -->
+    <!-- 网络代理：仅管理员可改。host/port 是代理服务器配置；
+         「启用代理」开关独立控制是否真的走代理（默认关），
+         渠道页的「使用代理」开关在该开关开启时才生效。 -->
     <div class="row" v-if="isAdmin">
       <div class="row-label">{{ t('settings.proxy.title') }}</div>
       <div class="row-control row-actions" style="gap: 12px; width: auto;">
@@ -54,6 +56,15 @@
           style="width: 120px;"
           @change="onProxyChange"
         />
+        <el-switch
+          v-model="proxyEnabled"
+          :disabled="proxySaving"
+          :loading="proxySaving"
+          @change="onProxyEnabledChange"
+        />
+        <span class="proxy-enabled-label">{{
+          proxyEnabled ? t('settings.proxy.enabled') : t('settings.proxy.disabled')
+        }}</span>
       </div>
     </div>
     <div class="row-desc" v-if="isAdmin">{{ t('settings.proxy.desc') }}</div>
@@ -129,9 +140,12 @@ async function onRetentionChange(days) {
   }
 }
 
-// Proxy settings: host + port. Both empty/0 = no proxy.
+// Proxy settings: host + port describe the proxy server; `enabled` is the
+// independent global on/off switch. All three are partial-updatable: host
+// or port change fires when the input commits; the switch fires on toggle.
 const proxyHost = ref('')
 const proxyPort = ref(0)
+const proxyEnabled = ref(false)
 const proxySaving = ref(false)
 
 async function loadProxy() {
@@ -139,6 +153,7 @@ async function loadProxy() {
     const data = await getProxySettings()
     proxyHost.value = data.host || ''
     proxyPort.value = data.port || 0
+    proxyEnabled.value = !!data.enabled
   } catch (_) {
     // ignore
   }
@@ -147,7 +162,22 @@ async function loadProxy() {
 async function onProxyChange() {
   proxySaving.value = true
   try {
-    await setProxySettings(proxyHost.value.trim(), proxyPort.value)
+    const data = await setProxySettings({
+      host: proxyHost.value,
+      port: proxyPort.value,
+    })
+    proxyHost.value = data.host || ''
+    proxyPort.value = data.port || 0
+  } finally {
+    proxySaving.value = false
+  }
+}
+
+async function onProxyEnabledChange(value) {
+  proxySaving.value = true
+  try {
+    const data = await setProxySettings({ enabled: value })
+    proxyEnabled.value = !!data.enabled
   } finally {
     proxySaving.value = false
   }

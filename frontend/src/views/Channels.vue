@@ -10,7 +10,7 @@
           <a v-if="row.website" :href="row.website" target="_blank" rel="noopener"
             class="name-link">{{ row.name }}<el-icon class="ext-icon"><Link /></el-icon></a>
           <span v-else>{{ row.name }}</span>
-          <el-tag v-if="row.use_proxy" size="small" type="warning" effect="light" class="proxy-tag">
+          <el-tag v-if="row.proxy_effective" size="small" type="warning" effect="light" class="proxy-tag">
             <el-icon><Connection /></el-icon>
             <span class="proxy-text">{{ t('channels.proxyTag') }}</span>
           </el-tag>

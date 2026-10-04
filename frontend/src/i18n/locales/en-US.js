@@ -396,9 +396,11 @@ export default {
     },
     proxy: {
       title: 'Network Proxy',
-      desc: 'Configure HTTP proxy (host:port). Leave empty to disable proxy. The "Use Proxy" toggle on the Channels page depends on this setting.',
+      desc: 'Configure the HTTP proxy server (host/port) and independently decide whether to enable it. The switch defaults to off — configuring a server does not implicitly enable the proxy. Per-channel "Use Proxy" only takes effect when the global switch is on.',
       hostPlaceholder: 'Proxy host or IP (e.g. 127.0.0.1)',
       portPlaceholder: 'Proxy port (e.g. 7890)',
+      enabled: 'Enabled',
+      disabled: 'Disabled',
     },
   },
   users: {

@@ -119,10 +119,14 @@ export const getLogRetention = () =>
 export const setLogRetention = (days) =>
   api.put('/settings/log-retention-days', { days }).then((r) => r.data.days)
 
-// Global HTTP/HTTPS proxy (host:port). Admin only.
+// Global HTTP/HTTPS proxy. Admin only.
+// `host` + `port` describe the proxy server; `enabled` is an independent
+// on/off switch — setting a server does not implicitly enable the proxy.
+// All three are partial-updatable: only fields present in the object are
+// sent to the server.
 export const getProxySettings = () => api.get('/settings/proxy').then((r) => r.data)
-export const setProxySettings = (host, port) =>
-  api.put('/settings/proxy', { host, port }).then((r) => r.data)
+export const setProxySettings = (patch) =>
+  api.put('/settings/proxy', patch).then((r) => r.data)
 
 // ---------- config backup / restore ----------
 //
