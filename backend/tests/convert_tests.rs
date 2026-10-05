@@ -664,3 +664,74 @@ fn an_all_zero_usage_block_yields_none() {
         usage_from_sse_payload(r#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none()
     );
 }
+
+#[test]
+fn merging_keeps_the_prompt_count_the_final_delta_left_out() {
+    // Anthropic splits the counts across two events, so the last one to arrive
+    // is not the whole story. Taking it wholesale — which is what the caller
+    // used to do — reported a prompt count of zero for every streamed request,
+    // which reads downstream as a free call.
+    let start = usage_from_sse_payload(
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+    )
+    .unwrap();
+    let delta =
+        usage_from_sse_payload(r#"{"type":"message_delta","usage":{"output_tokens":7}}"#).unwrap();
+
+    let mut total = start;
+    total.merge(delta);
+
+    assert_eq!(total.prompt, 9, "the input count survives the delta");
+    assert_eq!(total.completion, 7);
+}
+
+#[test]
+fn merging_keeps_the_cache_counts_a_later_frame_does_not_repeat() {
+    // `message_delta` carries no cache fields at all, so a wholesale replace
+    // would silently zero a large cached-prompt bill.
+    let start = usage_from_sse_payload(
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":110798}}}"#,
+    )
+    .unwrap();
+    let delta = usage_from_sse_payload(r#"{"type":"message_delta","usage":{"output_tokens":707}}"#)
+        .unwrap();
+
+    let mut total = start;
+    total.merge(delta);
+
+    assert_eq!(total.cache_read, 110798);
+    assert_eq!(total.prompt, 1);
+    assert_eq!(total.completion, 707);
+}
+
+#[test]
+fn merging_takes_the_largest_count_rather_than_adding() {
+    // Counts only grow within one response, and a provider that repeats the
+    // final total in both events must not be double-counted.
+    let mut acc =
+        usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
+    acc.merge(
+        usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":9}}"#).unwrap(),
+    );
+    assert_eq!(acc.prompt, 5);
+    assert_eq!(acc.completion, 9);
+}
+
+#[test]
+fn a_streamed_anthropic_request_asks_openai_for_usage() {
+    // OpenAI leaves usage out of a streamed response unless told otherwise, and
+    // `stream_options` is the only way to tell it. Without this every streamed
+    // request through an OpenAI-backed channel records zero tokens — the row
+    // looks like the provider reported a free call rather than that nothing
+    // was asked for.
+    let out = anthropic_req_to_openai(&v(r#"{"messages":[],"stream":true}"#), "gpt-4o");
+    assert_eq!(out["stream_options"]["include_usage"], json!(true));
+}
+
+#[test]
+fn a_buffered_request_asks_for_no_stream_options() {
+    // A non-streamed response carries usage unconditionally; the field would
+    // be at best noise and at worst rejected by a strict relay.
+    let out = anthropic_req_to_openai(&v(r#"{"messages":[],"stream":false}"#), "gpt-4o");
+    assert!(out.get("stream_options").is_none(), "{out}");
+}

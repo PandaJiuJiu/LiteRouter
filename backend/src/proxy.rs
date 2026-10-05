@@ -1278,13 +1278,24 @@ impl StreamLog {
         // `log_attempts` table is what the list page filters on), and the two
         // start out as separate clones of the same Attempt.
         if let Some(reason) = stream_error {
+            // The row always gets the fixed label, never the upstream's own
+            // words — same rule as `UpstreamOutcome::InvalidBody`: the row
+            // stays something an admin can scan for, and the upstream text
+            // goes to the breaker reason and the capture file. A truncated
+            // stream gets its own label because that is a different failure
+            // with a different fix, not a variant of an error event.
+            let label = if reason == STREAM_TRUNCATED {
+                STREAM_TRUNCATED.to_string()
+            } else {
+                STREAM_ERROR_DETAIL.to_string()
+            };
             if let Some(winner) = self.entry.winner.as_mut() {
                 winner.ok = false;
-                winner.error = STREAM_ERROR_DETAIL.to_string();
+                winner.error = label.clone();
             }
             if let Some(last) = self.entry.attempts.last_mut() {
                 last.ok = false;
-                last.error = STREAM_ERROR_DETAIL.to_string();
+                last.error = label;
             }
             self.state
                 .breaker
@@ -1355,7 +1366,7 @@ pub fn set_debug_logging(state: &AppState, v: bool) {
 struct LogOnEnd<S> {
     inner: S,
     log: Option<StreamLog>,
-    usage: Arc<Mutex<Option<convert::Usage>>>,
+    usage: Arc<Mutex<(convert::Usage, bool)>>,
     /// If set, overrides `usage` when Drop fires. Used for the converted
     /// path so the converter's own usage counter is the source of truth.
     converter_usage: Option<Arc<Mutex<Box<dyn SseConverter>>>>,
@@ -1367,15 +1378,46 @@ struct LogOnEnd<S> {
     /// terminal event that the client's protocol defines — but this is what
     /// makes the hop count as a failure once it ends.
     stream_error: Arc<Mutex<Option<String>>>,
+    /// Whether the upstream ended on its own terms, and whether it said so.
+    /// Read at Drop to tell a truncated stream from a completed one.
+    finish: Arc<Mutex<StreamFinish>>,
+}
+
+/// How a stream ended, from the upstream's point of view.
+///
+/// A well-formed stream announces its own end — `message_stop` for Anthropic,
+/// `data: [DONE]` for OpenAI. A provider that dies mid-response does not: the
+/// connection just stops, and the client's protocol never gets its terminator.
+/// That is indistinguishable from a success by status code alone, which is how
+/// a dead upstream ends up logged as a green 200 with zero tokens.
+///
+/// `upstream_eof` is tracked separately from `saw_terminal` because a client
+/// that hangs up mid-stream also produces no terminator — and that is the
+/// client's doing, not a reason to fail the provider or trip the breaker.
+#[derive(Default)]
+struct StreamFinish {
+    /// The upstream connection reached its end, rather than being dropped
+    /// because the client went away.
+    upstream_eof: bool,
+    /// The upstream's protocol terminator was seen before that.
+    saw_terminal: bool,
+}
+
+impl StreamFinish {
+    /// Did the upstream stop on its own without saying it was done?
+    fn truncated(&self) -> bool {
+        self.upstream_eof && !self.saw_terminal
+    }
 }
 
 impl<S> LogOnEnd<S> {
     fn wrap(
         inner: S,
         log: StreamLog,
-        usage: Arc<Mutex<Option<convert::Usage>>>,
+        usage: Arc<Mutex<(convert::Usage, bool)>>,
         capture: DebugCapture,
         stream_error: Arc<Mutex<Option<String>>>,
+        finish: Arc<Mutex<StreamFinish>>,
     ) -> Self {
         Self {
             inner,
@@ -1384,6 +1426,7 @@ impl<S> LogOnEnd<S> {
             converter_usage: None,
             capture,
             stream_error,
+            finish,
         }
     }
     fn wrap_with_converter(
@@ -1392,14 +1435,16 @@ impl<S> LogOnEnd<S> {
         converter: Arc<Mutex<Box<dyn SseConverter>>>,
         capture: DebugCapture,
         stream_error: Arc<Mutex<Option<String>>>,
+        finish: Arc<Mutex<StreamFinish>>,
     ) -> Self {
         Self {
             inner,
             log: Some(log),
-            usage: Arc::new(Mutex::new(None)),
+            usage: Arc::new(Mutex::new((convert::Usage::default(), false))),
             converter_usage: Some(converter),
             capture,
             stream_error,
+            finish,
         }
     }
 }
@@ -1431,10 +1476,25 @@ impl<S> Drop for LogOnEnd<S> {
             let usage = if let Some(conv) = self.converter_usage.as_ref() {
                 conv.lock().unwrap().usage()
             } else {
-                *self.usage.lock().unwrap()
+                // `saw_usage` distinguishes "the upstream never mentioned
+                // usage" from "the upstream reported zeros". Only the latter
+                // is a real (if empty) measurement; the former is what a
+                // truncated stream looks like, and reporting it as 0 would
+                // hide the difference from the log row.
+                let (acc, saw) = *self.usage.lock().unwrap();
+                saw.then_some(acc)
             };
             let capture = self.capture.clone();
-            let stream_error = self.stream_error.lock().unwrap().clone();
+            let mut stream_error = self.stream_error.lock().unwrap().clone();
+            // A stream the upstream abandoned mid-flight is a failure even
+            // though the client saw a clean 200. Fold it into the existing
+            // in-stream-error slot so `spawn_inline` applies one rule for
+            // both — the byte stream is already committed to the client by
+            // this point, so the row's status stays 200 either way; what
+            // changes is `ok` and what the breaker learns.
+            if stream_error.is_none() && self.finish.lock().unwrap().truncated() {
+                stream_error = Some(STREAM_TRUNCATED.to_string());
+            }
             tokio::spawn(async move {
                 log.spawn_inline(usage, capture, stream_error).await;
             });
@@ -1468,6 +1528,43 @@ fn usage_from_sse_payload(payload: &str) -> Option<convert::Usage> {
 /// upstream's own wording goes to the breaker reason and the raw bytes to the
 /// capture file.
 const STREAM_ERROR_DETAIL: &str = "upstream error event inside a 200 stream";
+
+/// The wording written when a 200 stream ended without its protocol's
+/// terminator.
+///
+/// Fixed, for the same reason as [`STREAM_ERROR_DETAIL`]: the row stays a
+/// stable label an admin can scan for, while the raw bytes behind it go to the
+/// capture file.
+const STREAM_TRUNCATED: &str = "upstream closed the stream without a terminator";
+
+/// Is this SSE line the end-of-stream marker its protocol defines?
+///
+/// Anthropic closes with `message_stop` and OpenAI with a literal `[DONE]`.
+/// Both are matched structurally — on the event name or the payload's own
+/// `type`, never on a substring — because a model whose text happens to
+/// contain "message_stop" arrives as ordinary content and must not be read as
+/// an ending. The payload form is checked as well as the `event:` form since
+/// relays that forward only `data:` lines are common.
+///
+/// Erring toward false negatives is deliberate: missing a terminator costs one
+/// mislabelled hop, while mistaking live output for the end would fail a
+/// healthy provider and trip the breaker on it.
+fn sse_line_is_terminal(line: &str) -> bool {
+    let trimmed = line.trim_end_matches('\r');
+    if trimmed.strip_prefix("event:").map(str::trim) == Some("message_stop") {
+        return true;
+    }
+    let Some(payload) = trimmed.strip_prefix("data:").map(str::trim) else {
+        return false;
+    };
+    if payload == "[DONE]" {
+        return true;
+    }
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .is_some_and(|t| t == "message_stop")
+}
 
 /// Does this SSE line announce that the upstream gave up?
 ///
@@ -1522,10 +1619,13 @@ fn passthrough_stream(
     log: StreamLog,
     capture: DebugCapture,
 ) -> Response {
-    let usage: Arc<Mutex<Option<convert::Usage>>> = Arc::new(Mutex::new(None));
+    let usage: Arc<Mutex<(convert::Usage, bool)>> =
+        Arc::new(Mutex::new((convert::Usage::default(), false)));
     let usage_for_drop = Arc::clone(&usage);
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_for_pump = Arc::clone(&stream_error);
+    let finish: Arc<Mutex<StreamFinish>> = Arc::new(Mutex::new(StreamFinish::default()));
+    let finish_for_drop = Arc::clone(&finish);
     // The first unfold iteration is dedicated to forwarding whatever bytes
     // the peek already consumed from `resp`. Without this, the client would
     // see only the chunks that arrive *after* the prefix was buffered (in
@@ -1539,29 +1639,35 @@ fn passthrough_stream(
             Arc::clone(&usage),
             capture.clone(),
             err_for_pump,
+            Arc::clone(&finish),
         ),
         |mut st| async move {
-            let (resp, buf, usage_ref, capture, err_ref) =
-                (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4);
+            let (resp, buf, usage_ref, capture, err_ref, finish_ref) =
+                (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4, &st.5);
             if !buf.is_empty() {
                 let prefix_bytes = std::mem::take(buf);
                 capture.push(&prefix_bytes);
                 // The prefix was assembled during the peek, so we have to
-                // re-scan its lines for both usage and the in-stream error
-                // detector; passthrough's normal chunk loop wouldn't see
-                // these bytes again.
+                // re-scan its lines for usage, the terminator and the
+                // in-stream error detector; passthrough's normal chunk loop
+                // wouldn't see these bytes again.
                 let mut scan = prefix_bytes.clone();
                 while let Some(pos) = scan.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = scan.drain(..=pos).collect();
                     let trimmed = std::str::from_utf8(&line)
                         .unwrap_or("")
                         .trim_end_matches('\r');
+                    if sse_line_is_terminal(trimmed) {
+                        finish_ref.lock().unwrap().saw_terminal = true;
+                    }
                     if let Some(reason) = sse_line_error(trimmed) {
                         note_stream_error(err_ref, reason);
                     }
                     if let Some(payload) = trimmed.strip_prefix("data:") {
                         if let Some(u) = usage_from_sse_payload(payload.trim()) {
-                            *usage_ref.lock().unwrap() = Some(u);
+                            let mut slot = usage_ref.lock().unwrap();
+                            slot.0.merge(u);
+                            slot.1 = true;
                         }
                     }
                 }
@@ -1581,18 +1687,28 @@ fn passthrough_stream(
                         let line: Vec<u8> = buf.drain(..=pos).collect();
                         let line_str = std::str::from_utf8(&line).unwrap_or("");
                         let trimmed = line_str.trim_end_matches('\r');
+                        if sse_line_is_terminal(trimmed) {
+                            finish_ref.lock().unwrap().saw_terminal = true;
+                        }
                         if let Some(reason) = sse_line_error(trimmed) {
                             note_stream_error(err_ref, reason);
                         }
                         if let Some(payload) = trimmed.strip_prefix("data:") {
                             if let Some(u) = usage_from_sse_payload(payload.trim()) {
-                                *usage_ref.lock().unwrap() = Some(u);
+                                let mut slot = usage_ref.lock().unwrap();
+                                slot.0.merge(u);
+                                slot.1 = true;
                             }
                         }
                     }
                     Some((Ok::<Bytes, reqwest::Error>(bytes), st))
                 }
-                Ok(None) => None,
+                // The upstream closed on its own. Whether that's clean is
+                // decided at Drop, once we know whether a terminator arrived.
+                Ok(None) => {
+                    finish_ref.lock().unwrap().upstream_eof = true;
+                    None
+                }
                 Err(e) => Some((Err(e), st)),
             }
         },
@@ -1610,6 +1726,7 @@ fn passthrough_stream(
             usage_for_drop,
             capture,
             stream_error,
+            finish_for_drop,
         )))
         .unwrap_or_else(|_| {
             error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
@@ -1631,6 +1748,7 @@ fn converted_stream(
 ) -> Response {
     let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let finish: Arc<Mutex<StreamFinish>> = Arc::new(Mutex::new(StreamFinish::default()));
     let mut response = Response::builder().status(StatusCode::OK);
     if let Some(h) = response.headers_mut() {
         h.insert(
@@ -1645,10 +1763,12 @@ fn converted_stream(
         false,
         capture.clone(),
         stream_error.clone(),
+        Arc::clone(&finish),
     );
     let body_stream = stream::unfold(state, |mut st| async move {
-        let (resp, buf, conv_ref, done, capture, err_ref) =
-            (&mut st.0, &mut st.1, &mut st.2, &mut st.3, &st.4, &st.5);
+        let (resp, buf, conv_ref, done, capture, err_ref, finish_ref) = (
+            &mut st.0, &mut st.1, &mut st.2, &mut st.3, &st.4, &st.5, &st.6,
+        );
         loop {
             if *done {
                 return None;
@@ -1660,6 +1780,9 @@ fn converted_stream(
                 // converter sees it. The converter drops event types it
                 // doesn't model, so an error frame would otherwise leave no
                 // trace anywhere and this hop would log as a clean success.
+                if sse_line_is_terminal(&line) {
+                    finish_ref.lock().unwrap().saw_terminal = true;
+                }
                 if let Some(reason) = sse_line_error(&line) {
                     note_stream_error(err_ref, reason);
                 }
@@ -1694,7 +1817,10 @@ fn converted_stream(
                     buf.push_str(&String::from_utf8_lossy(&bytes));
                 }
                 Ok(None) => {
-                    // upstream ended; flush converter's remaining events once
+                    // Upstream closed on its own. Whether that was clean is
+                    // settled at Drop, once a terminator would have shown up.
+                    finish_ref.lock().unwrap().upstream_eof = true;
+                    // flush converter's remaining events once
                     *done = true;
                     let events = conv_ref.lock().unwrap().finish();
                     if events.is_empty() {
@@ -1716,6 +1842,7 @@ fn converted_stream(
             conv,
             capture,
             stream_error,
+            finish,
         )))
         .unwrap_or_else(|_| {
             error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)

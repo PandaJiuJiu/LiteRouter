@@ -1574,6 +1574,148 @@ async fn a_clean_stream_is_still_logged_as_a_success() {
     );
 }
 
+/// A stream that stops mid-content, the way a provider whose connection died
+/// looks from here: a 200, some perfectly valid frames, then nothing. No
+/// `message_stop`, so the client's protocol never gets its ending.
+async fn upstream_truncated_stream(server: &MockServer) {
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-1\",\"type\":\"message\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: content_block_delta\n",
+        "ddata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" and then nothing\"}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_stream_cut_off_before_its_terminator_is_not_logged_as_a_success() {
+    // The status really is 200 and the client really does receive the bytes —
+    // so nothing here can be judged from the response. But the upstream never
+    // said it was done, and by status alone that is indistinguishable from a
+    // clean stream, which is how a dead provider stays logged green forever.
+    let server = MockServer::start().await;
+    upstream_truncated_stream(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    // The status line was committed before the body existed, so the client
+    // still gets its 200 — only the verdict changes.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("partial"),
+        "the bytes the upstream did send still reach the client: {text}"
+    );
+
+    await_log_row(h.pool()).await;
+    let row = sqlx::query(
+        "SELECT a.ok, l.error, l.status_code FROM log_attempts a \
+         JOIN logs l ON l.id = a.log_id ORDER BY a.id DESC LIMIT 1",
+    )
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.get::<i64, _>("ok"),
+        0,
+        "a stream with no terminator is not a success"
+    );
+    assert_eq!(
+        row.get::<i64, _>("status_code"),
+        200,
+        "the client was answered with 200; the row reports what it got"
+    );
+    assert_eq!(
+        row.get::<String, _>("error"),
+        "upstream closed the stream without a terminator",
+        "fixed wording, same rule as an in-stream error event"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_stream_trips_the_breaker() {
+    // The point of calling it a failure: without it the relay records Success
+    // the moment headers arrive and this provider is never backed off.
+    let server = MockServer::start().await;
+    upstream_truncated_stream(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    await_log_row(h.pool()).await;
+
+    assert!(
+        !h.breaker
+            .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
+            .await,
+        "a truncated stream must open the breaker so the next request goes elsewhere"
+    );
+}
+
+#[tokio::test]
+async fn usage_reported_before_the_truncation_is_kept() {
+    // The counts `message_start` did report are real billable work even
+    // though the stream died before the final output count — discarding them
+    // would make a failed call look free.
+    let server = MockServer::start().await;
+    upstream_truncated_stream(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    await_log_row(h.pool()).await;
+
+    let row = sqlx::query("SELECT prompt_tokens FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<i64, _>("prompt_tokens"),
+        11,
+        "the input count the upstream reported is not thrown away"
+    );
+}
+
 #[tokio::test]
 async fn a_stream_that_opens_with_an_error_frame_fails_over_before_responding() {
     // The pre-commit peek exists for this case: the *first* SSE frame is an

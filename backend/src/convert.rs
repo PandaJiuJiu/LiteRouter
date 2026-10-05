@@ -176,6 +176,15 @@ pub fn anthropic_req_to_openai(req: &Value, model: &str) -> Value {
     }
     if let Some(stream) = req.get("stream") {
         out["stream"] = stream.clone();
+        // OpenAI omits usage from a streamed response unless asked for it, and
+        // `stream_options` is the only way to ask. Without this the upstream
+        // stream carries no token counts at all and every streamed log row
+        // lands on zero — the Anthropic side reports usage natively, which is
+        // what makes this asymmetry easy to miss. Anthropic has no equivalent
+        // switch, so `openai_req_to_anthropic` deliberately has no counterpart.
+        if stream == &json!(true) {
+            out["stream_options"] = json!({ "include_usage": true });
+        }
     }
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let mapped: Vec<Value> = tools
@@ -565,6 +574,27 @@ impl Usage {
     /// True when nothing billable was reported.
     pub fn is_empty(&self) -> bool {
         self.prompt == 0 && self.completion == 0
+    }
+
+    /// Fold a later usage report into this one, field by field.
+    ///
+    /// Both protocols split the counts across events: Anthropic reports
+    /// `input_tokens` in `message_start` and `output_tokens` in a trailing
+    /// `message_delta`, and OpenAI reports the breakdown only in the final
+    /// chunk. Taking the last report wholesale throws away whatever the
+    /// earlier one carried — a streamed request would record zero prompt
+    /// tokens on every call, which reads as "free" in the usage report.
+    ///
+    /// So each field is kept at its largest non-zero value instead. The counts
+    /// only ever grow within one response, so max is the right merge for all
+    /// of them, cache included.
+    pub fn merge(&mut self, other: Usage) {
+        self.prompt = self.prompt.max(other.prompt);
+        self.completion = self.completion.max(other.completion);
+        self.total = self.total.max(other.total);
+        self.cache_read = self.cache_read.max(other.cache_read);
+        self.cache_creation = self.cache_creation.max(other.cache_creation);
+        self.reasoning = self.reasoning.max(other.reasoning);
     }
 }
 
