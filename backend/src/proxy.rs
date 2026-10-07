@@ -2402,7 +2402,8 @@ pub async fn anthropic_messages(
     relay(state, &headers, body, "anthropic", addr).await
 }
 
-/// GET /v1/models — list union of all enabled channel models.
+/// GET /v1/models — list downstream model aliases (from model_mappings) if any,
+/// otherwise fall back to union of all enabled channel models.
 pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let key = match extract_token(&headers) {
         Some(k) => k,
@@ -2418,8 +2419,9 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
     if let Err((s, msg)) = auth_token(&state, &key).await {
         return error_response("openai", s, msg, None);
     }
-    // only external channels serve relay traffic (see candidate_channels)
-    let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
+
+    // First, try to get model mappings (downstream aliases)
+    let mapping_rows = match sqlx::query("SELECT alias FROM model_mappings ORDER BY id ASC")
         .fetch_all(&state.pool)
         .await
     {
@@ -2433,18 +2435,44 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
             )
         }
     };
-    let mut models: Vec<String> = Vec::new();
-    for row in rows {
-        for m in row.get::<String, _>("models").split(',') {
-            let m = m.trim();
-            if m.is_empty() || m == "*" {
-                continue; // wildcard channels don't enumerate models
+
+    let models: Vec<String> = if !mapping_rows.is_empty() {
+        // Return downstream model aliases (what the gateway exposes to clients)
+        mapping_rows
+            .iter()
+            .map(|r| r.get::<String, _>("alias"))
+            .collect()
+    } else {
+        // Fallback: union of all enabled channel models (legacy behavior)
+        let rows = match sqlx::query("SELECT models FROM channels WHERE enabled=1")
+            .fetch_all(&state.pool)
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return error_response(
+                    "openai",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db error",
+                    None,
+                )
             }
-            if !models.iter().any(|x| x == m) {
-                models.push(m.to_string());
+        };
+        let mut models: Vec<String> = Vec::new();
+        for row in rows {
+            for m in row.get::<String, _>("models").split(',') {
+                let m = m.trim();
+                if m.is_empty() || m == "*" {
+                    continue; // wildcard channels don't enumerate models
+                }
+                if !models.iter().any(|x| x == m) {
+                    models.push(m.to_string());
+                }
             }
         }
-    }
+        models
+    };
+
     let data: Vec<Value> = models
         .iter()
         .map(|m| json!({ "id": m, "object": "model", "owned_by": "literouter" }))
