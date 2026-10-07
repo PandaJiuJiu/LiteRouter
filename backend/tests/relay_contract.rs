@@ -1558,7 +1558,7 @@ async fn a_clean_stream_is_still_logged_as_a_success() {
 
     await_log_row(h.pool()).await;
     let row = sqlx::query(
-        "SELECT a.ok, l.error FROM log_attempts a JOIN logs l ON l.id = a.log_id \
+        "SELECT a.ok, l.error, l.status_code, l.client_aborted FROM log_attempts a JOIN logs l ON l.id = a.log_id \
          ORDER BY a.id DESC LIMIT 1",
     )
     .fetch_one(h.pool())
@@ -1566,11 +1566,101 @@ async fn a_clean_stream_is_still_logged_as_a_success() {
     .unwrap();
     assert_eq!(row.get::<i64, _>("ok"), 1);
     assert_eq!(row.get::<String, _>("error"), "");
+    assert_eq!(
+        row.get::<i64, _>("client_aborted"),
+        0,
+        "a stream that reached its terminator is not a client cancel"
+    );
     assert!(
         h.breaker
             .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
             .await,
         "a clean stream must leave the breaker closed"
+    );
+}
+
+/// #3147, pinned: a Claude Code–style caller that gives up on a stream it no
+/// longer wants (parallel speculative requests — the winner cancels the rest).
+/// The 200 is real and the hop succeeded, but the usage both protocols report
+/// in the stream's tail was never read, so the row would otherwise be a
+/// silent green 200 worth zero tokens. It must be marked `client_aborted`
+/// **without** being marked a failure: `error` stays empty (every failure
+/// affordance in the UI keys off it), `ok` stays 1, and the breaker must not
+/// back off a provider that behaved perfectly.
+#[tokio::test]
+async fn a_client_hangup_marks_the_row_without_failing_it() {
+    let server = MockServer::start().await;
+    // A live-looking stream that is still open for business when the client
+    // walks away mid-flight — no terminator yet, upstream still talking.
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-1\",\"type\":\"message\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"working\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" still working\"}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The hang-up itself: the body is dropped unread, which drops the pump,
+    // which drops the upstream connection — exactly the axum path a real
+    // disconnected client takes.
+    drop(resp);
+
+    await_log_row(h.pool()).await;
+    let row = sqlx::query(
+        "SELECT a.ok, l.error, l.status_code, l.total_tokens, l.client_aborted \
+         FROM log_attempts a JOIN logs l ON l.id = a.log_id ORDER BY a.id DESC LIMIT 1",
+    )
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.get::<i64, _>("client_aborted"),
+        1,
+        "the hang-up must be recorded"
+    );
+    assert_eq!(
+        row.get::<i64, _>("ok"),
+        1,
+        "a client cancel is not a hop failure"
+    );
+    assert_eq!(
+        row.get::<String, _>("error"),
+        "",
+        "error stays empty: non-empty means a hop failed"
+    );
+    assert_eq!(row.get::<i64, _>("status_code"), 200);
+    assert_eq!(
+        row.get::<i64, _>("total_tokens"),
+        0,
+        "the usage tail was never read — this is the 0 that confused a human"
+    );
+    assert!(
+        h.breaker
+            .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
+            .await,
+        "the provider answered fine; a client hanging up must not back it off"
     );
 }
 
@@ -1629,7 +1719,7 @@ async fn a_stream_cut_off_before_its_terminator_is_not_logged_as_a_success() {
 
     await_log_row(h.pool()).await;
     let row = sqlx::query(
-        "SELECT a.ok, l.error, l.status_code FROM log_attempts a \
+        "SELECT a.ok, l.error, l.status_code, l.client_aborted FROM log_attempts a \
          JOIN logs l ON l.id = a.log_id ORDER BY a.id DESC LIMIT 1",
     )
     .fetch_one(h.pool())
@@ -1649,6 +1739,11 @@ async fn a_stream_cut_off_before_its_terminator_is_not_logged_as_a_success() {
         row.get::<String, _>("error"),
         "upstream closed the stream without a terminator",
         "fixed wording, same rule as an in-stream error event"
+    );
+    assert_eq!(
+        row.get::<i64, _>("client_aborted"),
+        0,
+        "the client read to EOF — this cutoff is the upstream's fault, not a hang-up"
     );
 }
 
@@ -2223,13 +2318,19 @@ async fn a_passthrough_stream_captures_the_upstream_bytes() {
         .debug_logging
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let server = MockServer::start().await;
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen-1\",\"type\":\"message\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
-                ),
+                .set_body_string(sse),
         )
         .mount(&server)
         .await;
@@ -2238,13 +2339,17 @@ async fn a_passthrough_stream_captures_the_upstream_bytes() {
         .await
         .unwrap();
     let token = support::insert_token(h.pool(), "relay", admin_id).await;
-    support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", true).await;
+    // Anthropic upstream so this hop is a passthrough going through the peek.
+    support::insert_channel(h.pool(), "ch", "", &server.uri(), "gpt-4o", true).await;
 
     let resp = support::call(
         &h.router,
         "POST",
-        "/v1/chat/completions",
-        Some(json!({"model": "gpt-4o", "stream": true, "messages": []})),
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
         Some(&token.key),
     )
     .await;
@@ -2263,10 +2368,14 @@ async fn a_passthrough_stream_captures_the_upstream_bytes() {
     .unwrap();
     // Regression: this file used to come out 0 bytes on every stream, because
     // the pump accumulated into its line-parsing buffer and never the
-    // capture.
-    assert!(
-        body.contains("[DONE]"),
-        "captured stream was empty: {body:?}"
+    // capture. The equality matters beyond containment: the peeked prefix
+    // was pushed into the capture twice (once by the relay, once by the
+    // pump), and a `contains` check cannot see that — a file with every
+    // frame doubled reads like an upstream that sends its envelope twice,
+    // which sent one real debugging session down the wrong path.
+    assert_eq!(
+        body, sse,
+        "the capture must be the upstream stream verbatim — no duplicated peek prefix"
     );
 }
 

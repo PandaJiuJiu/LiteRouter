@@ -1130,6 +1130,10 @@ pub async fn list_logs(
                 "latency_ms": r.get::<i64, _>("latency_ms"),
                 "failed_count": failed_count,
                 "failed_attempts": failed_by_log.get(&id).cloned().unwrap_or_default(),
+                // A stream the client hung up on. The list shows it next to
+                // the token count, which is otherwise a bare 0 with no
+                // explanation. `try_get`: rows predating migration 0033.
+                "client_aborted": r.try_get("client_aborted").unwrap_or(0) != 0,
                 "created_at": r.get::<i64, _>("created_at"),
                 "client_ip": r.get::<String, _>("client_ip"),
                 "user_agent": r.get::<String, _>("user_agent"),
@@ -1302,6 +1306,11 @@ pub async fn get_log(
             "protocol": row.get::<String, _>("protocol"),
             "convert": row.get::<String, _>("convert"),
             "error": row.get::<String, _>("error"),
+            // Written only by a stream Drop that saw the client hang up.
+            // Deliberately not folded into `error`: a client cancel is not a
+            // hop failure, and the failure affordances key off that column.
+            // `try_get` because rows written before migration 0033 predate it.
+            "client_aborted": row.try_get("client_aborted").unwrap_or(0) != 0,
             "failed_count": row.try_get("failed_count").unwrap_or(0),
             "attempts": attempts,
             "has_debug": has_debug,

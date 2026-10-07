@@ -20,6 +20,12 @@
         <el-tag v-if="log.failed_count > 0" size="small" type="warning" effect="plain">
           {{ t('logDetail.failedThenOk', { count: log.failed_count }) }}
         </el-tag>
+        <!-- Client hung up before the stream's terminator. Says why the
+             token section below is empty; deliberately not styled as an
+             error — the hop succeeded, the client just left early. -->
+        <el-tooltip v-if="log.client_aborted" placement="top" :show-after="200" :content="t('logs.abortedTip')">
+          <el-tag size="small" type="info" effect="plain">{{ t('logs.aborted') }}</el-tag>
+        </el-tooltip>
       </div>
 
       <el-alert v-if="log.error" type="error" :title="log.error" :closable="false" show-icon />

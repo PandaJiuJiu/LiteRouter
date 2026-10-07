@@ -611,6 +611,14 @@ struct LogEntry {
     attempts: Vec<Attempt>,
     client_ip: String,
     user_agent: String,
+    /// The stream was dropped before its protocol terminator because the
+    /// **client** hung up — no upstream fault observed. Recorded on its own
+    /// column rather than in `error`: every failure affordance in the UI
+    /// (`logs.error` non-empty, `failed_count`, `log_attempts.ok`) means "a
+    /// hop failed", and a client hang-up is not one. The column answers the
+    /// admin's actual question about such a row — "why is this 200 worth zero
+    /// tokens?" — without painting a healthy provider red.
+    client_aborted: bool,
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
@@ -628,7 +636,7 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
         Err(_) => return None,
     };
     let inserted = match sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&e.token_name)
     .bind(&winner.upstream_model)
@@ -651,6 +659,7 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
     .bind(failed_count)
     .bind(&e.client_ip)
     .bind(&e.user_agent)
+    .bind(e.client_aborted as i64)
     .execute(&mut *tx)
     .await
     {
@@ -1264,6 +1273,7 @@ impl StreamLog {
         usage: Option<convert::Usage>,
         capture: DebugCapture,
         stream_error: Option<String>,
+        client_aborted: bool,
     ) {
         // A 200 whose body turned out to be an error is a failure, and it has
         // to be recorded as one: the log page otherwise shows a green 200 with
@@ -1305,6 +1315,7 @@ impl StreamLog {
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
         }
+        self.entry.client_aborted = client_aborted;
         let ok = self.entry.winner.as_ref().map(|w| w.ok).unwrap_or(false);
         let log_id = log_request(&self.pool, &self.entry).await;
         if should_capture(&self.state, ok) {
@@ -1381,6 +1392,14 @@ struct LogOnEnd<S> {
     /// Whether the upstream ended on its own terms, and whether it said so.
     /// Read at Drop to tell a truncated stream from a completed one.
     finish: Arc<Mutex<StreamFinish>>,
+    /// Whether the pump saw an upstream-side fault: the upstream body stream
+    /// yielding `Err` (a mid-body transport failure). In-stream error events
+    /// are covered by `stream_error` already. Set from `poll_next`, which is
+    /// the one place every pump's error item passes through, so neither pump
+    /// needs to know about it. Drop uses it to tell "the fault was the
+    /// upstream's" from "no fault was observed, yet the protocol terminator
+    /// never arrived" — the residue of a client that hung up mid-stream.
+    pump_saw_err: bool,
 }
 
 /// How a stream ended, from the upstream's point of view.
@@ -1427,6 +1446,7 @@ impl<S> LogOnEnd<S> {
             capture,
             stream_error,
             finish,
+            pump_saw_err: false,
         }
     }
     fn wrap_with_converter(
@@ -1445,6 +1465,7 @@ impl<S> LogOnEnd<S> {
             capture,
             stream_error,
             finish,
+            pump_saw_err: false,
         }
     }
 }
@@ -1465,8 +1486,23 @@ where
         // the upstream byte stream (e.g. `stream::unfold` over
         // `reqwest::Response`) may not be `Unpin`.
         let this = unsafe { self.get_unchecked_mut() };
+        // Split borrow: `inner` pins `this.inner`, so the error bookkeeping
+        // has to reach its own field directly rather than through `this`.
+        let saw_err = &mut this.pump_saw_err;
         let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
-        inner.poll_next(cx)
+        match inner.poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                // An `Err` item is the upstream's fault (a body that stopped
+                // arriving), not the client's — Drop must not misread it as a
+                // client hang-up. Recorded here rather than in each pump so
+                // the passthrough and converted streams are covered alike.
+                if item.is_err() {
+                    *saw_err = true;
+                }
+                std::task::Poll::Ready(Some(item))
+            }
+            other => other,
+        }
     }
 }
 
@@ -1495,8 +1531,19 @@ impl<S> Drop for LogOnEnd<S> {
             if stream_error.is_none() && self.finish.lock().unwrap().truncated() {
                 stream_error = Some(STREAM_TRUNCATED.to_string());
             }
+            // No fault of the upstream's, and no terminator: the only way that
+            // happens is this side dropping the stream, i.e. the client hung
+            // up. That is not a provider failure — the hop did answer, and the
+            // breaker already recorded Success — but the row has to say why it
+            // looks like a 200 that bought no tokens: the usage of both
+            // protocols lives in the tail of the stream, which the client
+            // never waited for.
+            let client_aborted = stream_error.is_none()
+                && !self.pump_saw_err
+                && !self.finish.lock().unwrap().saw_terminal;
             tokio::spawn(async move {
-                log.spawn_inline(usage, capture, stream_error).await;
+                log.spawn_inline(usage, capture, stream_error, client_aborted)
+                    .await;
             });
         }
     }
@@ -1646,11 +1693,14 @@ fn passthrough_stream(
                 (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4, &st.5);
             if !buf.is_empty() {
                 let prefix_bytes = std::mem::take(buf);
-                capture.push(&prefix_bytes);
-                // The prefix was assembled during the peek, so we have to
-                // re-scan its lines for usage, the terminator and the
-                // in-stream error detector; passthrough's normal chunk loop
-                // wouldn't see these bytes again.
+                // The caller already pushed these bytes into `capture` (see
+                // `respond_from_upstream`), so pushing again here duplicated
+                // the peeked prefix in every passthrough debug capture — the
+                // file then showed `message_start` twice and jumped straight
+                // from `ping` to `content_block_start`, an artifact that reads
+                // exactly like a misbehaving upstream. Only the *scan* below
+                // is this branch's job: the peek consumed these bytes, so the
+                // normal chunk loop will never see them again.
                 let mut scan = prefix_bytes.clone();
                 while let Some(pos) = scan.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = scan.drain(..=pos).collect();
@@ -1899,6 +1949,10 @@ async fn respond_from_upstream(
         attempts: push(attempts, winner),
         client_ip: ctx.client_info.ip.clone(),
         user_agent: ctx.client_info.user_agent.clone(),
+        // Only a stream's Drop can observe a client hang-up; the buffered
+        // path has no stream to hang up on. `spawn_inline` sets this for the
+        // streaming row.
+        client_aborted: false,
     };
 
     let (status, content_type, bytes) = match body {
@@ -2310,6 +2364,7 @@ async fn relay(
             attempts: Vec::new(),
             client_ip: client_info.ip.clone(),
             user_agent: client_info.user_agent.clone(),
+            client_aborted: false,
         };
         let _ = log_request(&state.pool, &entry).await;
         return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
@@ -2369,6 +2424,7 @@ async fn relay(
         attempts,
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
+        client_aborted: false,
     };
     let log_id = log_request(&state.pool, &entry).await;
     // Unconditional: a request that exhausted every candidate is exactly the

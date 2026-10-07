@@ -249,6 +249,11 @@ export default {
     noChannel: 'no channel',
     failTipTitle: 'First {count} forwarding attempts failed — the channel was switched automatically',
     failBadge: '{count} failed',
+    // A stream the client hung up on: the 200 is real, the 0 tokens are the
+    // usage tail the client never waited for. Not a failure, so it gets its
+    // own neutral tag rather than the red treatment a failed hop gets.
+    aborted: 'cancelled by client',
+    abortedTip: 'The client closed the connection before the stream ended, so the usage reported at the end of the stream was never read. Not an upstream failure.',
     filter: {
       ip: 'Client IP',
       token: 'Token',

@@ -241,6 +241,10 @@ export default {
     noChannel: '无渠道',
     failTipTitle: '前 {count} 次转发失败，已自动切换渠道',
     failBadge: '失败 {count} 次',
+    // 客户端提前掐断的流：200 是真的，0 token 是客户端没等到的流末尾用量。
+    // 不是失败，所以用中性标签，不走失败 hop 的红色样式。
+    aborted: '客户端已取消',
+    abortedTip: '客户端在流结束前关闭了连接，因此流末尾上报的用量未被读取。这不是上游故障。',
     filter: {
       ip: '客户端 IP',
       token: '令牌',

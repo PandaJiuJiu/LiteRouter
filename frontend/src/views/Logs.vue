@@ -101,7 +101,21 @@
       </el-table-column>
       <el-table-column :label="t('logs.col.tokens')" width="110" prop="total_tokens">
         <template #default="{ row }">
-          <span v-if="row.total_tokens > 0" class="num">{{ fmt(row.total_tokens) }}</span>
+          <!-- A stream the client hung up on usually reports no usage: the
+               count lives in the tail the client never waited for. Without
+               this the cell is a bare dash and the row reads like a free
+               call. Only replaces the dash — a row that did capture usage
+               says nothing confusing. Neutral info styling: a client cancel
+               is not a failure, so it must not borrow the red of one. -->
+          <el-tooltip
+            v-if="!row.total_tokens && row.client_aborted"
+            placement="top"
+            :show-after="200"
+            :content="t('logs.abortedTip')"
+          >
+            <el-tag type="info" size="small" effect="plain">{{ t('logs.aborted') }}</el-tag>
+          </el-tooltip>
+          <span v-else-if="row.total_tokens > 0" class="num">{{ fmt(row.total_tokens) }}</span>
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>

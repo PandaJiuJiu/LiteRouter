@@ -1,0 +1,13 @@
+-- 流式请求被客户端中途掐断的标记。0=流正常走完（或请求根本没到流阶段），
+-- 1=下游在收到上游的协议终止符之前断开。
+--
+-- 为什么单独一列而不是往 logs.error 里写一句话：全项目（Logs.vue 的失败
+-- tooltip、LogDetail.vue 的红色横幅）都默认 `error != ''` 等价于「有 hop
+-- 失败」。客户端取消不是失败——状态确实是 200，hop 确实成功过，breaker
+-- 也不该收到 Failure——写进 error 会让详情页同时亮起绿色 200 和红色错误
+-- 横幅，比原来的 0-token 困惑更困惑。
+--
+-- 这个标记回答的问题是另一类："这条 200 / 0 token 的流式记录是不是白烧
+-- 了上游 quota？"——是客户端提前挂断的，就回答"不是上游的锅，也解释 token
+-- 为 0"（usage 在流末尾的 message_delta 里，客户端没等到）。
+ALTER TABLE logs ADD COLUMN client_aborted INTEGER NOT NULL DEFAULT 0;
