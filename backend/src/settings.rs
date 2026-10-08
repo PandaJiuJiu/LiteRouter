@@ -433,47 +433,21 @@ pub async fn set_proxy_settings(
     let new_port = req.port.unwrap_or(cur_port);
     let new_enabled = req.enabled.unwrap_or(cur_enabled);
 
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('proxy_host', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(new_host)
-    .execute(&state.pool)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "db error"}).into(),
+    let pairs: [(&str, &str); 3] = [
+        ("proxy_host", new_host),
+        ("proxy_port", &new_port.to_string()),
+        ("proxy_enabled", if new_enabled { "1" } else { "0" }),
+    ];
+    for (k, v) in pairs {
+        let _ = sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-    })?;
-
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('proxy_port', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(new_port.to_string())
-    .execute(&state.pool)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "db error"}).into(),
-        )
-    })?;
-
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('proxy_enabled', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(if new_enabled { "1" } else { "0" })
-    .execute(&state.pool)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": "db error"}).into(),
-        )
-    })?;
+        .bind(k)
+        .bind(v)
+        .execute(&state.pool)
+        .await;
+    }
 
     // Rebuild the cached client only if host/port actually changed — the
     // toggle flip is cheap and goes through the atomic.
