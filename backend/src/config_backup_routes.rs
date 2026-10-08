@@ -66,23 +66,32 @@ impl ConflictAction {
 
 // ---------- shared helpers ----------
 
-/// Build a 400 with a JSON `{error: ...}` body. Handlers all return
-/// `Result<_, Response>` and use `?` to propagate — the alternative to
-/// carrying `Response` in the Err is to use a tuple, but every external
-/// caller (the `IntoResponse` machinery in `commit_import`) only has it
-/// via tuple construction, so making every error site convert is the same
-/// code with more `into_response()` calls sprinkled around.
-fn bad_request(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": msg.into() })),
-    )
-        .into_response()
+/// A table + column pair used to probe for name availability.
+struct TableCol(&'static str, &'static str);
+
+/// Find the first `_n` suffix (n = 1..9999) that produces a name absent from
+/// `table.column`. Falls back to `base_<timestamp>` if all suffixes are taken.
+async fn free_name(pool: &sqlx::SqlitePool, base: &str, tc: TableCol) -> String {
+    for n in 1..10_000 {
+        let candidate = format!("{base}_{n}");
+        let taken: i64 = sqlx::query_scalar(format!("SELECT COUNT(*) FROM {} WHERE {}=?", tc.0, tc.1))
+            .bind(&candidate)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(1);
+        if taken == 0 {
+            return candidate;
+        }
+    }
+    format!("{base}_{}", now())
 }
 
-/// Validate the requested section list against [`ALL_SECTIONS`]. An empty
-/// list is an error rather than a no-op export — silently producing an
-/// empty file the user then imports for hours is worse than a 400.
+/// Build a 400 with a JSON `{error: ...}` body.
+fn bad_request(msg: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// Validate the requested section list against [`ALL_SECTIONS`].
 #[allow(clippy::result_large_err)]
 fn selected_sections(raw: &[String]) -> Result<Vec<String>, Response> {
     if raw.is_empty() {
@@ -93,8 +102,6 @@ fn selected_sections(raw: &[String]) -> Result<Vec<String>, Response> {
             return Err(bad_request(format!("未知的导出内容：{s}")));
         }
     }
-    // Deduplicate while preserving the caller's order, so the payload's
-    // `sections` field reads the way the user checked the boxes.
     let mut out: Vec<String> = Vec::new();
     for s in raw {
         if !out.contains(s) {
@@ -104,9 +111,7 @@ fn selected_sections(raw: &[String]) -> Result<Vec<String>, Response> {
     Ok(out)
 }
 
-/// Require a passphrase. Empty or all-whitespace is rejected: an empty
-/// passphrase is not encryption, it's obfuscation, and a backup file that
-/// looks protected but isn't is the worst outcome here.
+/// Require a passphrase. Empty or all-whitespace is rejected.
 #[allow(clippy::result_large_err)]
 fn require_passphrase(p: &str) -> Result<(), Response> {
     if p.trim().is_empty() {
@@ -116,63 +121,6 @@ fn require_passphrase(p: &str) -> Result<(), Response> {
         return Err(bad_request("加密密码至少 8 位"));
     }
     Ok(())
-}
-
-/// Channel name that doesn't collide with anything already in the table and
-/// doesn't collide with a name produced earlier in this same import.
-/// `_1`, `_2`, … until free — the numbering is by first-free, not by count,
-/// so a deleted `foo_1` doesn't push the next import to `foo_2`.
-async fn free_channel_name(pool: &sqlx::SqlitePool, base: &str) -> String {
-    for n in 1..10_000 {
-        let candidate = format!("{base}_{n}");
-        let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE name=?")
-            .bind(&candidate)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(1);
-        if taken == 0 {
-            return candidate;
-        }
-    }
-    // 10000 suffixes already exist; the name is genuinely taken. Returning
-    // base would collide, so fall back to something guaranteed-unique-ish
-    // and let the unique constraint have the final say.
-    format!("{base}_{}", now())
-}
-
-/// Same idea for token names. `tokens.name` has no UNIQUE constraint, so we
-/// still check before writing — "keep both" that silently overwrote is the
-/// failure mode this whole endpoint exists to avoid.
-async fn free_token_name(pool: &sqlx::SqlitePool, base: &str) -> String {
-    for n in 1..10_000 {
-        let candidate = format!("{base}_{n}");
-        let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE name=?")
-            .bind(&candidate)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(1);
-        if taken == 0 {
-            return candidate;
-        }
-    }
-    format!("{base}_{}", now())
-}
-
-/// `model_mappings.alias` IS unique, so this one can lean on the constraint,
-/// but we still probe first so the user sees the intended name in the plan.
-async fn free_alias(pool: &sqlx::SqlitePool, base: &str) -> String {
-    for n in 1..10_000 {
-        let candidate = format!("{base}_{n}");
-        let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_mappings WHERE alias=?")
-            .bind(&candidate)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(1);
-        if taken == 0 {
-            return candidate;
-        }
-    }
-    format!("{base}_{}", now())
 }
 
 // ---------- export ----------
@@ -496,7 +444,7 @@ pub async fn commit_import(
                 skipped += 1;
             }
             (Some(_), Some(ConflictAction::KeepBoth)) => {
-                let name = free_channel_name(&state.pool, &c.name).await;
+                let name = free_name(&state.pool, &c.name, TableCol("channels", "name")).await;
                 insert_channel(&state, c, &name).await?;
                 kept_both += 1;
             }
@@ -530,7 +478,7 @@ pub async fn commit_import(
                 skipped += 1;
             }
             (Some(_), Some(ConflictAction::KeepBoth)) => {
-                let name = free_token_name(&state.pool, &t.name).await;
+                let name = free_name(&state.pool, &t.name, TableCol("tokens", "name")).await;
                 insert_token(&state, t, &name).await?;
                 kept_both += 1;
             }
@@ -569,7 +517,7 @@ pub async fn commit_import(
                 skipped += 1;
             }
             (Some(_), Some(ConflictAction::KeepBoth)) => {
-                let alias = free_alias(&state.pool, &m.alias).await;
+                let alias = free_name(&state.pool, &m.alias, TableCol("model_mappings", "alias")).await;
                 insert_mapping(&state, m, &alias, &targets).await?;
                 kept_both += 1;
             }
