@@ -1526,7 +1526,7 @@ async fn proxy_state_reflects_effective_combination_in_state() {
 
     // Flip global switch on — now every channel goes through the proxy,
     // including one that never opted in.
-    state.set_proxy_enabled(true);
+    state.set_proxy_on(true);
     assert!(
         state.proxy_active_for(false),
         "global on → even channel without use_proxy goes through proxy"
@@ -1538,7 +1538,7 @@ async fn proxy_state_reflects_effective_combination_in_state() {
 
     // Turn global off again. Per-channel and global are independent: the
     // opted-in channel keeps its proxy, the rest goes direct.
-    state.set_proxy_enabled(false);
+    state.set_proxy_on(false);
     assert!(
         !state.proxy_active_for(false),
         "global off, no channel toggle → no proxy"

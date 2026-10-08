@@ -43,9 +43,13 @@ impl TargetEntry {
 pub fn parse_targets(targets: &str, fallback: &str) -> Vec<(String, String)> {
     let raw: serde_json::Value = match serde_json::from_str(targets) {
         Ok(v) => v,
-        Err(_) => return fallback.is_empty().then_some(Vec::new()).unwrap_or_else(|| {
-            vec![(String::new(), fallback.trim().to_string())]
-        }),
+        Err(_) => {
+            if fallback.is_empty() {
+                return Vec::new();
+            } else {
+                return vec![(String::new(), fallback.trim().to_string())];
+            }
+        }
     };
     let entries = deserialize_targets(raw);
     let mut out: Vec<(String, String)> = Vec::new();

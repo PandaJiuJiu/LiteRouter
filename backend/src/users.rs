@@ -140,10 +140,8 @@ pub async fn update_user(
     let mut is_admin = target_is_admin;
     if let Some(flag) = req.is_admin {
         // Demoting an admin: make sure at least one admin stays.
-        if target_is_admin != 0 && !flag {
-            if !has_other_admin(&state.pool, id).await {
+        if target_is_admin != 0 && !flag && !has_other_admin(&state.pool, id).await {
                 return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
-            }
         }
         is_admin = flag as i64;
     }

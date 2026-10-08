@@ -74,7 +74,7 @@ struct TableCol(&'static str, &'static str);
 async fn free_name(pool: &sqlx::SqlitePool, base: &str, tc: TableCol) -> String {
     for n in 1..10_000 {
         let candidate = format!("{base}_{n}");
-        let taken: i64 = sqlx::query_scalar(format!("SELECT COUNT(*) FROM {} WHERE {}=?", tc.0, tc.1))
+        let taken: i64 = sqlx::query_scalar(format!("SELECT COUNT(*) FROM {} WHERE {}=?", tc.0, tc.1).as_str())
             .bind(&candidate)
             .fetch_one(pool)
             .await
