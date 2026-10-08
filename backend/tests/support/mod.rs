@@ -349,4 +349,45 @@ pub async fn login(router: &Router, username: &str) -> String {
     body["session"].as_str().expect("session").to_string()
 }
 
+use std::time::Duration;
+use tokio::time::{interval, MissedTickBehavior};
 use tower::ServiceExt;
+
+/// Poll the DB until at least `expected` rows exist in `logs`, or `timeout`
+/// elapses. Use this after a non-streaming relay request when the backend logs
+/// asynchronously off the response hot path.
+pub async fn wait_for_logs(pool: &SqlitePool, expected: i64, timeout: Duration) {
+    let mut ticker = interval(Duration::from_millis(10));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        if count >= expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {} log row(s)", expected);
+        }
+        ticker.tick().await;
+    }
+}
+
+/// Poll the DB until a log row with the given id has debug capture on disk.
+pub async fn wait_for_debug(pool: &SqlitePool, log_id: i64, timeout: Duration) {
+    let mut ticker = interval(Duration::from_millis(10));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let dir = debug_log_dir(pool);
+    loop {
+        if dir.join(log_id.to_string()).join("resp.json").exists() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for debug capture for log {}", log_id);
+        }
+        ticker.tick().await;
+    }
+}

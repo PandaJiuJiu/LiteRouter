@@ -245,6 +245,7 @@ async fn a_model_that_no_channel_serves_is_a_404_that_still_gets_a_log_row() {
         "{body}"
     );
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE token_name='relay'")
         .fetch_one(h.pool())
         .await
@@ -351,6 +352,8 @@ async fn the_log_row_records_every_attempt_in_order() {
     let (h, key) = two_channels(&a.uri(), &b.uri()).await;
     chat(&h, &key, "gpt-4o", json!({})).await;
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
+
     let rows = sqlx::query(
         "SELECT log_id, seq, channel_name, status_code, ok FROM log_attempts ORDER BY seq",
     )
@@ -380,6 +383,8 @@ async fn the_parent_log_row_takes_the_winning_attempts_channel_and_tokens() {
     upstream_ok(&b).await;
     let (h, key) = two_channels(&a.uri(), &b.uri()).await;
     chat(&h, &key, "gpt-4o", json!({})).await;
+
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
 
     let row = sqlx::query("SELECT channel_name, status_code, total_tokens, failed_count FROM logs")
         .fetch_one(h.pool())
@@ -570,6 +575,7 @@ async fn an_all_failed_request_still_writes_a_log_row() {
     let (h, key) = two_channels(&a.uri(), &b.uri()).await;
     chat(&h, &key, "gpt-4o", json!({})).await;
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     // The parent row must not name the last failed channel as if it had served
     // the request — an empty channel renders as "—" in the list.
     let row = sqlx::query("SELECT channel_name, status_code FROM logs")
@@ -732,6 +738,8 @@ async fn a_skipped_hop_is_recorded_as_skipped_not_as_a_failure() {
         .await;
     chat(&h, &key, "gpt-4o", json!({})).await;
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
+
     let row = sqlx::query("SELECT ok, skipped, error FROM log_attempts")
         .fetch_one(h.pool())
         .await
@@ -826,6 +834,7 @@ async fn the_error_message_is_not_leaked_to_the_client_or_the_log() {
         "upstream wording must not reach the client: {body}"
     );
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let err: String = sqlx::query_scalar("SELECT error FROM log_attempts LIMIT 1")
         .fetch_one(h.pool())
         .await
@@ -1022,6 +1031,8 @@ async fn a_converted_hop_is_labelled_in_the_log_row() {
     support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
     chat(&h, &token.key, "claude-x", json!({})).await;
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
+
     let row = sqlx::query("SELECT convert, protocol FROM logs")
         .fetch_one(h.pool())
         .await
@@ -1082,6 +1093,8 @@ async fn the_client_ip_and_user_agent_are_recorded_on_the_log_row() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
 
     let row = sqlx::query("SELECT client_ip FROM logs")
         .fetch_one(h.pool())
@@ -2014,6 +2027,7 @@ async fn a_200_carrying_an_error_envelope_fails_over_to_the_next_channel() {
     // The client got the second channel's real completion, not the error page.
     assert_eq!(body["choices"][0]["message"]["content"], "hi");
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let row = sqlx::query("SELECT failed_count FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
@@ -2071,6 +2085,7 @@ async fn every_candidate_returning_a_bad_200_synthesizes_502() {
     assert!(msg.contains("first"), "{msg}");
     assert!(msg.contains("second"), "{msg}");
     // Both attempts recorded the real upstream status, not a synthesized one.
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let rows = sqlx::query("SELECT status_code, ok, error FROM log_attempts ORDER BY seq ASC")
         .fetch_all(h.pool())
         .await
@@ -2132,10 +2147,12 @@ async fn a_failed_request_captures_the_upstream_body_without_the_debug_switch() 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
         .unwrap();
+    support::wait_for_debug(h.pool(), id, std::time::Duration::from_secs(1)).await;
     let body = std::fs::read_to_string(
         support::debug_log_dir(h.pool())
             .join(id.to_string())
@@ -2155,6 +2172,7 @@ async fn a_capture_never_contains_the_request_body() {
     let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
 
     chat(&h, &key, "gpt-4o", json!({})).await;
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
@@ -2179,6 +2197,7 @@ async fn a_successful_request_writes_no_capture_when_the_switch_is_off() {
 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
     assert_eq!(status, StatusCode::OK);
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
@@ -2207,6 +2226,7 @@ async fn the_debug_switch_captures_successful_requests_too() {
     support::insert_channel(h.pool(), "ch", &server.uri(), "", "gpt-4o", true).await;
 
     chat(&h, &token.key, "gpt-4o", json!({})).await;
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
@@ -2245,11 +2265,13 @@ async fn a_capture_is_truncated_and_marked_past_the_cap() {
 
     let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
     // The capture of the first (failing) hop is what gets persisted.
     let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
         .fetch_one(h.pool())
         .await
         .unwrap();
+    support::wait_for_debug(h.pool(), id, std::time::Duration::from_secs(1)).await;
     let dir = support::debug_log_dir(h.pool()).join(id.to_string());
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("resp.meta.json")).unwrap())

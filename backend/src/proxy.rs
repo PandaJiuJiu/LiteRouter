@@ -83,13 +83,14 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
 ///   (UNAUTHORIZED, "invalid or disabled token") — bad/disabled key
 ///   (TOO_MANY_REQUESTS, msg) — rpm or daily-token limit exceeded
 async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, &'static str)> {
-    let row =
-        sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit, accessed_at FROM tokens WHERE key=?")
-            .bind(key)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
-            .ok_or((StatusCode::UNAUTHORIZED, "invalid or disabled token"))?;
+    let row = sqlx::query(
+        "SELECT name, enabled, rpm_limit, daily_token_limit, accessed_at FROM tokens WHERE key=?",
+    )
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
+    .ok_or((StatusCode::UNAUTHORIZED, "invalid or disabled token"))?;
     if row.get::<i64, _>("enabled") != 1 {
         return Err((StatusCode::UNAUTHORIZED, "invalid or disabled token"));
     }
@@ -2027,14 +2028,21 @@ async fn respond_from_upstream(
     };
     let entry = entry_of(attempt.clone(), attempts);
     let ok = attempt.ok;
-    let log_id = log_request(&ctx.state.pool, &entry).await;
-    if should_capture(ctx.state, ok) {
-        let capture = DebugCapture::new();
-        capture.push(&bytes);
-        if let Some(id) = log_id {
-            write_debug_log(&ctx.state.pool, id, &capture).await;
+    // Spawned, not awaited: the fsync-heavy log INSERT and any debug-file
+    // writes must not sit between the client and their response bytes. The
+    // streaming path already logs this way (LogOnEnd::drop).
+    let state_arc = ctx.state_arc.clone();
+    let capture = should_capture(ctx.state, ok).then(|| {
+        let c = DebugCapture::new();
+        c.push(&bytes);
+        c
+    });
+    tokio::spawn(async move {
+        let log_id = log_request(&state_arc.pool, &entry).await;
+        if let (Some(capture), Some(id)) = (capture, log_id) {
+            write_debug_log(&state_arc.pool, id, &capture).await;
         }
-    }
+    });
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
         if let Some(h) = builder.headers_mut() {
@@ -2372,7 +2380,12 @@ async fn relay(
             user_agent: client_info.user_agent.clone(),
             client_aborted: false,
         };
-        let _ = log_request(&state.pool, &entry).await;
+        // Spawned, not awaited: keep DB fsync and file writes off the response
+        // path. We clone `state_arc` so the owned Arc can move into the task.
+        let state_arc2 = state_arc.clone();
+        tokio::spawn(async move {
+            let _ = log_request(&state_arc2.pool, &entry).await;
+        });
         return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
     }
     // Pick the most informative status code:
@@ -2432,15 +2445,20 @@ async fn relay(
         user_agent: client_info.user_agent.clone(),
         client_aborted: false,
     };
-    let log_id = log_request(&state.pool, &entry).await;
-    // Unconditional: a request that exhausted every candidate is exactly the
-    // one an admin will want to investigate, and whether the debug switch was
-    // on when it happened is not something they can retroactively know.
-    if let Some(capture) = last_capture {
-        if let Some(id) = log_id {
-            write_debug_log(&state.pool, id, &capture).await;
+    // Spawned, not awaited: keep DB fsync and file writes off the response
+    // path. We clone `state_arc` so the owned Arc can move into the task.
+    let state_arc2 = state_arc.clone();
+    tokio::spawn(async move {
+        let log_id = log_request(&state_arc2.pool, &entry).await;
+        // Unconditional: a request that exhausted every candidate is exactly the
+        // one an admin will want to investigate, and whether the debug switch was
+        // on when it happened is not something they can retroactively know.
+        if let Some(capture) = last_capture {
+            if let Some(id) = log_id {
+                write_debug_log(&state_arc2.pool, id, &capture).await;
+            }
         }
-    }
+    });
     error_response(protocol, final_status, &err, relay_retry_after.as_deref())
 }
 
