@@ -326,7 +326,7 @@ pub fn set_debug_log_dir_for(pool: &sqlx::SqlitePool, dir: &str) {
         .insert(key, dir.to_string());
 }
 
-fn debug_log_dir_for(pool: &sqlx::SqlitePool) -> String {
+pub fn debug_log_dir_for(pool: &sqlx::SqlitePool) -> String {
     let key = pool_key(pool);
     DEBUG_LOG_DIR_OVERRIDE
         .lock()
@@ -350,29 +350,91 @@ fn pool_key(pool: &sqlx::SqlitePool) -> String {
         .into_owned()
 }
 
-/// Upper bound on a captured response body. A failing upstream can send
+/// Upper bound on a captured body (request or response). A failing upstream can send
 /// anything — an HTML error page, a multi-megabyte dump — and the log detail
 /// page has no use for more than the first chunk of it. Past the cap we stop
 /// accumulating and mark the capture truncated so the reader knows they're
 /// looking at a fragment.
 pub const DEBUG_BODY_MAX: usize = 256 * 1024;
 
-#[derive(Default)]
-struct CaptureInner {
-    bytes: Vec<u8>,
-    /// Total bytes offered to `push`, including the ones dropped past the
-    /// cap — the log page shows "of N bytes" so a truncated capture is
-    /// visibly incomplete rather than silently short.
-    seen: usize,
-    truncated: bool,
+/// Debug request information
+#[derive(Default, Clone)]
+pub struct DebugRequest {
+    pub url: String,
+    pub method: String,
+    pub headers: serde_json::Value,
+    pub body: Vec<u8>,
+    pub body_truncated: bool,
+    pub timestamp: i64,
 }
 
-/// A handle on the upstream response body, filled as it streams past and read
+/// Debug response information
+#[derive(Default, Clone)]
+pub struct DebugResponse {
+    pub status: u16,
+    pub headers: serde_json::Value,
+    pub body: Vec<u8>,
+    pub body_truncated: bool,
+    pub total_bytes: usize,
+    pub timestamp: i64,
+    pub latency_ms: i64,
+}
+
+/// Debug circuit breaker state
+#[derive(Default, Clone)]
+pub struct DebugBreakerState {
+    pub key: String,
+    pub is_open: bool,
+    pub reason: String,
+    pub cooldown_remaining_secs: u64,
+    pub current_backoff_secs: u64,
+}
+
+/// Metadata for the debug log
+#[derive(Default, Clone)]
+pub struct DebugMeta {
+    pub channel_name: String,
+    pub upstream_model: String,
+    pub protocol: String,
+    pub convert_mode: String,
+    pub attempt_number: usize,
+    pub total_attempts: usize,
+    pub client_ip: String,
+    pub user_agent: String,
+    pub token_name: String,
+    pub is_streaming: bool,
+}
+
+/// Snapshot of debug capture for serialization
+#[derive(Clone)]
+pub struct DebugCaptureSnapshot {
+    pub request: Option<DebugRequest>,
+    pub response: Option<DebugResponse>,
+    pub breaker_state: Option<DebugBreakerState>,
+    pub meta: DebugMeta,
+}
+
+/// One captured body plus the metadata `resp.meta.json` records alongside it.
+pub struct DebugCaptureFile {
+    pub request_bytes: Vec<u8>,
+    pub request_truncated: bool,
+    pub response_bytes: Vec<u8>,
+    pub response_truncated: bool,
+}
+
+/// Inner state for DebugCapture, protected by Arc<Mutex> for sharing across
+/// the SSE pump and the log-writing task.
+#[derive(Default)]
+struct CaptureInner {
+    pub request: Option<DebugRequest>,
+    pub response: Option<DebugResponse>,
+    pub breaker_state: Option<DebugBreakerState>,
+    pub meta: DebugMeta,
+}
+
+/// A handle on the upstream request/response, filled as it streams past and read
 /// once the request settles. Cloning shares the buffer, so the SSE pump and
 /// the log-writing task can each hold one.
-///
-/// Deliberately narrow: it captures the **upstream** bytes and nothing else.
-/// The request body is never offered to it — see `write_debug_log`.
 #[derive(Clone, Default)]
 pub struct DebugCapture(Arc<Mutex<CaptureInner>>);
 
@@ -381,74 +443,218 @@ impl DebugCapture {
         Self::default()
     }
 
-    /// Append a chunk. Cheap and non-blocking (a `std::sync::Mutex`, never
-    /// held across an await) so it's safe to call from inside the unfold
-    /// closure driving a live stream.
+    /// Set the request information
+    pub fn set_request(&self, req: DebugRequest) {
+        let mut inner = self.0.lock().unwrap();
+        inner.request = Some(req);
+    }
+
+    /// Set the response information
+    pub fn set_response(&self, resp: DebugResponse) {
+        let mut inner = self.0.lock().unwrap();
+        inner.response = Some(resp);
+    }
+
+    /// Set the breaker state
+    pub fn set_breaker_state(&self, state: DebugBreakerState) {
+        let mut inner = self.0.lock().unwrap();
+        inner.breaker_state = Some(state);
+    }
+
+    /// Set metadata
+    pub fn set_meta(&self, meta: DebugMeta) {
+        let mut inner = self.0.lock().unwrap();
+        inner.meta = meta;
+    }
+
+    /// Push request body chunk (for streaming requests)
+    pub fn push_request_body(&self, chunk: &[u8]) {
+        let mut inner = self.0.lock().unwrap();
+        if let Some(req) = &mut inner.request {
+            let room = DEBUG_BODY_MAX.saturating_sub(req.body.len());
+            if room == 0 {
+                req.body_truncated = true;
+                return;
+            }
+            let take = chunk.len().min(room);
+            req.body.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                req.body_truncated = true;
+            }
+        }
+    }
+
+    /// Push response body chunk
+    pub fn push_response_body(&self, chunk: &[u8]) {
+        let mut inner = self.0.lock().unwrap();
+        if let Some(resp) = &mut inner.response {
+            resp.total_bytes += chunk.len();
+            let room = DEBUG_BODY_MAX.saturating_sub(resp.body.len());
+            if room == 0 {
+                resp.body_truncated = true;
+                return;
+            }
+            let take = chunk.len().min(room);
+            resp.body.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                resp.body_truncated = true;
+            }
+        }
+    }
+
+    /// Get a snapshot of all captured data for writing to disk
+    pub fn snapshot(&self) -> DebugCaptureSnapshot {
+        let inner = self.0.lock().unwrap();
+        DebugCaptureSnapshot {
+            request: inner.request.clone(),
+            response: inner.response.clone(),
+            breaker_state: inner.breaker_state.clone(),
+            meta: inner.meta.clone(),
+        }
+    }
+
+    /// Backward-compatible alias: push response body chunk (same as push_response_body).
+    /// Kept for existing call sites that use `capture.push(&bytes)`.
+    /// If no response was set yet, creates a default one automatically.
     pub fn push(&self, chunk: &[u8]) {
         let mut inner = self.0.lock().unwrap();
-        inner.seen += chunk.len();
-        let room = DEBUG_BODY_MAX.saturating_sub(inner.bytes.len());
-        if room == 0 {
-            inner.truncated = true;
-            return;
+        if inner.response.is_none() {
+            inner.response = Some(DebugResponse {
+                status: 200,
+                headers: serde_json::Value::Object(serde_json::Map::new()),
+                body: Vec::new(),
+                body_truncated: false,
+                total_bytes: 0,
+                timestamp: crate::db::now(),
+                latency_ms: 0,
+            });
         }
-        let take = chunk.len().min(room);
-        inner.bytes.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            inner.truncated = true;
+        if let Some(resp) = &mut inner.response {
+            resp.total_bytes += chunk.len();
+            let room = DEBUG_BODY_MAX.saturating_sub(resp.body.len());
+            if room == 0 {
+                resp.body_truncated = true;
+                return;
+            }
+            let take = chunk.len().min(room);
+            resp.body.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                resp.body_truncated = true;
+            }
         }
-    }
-
-    /// `(captured bytes, total bytes seen, truncated)`.
-    pub fn snapshot(&self) -> (Vec<u8>, usize, bool) {
-        let inner = self.0.lock().unwrap();
-        (inner.bytes.clone(), inner.seen, inner.truncated)
     }
 }
 
-/// One captured body plus the metadata `resp.meta.json` records alongside it.
-pub struct DebugCaptureFile {
-    pub bytes: Vec<u8>,
-    pub truncated: bool,
-}
-
-/// Write the captured **response** body to disk.
+/// Write the captured request/response and metadata to disk.
 ///
-/// The request body is deliberately not written. Migration
-/// `0014_log_details.sql` records the stance — prompts and replies are the
-/// user's private data, and diagnosing a relay fault needs "what did the
-/// upstream actually send", not what we sent it. Not writing it is the
-/// strongest form of that: there is no code path that could leak it.
-///
-/// Files: `data/debug_logs/{log_id}/resp.json` and `resp.meta.json`.
+/// Files: `data/debug_logs/{log_id}/req.json`, `resp.json`, `breaker.json`, `meta.json`.
 /// Errors are swallowed — a diagnostic aid never fails a request.
 pub async fn write_debug_log(pool: &sqlx::SqlitePool, log_id: i64, capture: &DebugCapture) {
-    let (bytes, seen, truncated) = capture.snapshot();
-    if bytes.is_empty() {
+    let snapshot = capture.snapshot();
+
+    // Check if there's anything to write
+    let has_data = snapshot.request.is_some()
+        || snapshot.response.is_some()
+        || snapshot.breaker_state.is_some();
+    if !has_data {
         return;
     }
+
     let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         eprintln!("debug_log: create_dir {} failed: {}", dir, e);
         return;
     }
+
     async fn write(dir: &str, filename: &str, body: &[u8]) {
         let path = format!("{dir}/{filename}");
         if let Err(e) = tokio::fs::write(&path, body).await {
             eprintln!("debug_log: write {} failed: {}", path, e);
         }
     }
-    write(&dir, "resp.json", &bytes).await;
+
+    // Write request if present
+    if let Some(req) = &snapshot.request {
+        write(&dir, "req.json", &req.body).await;
+        let meta = json!({
+            "url": req.url,
+            "method": req.method,
+            "headers": req.headers,
+            "bytes": req.body.len(),
+            "captured": req.body.len(),
+            "truncated": req.body_truncated,
+            "max_bytes": DEBUG_BODY_MAX,
+            "timestamp": req.timestamp,
+        });
+        write(
+            &dir,
+            "req.meta.json",
+            serde_json::to_vec_pretty(&meta)
+                .unwrap_or_default()
+                .as_slice(),
+        )
+        .await;
+    }
+
+    // Write response if present
+    if let Some(resp) = &snapshot.response {
+        write(&dir, "resp.json", &resp.body).await;
+        let meta = json!({
+            "status": resp.status,
+            "headers": resp.headers,
+            "bytes": resp.total_bytes,
+            "captured": resp.body.len(),
+            "truncated": resp.body_truncated,
+            "max_bytes": DEBUG_BODY_MAX,
+            "timestamp": resp.timestamp,
+            "latency_ms": resp.latency_ms,
+        });
+        write(
+            &dir,
+            "resp.meta.json",
+            serde_json::to_vec_pretty(&meta)
+                .unwrap_or_default()
+                .as_slice(),
+        )
+        .await;
+    }
+
+    // Write breaker state if present
+    if let Some(breaker) = &snapshot.breaker_state {
+        let meta = json!({
+            "key": breaker.key,
+            "is_open": breaker.is_open,
+            "reason": breaker.reason,
+            "cooldown_remaining_secs": breaker.cooldown_remaining_secs,
+            "current_backoff_secs": breaker.current_backoff_secs,
+        });
+        write(
+            &dir,
+            "breaker.json",
+            serde_json::to_vec_pretty(&meta)
+                .unwrap_or_default()
+                .as_slice(),
+        )
+        .await;
+    }
+
+    // Write meta
     let meta = json!({
-        "bytes": seen,
-        "captured": bytes.len(),
-        "truncated": truncated,
-        "max_bytes": DEBUG_BODY_MAX,
+        "channel_name": snapshot.meta.channel_name,
+        "upstream_model": snapshot.meta.upstream_model,
+        "protocol": snapshot.meta.protocol,
+        "convert_mode": snapshot.meta.convert_mode,
+        "attempt_number": snapshot.meta.attempt_number,
+        "total_attempts": snapshot.meta.total_attempts,
+        "client_ip": snapshot.meta.client_ip,
+        "user_agent": snapshot.meta.user_agent,
+        "token_name": snapshot.meta.token_name,
+        "is_streaming": snapshot.meta.is_streaming,
         "at": now(),
     });
     write(
         &dir,
-        "resp.meta.json",
+        "meta.json",
         serde_json::to_vec_pretty(&meta)
             .unwrap_or_default()
             .as_slice(),
@@ -456,20 +662,43 @@ pub async fn write_debug_log(pool: &sqlx::SqlitePool, log_id: i64, capture: &Deb
     .await;
 }
 
-/// Read back a previously captured body. `None` when nothing was captured
+/// Read back a previously captured debug log. `None` when nothing was captured
 /// for this log id — which is the normal case, since we only write on failure
 /// or when debug logging is on.
 pub async fn read_debug_log(pool: &sqlx::SqlitePool, log_id: i64) -> Option<DebugCaptureFile> {
     let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
-    let bytes = tokio::fs::read(format!("{dir}/resp.json")).await.ok()?;
-    let truncated = match tokio::fs::read(format!("{dir}/resp.meta.json")).await {
+
+    // Try to read request and response
+    let request_bytes = tokio::fs::read(format!("{dir}/req.json")).await.ok();
+    let response_bytes = tokio::fs::read(format!("{dir}/resp.json")).await.ok();
+
+    // If neither exists, return None
+    if request_bytes.is_none() && response_bytes.is_none() {
+        return None;
+    }
+
+    let request_truncated = match tokio::fs::read(format!("{dir}/req.meta.json")).await {
         Ok(meta) => serde_json::from_slice::<Value>(&meta)
             .ok()
             .and_then(|v| v.get("truncated").and_then(|b| b.as_bool()))
             .unwrap_or(false),
         Err(_) => false,
     };
-    Some(DebugCaptureFile { bytes, truncated })
+
+    let response_truncated = match tokio::fs::read(format!("{dir}/resp.meta.json")).await {
+        Ok(meta) => serde_json::from_slice::<Value>(&meta)
+            .ok()
+            .and_then(|v| v.get("truncated").and_then(|b| b.as_bool()))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+
+    Some(DebugCaptureFile {
+        request_bytes: request_bytes.unwrap_or_default(),
+        request_truncated,
+        response_bytes: response_bytes.unwrap_or_default(),
+        response_truncated,
+    })
 }
 
 /// Whether a debug capture exists for this log id, without reading the body.
@@ -478,9 +707,17 @@ pub async fn read_debug_log(pool: &sqlx::SqlitePool, log_id: i64) -> Option<Debu
 /// round trip that comes back empty.
 pub async fn debug_log_exists(pool: &sqlx::SqlitePool, log_id: i64) -> bool {
     let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
-    tokio::fs::metadata(format!("{dir}/resp.json"))
-        .await
-        .is_ok()
+    // Check for any of the debug log files
+    tokio::fs::metadata(format!("{dir}/req.json")).await.is_ok()
+        || tokio::fs::metadata(format!("{dir}/resp.json"))
+            .await
+            .is_ok()
+        || tokio::fs::metadata(format!("{dir}/breaker.json"))
+            .await
+            .is_ok()
+        || tokio::fs::metadata(format!("{dir}/meta.json"))
+            .await
+            .is_ok()
 }
 
 /// Delete the debug log directory for a given log_id. Idempotent —
@@ -885,6 +1122,7 @@ enum UpstreamBody {
         status: StatusCode,
         content_type: Option<axum::http::HeaderValue>,
         bytes: Bytes,
+        capture: DebugCapture,
     },
     /// Streaming: untouched from where `peek` left off, so the SSE pump can
     /// forward it without buffering. `prefix` holds whatever bytes the peek
@@ -895,6 +1133,7 @@ enum UpstreamBody {
     Live {
         resp: reqwest::Response,
         prefix: Vec<u8>,
+        capture: DebugCapture,
     },
 }
 
@@ -952,6 +1191,13 @@ async fn try_upstream(
     headers: &HeaderMap,
     is_streaming: bool,
 ) -> UpstreamOutcome {
+    let url = if upstream_protocol == "anthropic" {
+        format!("{}/v1/messages", cand.base_url)
+    } else {
+        format!("{}/chat/completions", cand.base_url)
+    };
+    let start_time = tokio::time::Instant::now();
+
     let req = build_request(
         client,
         &cand.base_url,
@@ -959,15 +1205,32 @@ async fn try_upstream(
         upstream_protocol,
         headers,
     )
-    .body(body);
+    .body(body.clone());
+
     match req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
                 if is_streaming {
-                    return upstream_2xx_streaming_peek(resp, status).await;
+                    return upstream_2xx_streaming_peek(
+                        resp,
+                        status,
+                        upstream_protocol,
+                        &url,
+                        &body,
+                        start_time,
+                    )
+                    .await;
                 }
-                return upstream_2xx_buffered(resp, status, upstream_protocol).await;
+                return upstream_2xx_buffered(
+                    resp,
+                    status,
+                    upstream_protocol,
+                    &url,
+                    &body,
+                    start_time,
+                )
+                .await;
             }
             let retry_after_secs = resp
                 .headers()
@@ -1008,7 +1271,14 @@ async fn try_upstream(
 /// The limit is 8 KiB / 1.5 s. Most providers emit `message_start` or the
 /// first chunk within milliseconds; anything slower is unusual enough that
 /// failing over on a guess is more wrong than right.
-async fn upstream_2xx_streaming_peek(mut resp: reqwest::Response, status: u16) -> UpstreamOutcome {
+async fn upstream_2xx_streaming_peek(
+    mut resp: reqwest::Response,
+    status: u16,
+    upstream_protocol: &str,
+    url: &str,
+    request_body: &[u8],
+    start_time: tokio::time::Instant,
+) -> UpstreamOutcome {
     if resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1027,6 +1297,41 @@ async fn upstream_2xx_streaming_peek(mut resp: reqwest::Response, status: u16) -
     }
     let mut buf: Vec<u8> = Vec::new();
     let capture = DebugCapture::new();
+
+    // Set up request info
+    let mut req_headers = serde_json::Map::new();
+    req_headers.insert("content-type".to_string(), json!("application/json"));
+    req_headers.insert("authorization".to_string(), json!("[REDACTED]"));
+    if upstream_protocol == "anthropic" {
+        req_headers.insert("anthropic-version".to_string(), json!("2023-06-01"));
+    }
+    capture.set_request(DebugRequest {
+        url: url.to_string(),
+        method: "POST".to_string(),
+        headers: json!(req_headers),
+        body: request_body.to_vec(),
+        body_truncated: false,
+        timestamp: crate::db::now(),
+    });
+
+    // Set up response info
+    let latency_ms = start_time.elapsed().as_millis() as i64;
+    let mut resp_headers = serde_json::Map::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(val) = v.to_str() {
+            resp_headers.insert(k.to_string(), json!(val));
+        }
+    }
+    capture.set_response(DebugResponse {
+        status,
+        headers: json!(resp_headers),
+        body: Vec::new(),
+        body_truncated: false,
+        total_bytes: 0,
+        timestamp: crate::db::now(),
+        latency_ms,
+    });
+
     const PEEK_MAX: usize = 8 * 1024;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
     loop {
@@ -1039,7 +1344,7 @@ async fn upstream_2xx_streaming_peek(mut resp: reqwest::Response, status: u16) -
         }
         match tokio::time::timeout(remaining, resp.chunk()).await {
             Ok(Ok(Some(bytes))) => {
-                capture.push(&bytes);
+                capture.push_response_body(&bytes);
                 buf.extend_from_slice(&bytes);
                 if let Some(end) = sse_frame_end(&buf) {
                     let frame = &buf[..end];
@@ -1066,28 +1371,11 @@ async fn upstream_2xx_streaming_peek(mut resp: reqwest::Response, status: u16) -
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
-    UpstreamOutcome::Ok(UpstreamBody::Live { resp, prefix: buf })
-}
-
-/// Locate the byte index just past the end of the first complete SSE frame
-/// in `buf`. A frame ends at `\n\n` or `\r\n\r\n`; everything after is the
-/// next frame (or a partial one this function ignores). Returns `None` when
-/// `buf` does not yet contain a full frame boundary, which the caller treats
-/// as "read more".
-fn sse_frame_end(buf: &[u8]) -> Option<usize> {
-    if let Some(pos) = find_subsequence(buf, b"\n\n") {
-        return Some(pos + 2);
-    }
-    find_subsequence(buf, b"\r\n\r\n").map(|pos| pos + 4)
-}
-
-/// Small, dependency-free subsequence search. `memchr` would be faster but
-/// isn't worth a new dep for two calls per stream.
-fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return if needle.is_empty() { Some(0) } else { None };
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
+    UpstreamOutcome::Ok(UpstreamBody::Live {
+        resp,
+        prefix: buf,
+        capture,
+    })
 }
 
 /// A 2xx on a non-streaming request: read it, then check it's actually a
@@ -1096,9 +1384,47 @@ async fn upstream_2xx_buffered(
     resp: reqwest::Response,
     status: u16,
     upstream_protocol: &str,
+    url: &str,
+    request_body: &[u8],
+    start_time: tokio::time::Instant,
 ) -> UpstreamOutcome {
     let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
     let capture = DebugCapture::new();
+    let latency_ms = start_time.elapsed().as_millis() as i64;
+
+    // Set up request info
+    let mut req_headers = serde_json::Map::new();
+    req_headers.insert("content-type".to_string(), json!("application/json"));
+    req_headers.insert("authorization".to_string(), json!("[REDACTED]"));
+    if upstream_protocol == "anthropic" {
+        req_headers.insert("anthropic-version".to_string(), json!("2023-06-01"));
+    }
+    capture.set_request(DebugRequest {
+        url: url.to_string(),
+        method: "POST".to_string(),
+        headers: json!(req_headers),
+        body: request_body.to_vec(),
+        body_truncated: false,
+        timestamp: crate::db::now(),
+    });
+
+    // Set up response info
+    let mut resp_headers = serde_json::Map::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(val) = v.to_str() {
+            resp_headers.insert(k.to_string(), json!(val));
+        }
+    }
+    capture.set_response(DebugResponse {
+        status,
+        headers: json!(resp_headers),
+        body: Vec::new(),
+        body_truncated: false,
+        total_bytes: 0,
+        timestamp: crate::db::now(),
+        latency_ms,
+    });
+
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -1107,7 +1433,7 @@ async fn upstream_2xx_buffered(
             return UpstreamOutcome::Transport(format!("upstream body read failed: {e}"));
         }
     };
-    capture.push(&bytes);
+    capture.push_response_body(&bytes);
     if !body_matches_protocol(&bytes, upstream_protocol) {
         return UpstreamOutcome::InvalidBody {
             status,
@@ -1119,6 +1445,7 @@ async fn upstream_2xx_buffered(
         status: StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
         content_type,
         bytes,
+        capture,
     })
 }
 
@@ -1633,6 +1960,25 @@ const STREAM_ERROR_DETAIL: &str = "upstream error event inside a 200 stream";
 /// capture file.
 const STREAM_TRUNCATED: &str = "upstream closed the stream without a terminator";
 
+/// Find the end of the first complete SSE frame in a byte buffer.
+/// Returns the byte index *after* the frame delimiter (`\n\n` or `\r\n\r\n`),
+/// or `None` if the buffer doesn't yet contain a full frame boundary.
+fn sse_frame_end(buf: &[u8]) -> Option<usize> {
+    if let Some(pos) = find_subsequence(buf, b"\n\n") {
+        return Some(pos + 2);
+    }
+    find_subsequence(buf, b"\r\n\r\n").map(|pos| pos + 4)
+}
+
+/// Small, dependency-free subsequence search. `memchr` would be faster but
+/// isn't worth a new dep for two calls per stream.
+fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return if needle.is_empty() { Some(0) } else { None };
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Is this SSE line the end-of-stream marker its protocol defines?
 ///
 /// Anthropic closes with `message_stop` and OpenAI with a literal `[DONE]`.
@@ -2004,32 +2350,64 @@ async fn respond_from_upstream(
         client_aborted: false,
     };
 
-    let (status, content_type, bytes) = match body {
+    let (status, content_type, bytes, capture) = match body {
         UpstreamBody::Buffered {
             status,
             content_type,
             bytes,
-        } => (status, content_type, bytes),
-        UpstreamBody::Live { resp, prefix } => {
+            capture,
+        } => (status, content_type, bytes, capture),
+        UpstreamBody::Live {
+            resp,
+            prefix,
+            capture,
+        } => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = resp.headers().get("content-type").cloned();
             // This hop ends the request either way — the client gets its
             // response here, whether it succeeded or not.
             let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true);
-            let entry = entry_of(attempt.clone(), attempts);
+            // Clone attempts for entry creation since we need the original for metadata
+            let attempts_for_entry = attempts.clone();
+            let entry = entry_of(attempt.clone(), attempts_for_entry);
             let log = StreamLog {
                 pool: state.pool.clone(),
                 state: ctx.state_arc.clone(),
                 entry,
                 breaker_key: breaker::breaker_key(&cand.name, model),
             };
-            // The bytes the peek already consumed get captured here so the
-            // debug log shows the full stream the upstream actually sent, with
-            // no gap at the start. The pump will *not* re-emit them; only
-            // chunks arriving after the prefix reach the client.
-            let capture = DebugCapture::new();
-            capture.push(&prefix);
+            // The capture from the peek already has request/response info set up.
+            // Just add the prefix bytes and metadata.
+            capture.set_meta(DebugMeta {
+                channel_name: cand.name.clone(),
+                upstream_model: model.to_string(),
+                protocol: ctx.protocol.to_string(),
+                convert_mode: match cand.convert {
+                    ConvertMode::None => "none".to_string(),
+                    ConvertMode::ToOpenAI => "to_openai".to_string(),
+                    ConvertMode::ToAnthropic => "to_anthropic".to_string(),
+                },
+                attempt_number: attempts.len() + 1,
+                total_attempts: attempts.len() + 1,
+                client_ip: ctx.client_info.ip.clone(),
+                user_agent: ctx.client_info.user_agent.clone(),
+                token_name: ctx.token_name.to_string(),
+                is_streaming: ctx.streaming,
+            });
+            // Add breaker state
+            let breaker_key = breaker::breaker_key(&cand.name, model);
+            if let Some((is_open, reason, cooldown, backoff)) =
+                state.breaker.get_key_state(&breaker_key).await
+            {
+                capture.set_breaker_state(DebugBreakerState {
+                    key: breaker_key,
+                    is_open,
+                    reason,
+                    cooldown_remaining_secs: cooldown,
+                    current_backoff_secs: backoff,
+                });
+            }
             let response = match cand.convert {
                 ConvertMode::None => {
                     passthrough_stream(prefix, resp, status, content_type, log, capture.clone())
@@ -2068,21 +2446,51 @@ async fn respond_from_upstream(
     } else {
         bytes.to_vec()
     };
+
+    // Add metadata and breaker state to the capture (which was already set up in upstream_2xx_buffered)
+    let breaker_key = breaker::breaker_key(&cand.name, model);
+    capture.set_meta(DebugMeta {
+        channel_name: cand.name.clone(),
+        upstream_model: model.to_string(),
+        protocol: ctx.protocol.to_string(),
+        convert_mode: match cand.convert {
+            ConvertMode::None => "none".to_string(),
+            ConvertMode::ToOpenAI => "to_openai".to_string(),
+            ConvertMode::ToAnthropic => "to_anthropic".to_string(),
+        },
+        attempt_number: attempts.len() + 1,
+        total_attempts: attempts.len() + 1,
+        client_ip: ctx.client_info.ip.clone(),
+        user_agent: ctx.client_info.user_agent.clone(),
+        token_name: ctx.token_name.to_string(),
+        is_streaming: ctx.streaming,
+    });
+    if let Some((is_open, reason, cooldown, backoff)) =
+        state.breaker.get_key_state(&breaker_key).await
+    {
+        capture.set_breaker_state(DebugBreakerState {
+            key: breaker_key,
+            is_open,
+            reason,
+            cooldown_remaining_secs: cooldown,
+            current_backoff_secs: backoff,
+        });
+    }
+
     let entry = entry_of(attempt.clone(), attempts);
     let ok = attempt.ok;
     // Spawned, not awaited: the fsync-heavy log INSERT and any debug-file
     // writes must not sit between the client and their response bytes. The
     // streaming path already logs this way (LogOnEnd::drop).
     let state_arc = ctx.state_arc.clone();
-    let capture = should_capture(ctx.state, ok).then(|| {
-        let c = DebugCapture::new();
-        c.push(&bytes);
-        c
-    });
+    let capture_clone = capture.clone();
     tokio::spawn(async move {
         let log_id = log_request(&state_arc.pool, &entry).await;
-        if let (Some(capture), Some(id)) = (capture, log_id) {
-            write_debug_log(&state_arc.pool, id, &capture).await;
+        // Only write debug file if should_capture (failure or debug switch on)
+        if should_capture(&state_arc, ok) {
+            if let Some(id) = log_id {
+                write_debug_log(&state_arc.pool, id, &capture_clone).await;
+            }
         }
     });
     let mut builder = Response::builder().status(status);
@@ -2479,6 +2887,13 @@ async fn relay(
         skipped: false,
         usage: None,
     };
+    // Clone values needed for the async log task before moving into entry
+    let token_name_for_log = token_name.clone();
+    let client_info_for_log = client_info.clone();
+    let protocol_for_log = protocol.to_string();
+    let is_streaming_for_log = is_streaming;
+    let last_capture_for_log = last_capture;
+    let state_for_log = state_arc.clone();
     let entry = LogEntry {
         token_name,
         request_model: model,
@@ -2498,7 +2913,40 @@ async fn relay(
         // Unconditional: a request that exhausted every candidate is exactly the
         // one an admin will want to investigate, and whether the debug switch was
         // on when it happened is not something they can retroactively know.
-        if let Some(capture) = last_capture {
+        if let Some(capture) = last_capture_for_log {
+            // Add metadata to the captured debug info
+            let last_attempt = entry.attempts.last().cloned();
+            if let Some(attempt) = last_attempt {
+                let breaker_key =
+                    breaker::breaker_key(&attempt.channel_name, &attempt.upstream_model);
+                capture.set_meta(DebugMeta {
+                    channel_name: attempt.channel_name,
+                    upstream_model: attempt.upstream_model,
+                    protocol: protocol_for_log,
+                    convert_mode: match attempt.convert {
+                        ConvertMode::None => "none".to_string(),
+                        ConvertMode::ToOpenAI => "to_openai".to_string(),
+                        ConvertMode::ToAnthropic => "to_anthropic".to_string(),
+                    },
+                    attempt_number: entry.attempts.len(),
+                    total_attempts: entry.attempts.len(),
+                    client_ip: client_info_for_log.ip.clone(),
+                    user_agent: client_info_for_log.user_agent.clone(),
+                    token_name: token_name_for_log,
+                    is_streaming: is_streaming_for_log,
+                });
+                if let Some((is_open, reason, cooldown, backoff)) =
+                    state_for_log.breaker.get_key_state(&breaker_key).await
+                {
+                    capture.set_breaker_state(DebugBreakerState {
+                        key: breaker_key,
+                        is_open,
+                        reason,
+                        cooldown_remaining_secs: cooldown,
+                        current_backoff_secs: backoff,
+                    });
+                }
+            }
             if let Some(id) = log_id {
                 write_debug_log(&state_arc2.pool, id, &capture).await;
             }
@@ -2971,7 +3419,11 @@ mod tests {
         // and the truncation flag is set as soon as the cap is crossed.
         cap.push(&vec![b'a'; DEBUG_BODY_MAX]);
         cap.push(&[b'b'; 16]);
-        let (bytes, seen, truncated) = cap.snapshot();
+        let snap = cap.snapshot();
+        let resp = snap.response.unwrap();
+        let bytes = resp.body;
+        let seen = resp.total_bytes;
+        let truncated = resp.body_truncated;
         assert_eq!(bytes.len(), DEBUG_BODY_MAX);
         assert!(bytes.iter().all(|&b| b == b'a'));
         assert_eq!(seen, DEBUG_BODY_MAX + 16);
@@ -2982,7 +3434,11 @@ mod tests {
     fn debug_capture_under_the_cap_is_not_marked_truncated() {
         let cap = DebugCapture::new();
         cap.push(b"hello");
-        let (bytes, seen, truncated) = cap.snapshot();
+        let snap = cap.snapshot();
+        let resp = snap.response.unwrap();
+        let bytes = resp.body;
+        let seen = resp.total_bytes;
+        let truncated = resp.body_truncated;
         assert_eq!(bytes, b"hello");
         assert_eq!(seen, 5);
         assert!(!truncated);

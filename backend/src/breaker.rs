@@ -324,6 +324,24 @@ impl Breaker {
         out
     }
 
+    /// Get state for a specific key, for debug logging. Returns None if the
+    /// key is not currently tracked (i.e., the breaker is closed for this key).
+    pub async fn get_key_state(&self, key: &str) -> Option<(bool, String, u64, u64)> {
+        let guard = self.inner.read().await;
+        if let Some(entry) = guard.get(key) {
+            let now = Instant::now();
+            let remain = entry.deadline.saturating_duration_since(now).as_secs();
+            Some((
+                true, // is_open
+                entry.reason.clone(),
+                remain,
+                entry.current_backoff.as_secs(),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Clear every key. Returns the `(channel, target_model)` pairs that were
     /// dropped so the caller (the admin HTTP handler) can append one
     /// `reset_all` history row per pair. Order matches the map's iteration

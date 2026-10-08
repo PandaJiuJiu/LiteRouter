@@ -1321,7 +1321,7 @@ pub async fn get_log(
     })))
 }
 
-/// GET /api/logs/:id/debug — the captured upstream response body for a
+/// GET /api/logs/:id/debug — the full captured debug information for a
 /// request, as written by the relay's debug capture.
 ///
 /// Deliberately its own endpoint rather than a field on `get_log`: the body
@@ -1346,16 +1346,57 @@ pub async fn get_log_debug(
             "available": false,
         })));
     };
-    // Lossy: an upstream can reply with binary or with a truncated UTF-8
-    // sequence. The body is returned as a JSON *string* so the SPA never has
-    // to guess a content type, and replacement chars are visible rather than
-    // silently decoding into something that looks valid.
+
+    // Read all debug log files
+    let dir = format!("{}/{}", proxy::debug_log_dir_for(&state.pool), id);
+
+    // Helper to read and parse JSON file
+    async fn read_json_file(path: &str) -> Option<Value> {
+        tokio::fs::read(path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    }
+
+    // Read request
+    let request = if let Ok(req_body) = tokio::fs::read(format!("{dir}/req.json")).await {
+        let meta = read_json_file(&format!("{dir}/req.meta.json")).await;
+        Some(json!({
+            "body": String::from_utf8_lossy(&req_body),
+            "bytes": req_body.len(),
+            "truncated": file.request_truncated,
+            "meta": meta.unwrap_or(json!({})),
+        }))
+    } else {
+        None
+    };
+
+    // Read response
+    let response = if let Ok(resp_body) = tokio::fs::read(format!("{dir}/resp.json")).await {
+        let meta = read_json_file(&format!("{dir}/resp.meta.json")).await;
+        Some(json!({
+            "body": String::from_utf8_lossy(&resp_body),
+            "bytes": resp_body.len(),
+            "truncated": file.response_truncated,
+            "meta": meta.unwrap_or(json!({})),
+        }))
+    } else {
+        None
+    };
+
+    // Read breaker state
+    let breaker = read_json_file(&format!("{dir}/breaker.json")).await;
+
+    // Read meta
+    let meta = read_json_file(&format!("{dir}/meta.json")).await;
+
     Ok(Json(json!({
         "log_id": id,
         "available": true,
-        "bytes": file.bytes.len(),
-        "truncated": file.truncated,
-        "body": String::from_utf8_lossy(&file.bytes),
+        "request": request,
+        "response": response,
+        "breaker": breaker,
+        "meta": meta.unwrap_or(json!({})),
     })))
 }
 

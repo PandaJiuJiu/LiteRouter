@@ -74,7 +74,7 @@ beforeEach(() => {
 function findLoadButton(w) {
   const buttons = w.findAll('button')
   return (
-    buttons.find((b) => /Show captured response|查看捕获到的响应/.test(b.text())) ||
+    buttons.find((b) => /Show captured debug info|查看捕获到的调试信息/.test(b.text())) ||
     buttons.find((b) => b.classes('debug-reload')) ||
     buttons[buttons.length - 1]
   )
@@ -87,7 +87,7 @@ describe('LogDetail — captured upstream response', () => {
     await flushPromises()
     // Not just the body — the button goes with it, so a request that captured
     // nothing doesn't leave a dead control behind.
-    expect(w.text()).not.toMatch(/Show captured response|查看捕获到的响应/)
+    expect(w.text()).not.toMatch(/Show captured debug info|查看捕获到的调试信息/)
     expect(w.find('pre.debug-body').exists()).toBe(false)
     // And nothing was fetched to find that out.
     expect(getLogDebug).not.toHaveBeenCalled()
@@ -96,7 +96,7 @@ describe('LogDetail — captured upstream response', () => {
   it('shows just the button, no heading or explainer, when a capture exists', async () => {
     const w = await mountDetail()
     await flushPromises()
-    expect(w.text()).toMatch(/Show captured response|查看捕获到的响应/)
+    expect(w.text()).toMatch(/Show captured debug info|查看捕获到的调试信息/)
     // Nothing narrates the section — the button says it all.
     expect(w.text()).not.toMatch(/Captured upstream response|捕获到的上游响应/)
     expect(w.text()).not.toMatch(/Only the upstream response body is recorded|仅记录上游响应体/)
@@ -106,46 +106,64 @@ describe('LogDetail — captured upstream response', () => {
     getLogDebug.mockResolvedValue({ log_id: 7, available: false })
     const w = await mountDetail()
     await flushPromises()
-    expect(w.text()).toMatch(/Show captured response|查看捕获到的响应/)
+    expect(w.text()).toMatch(/Show captured debug info|查看捕获到的调试信息/)
     // Body is not rendered yet — the button is.
     expect(w.find('pre.debug-body').exists()).toBe(false)
   })
 
-  it('renders available:true as JSON when the body parses', async () => {
+  it('renders available:true as JSON when the response body parses', async () => {
     getLogDebug.mockResolvedValue({
       log_id: 7,
       available: true,
-      bytes: 64,
-      truncated: false,
-      body: '{"error":{"message":"upstream node is down"}}',
+      request: null,
+      response: {
+        body: '{"error":{"message":"upstream node is down"}}',
+        bytes: 64,
+        truncated: false,
+        meta: { status: 500 },
+        pretty: JSON.stringify({ error: { message: 'upstream node is down' } }, null, 2),
+        parseError: false,
+      },
+      breaker: null,
+      meta: {},
     })
     const w = await mountDetail()
     await flushPromises()
-    await w.find('button.debug-reload, button').trigger('click').catch(() => {})
-    // Fallback: directly invoke the loader via component (avoids the
-    // Element Plus button-text quirk in jsdom).
     await findLoadButton(w).trigger('click')
     await flushPromises()
-    const pre = w.find('pre.debug-body')
-    expect(pre.exists()).toBe(true)
+    // Should find the response body pre tag
+    const pres = w.findAll('pre.debug-body')
+    expect(pres.length).toBeGreaterThan(0)
+    const pre = pres[pres.length - 1] // last one is response body
     expect(pre.text()).toContain('upstream node is down')
     // Pretty-printed JSON has indentation.
     expect(pre.text()).toMatch(/\n\s+/)
   })
 
-  it('renders available:true verbatim when the body is not JSON', async () => {
+  it('renders available:true verbatim when the response body is not JSON', async () => {
     getLogDebug.mockResolvedValue({
       log_id: 7,
       available: true,
-      bytes: 13,
-      truncated: false,
-      body: '<html>oops</html>',
+      request: null,
+      response: {
+        body: '<html>oops</html>',
+        bytes: 13,
+        truncated: false,
+        meta: { status: 200 },
+        pretty: '<html>oops</html>',
+        parseError: true,
+      },
+      breaker: null,
+      meta: {},
     })
     const w = await mountDetail()
     await flushPromises()
     await findLoadButton(w).trigger('click')
     await flushPromises()
-    expect(w.find('pre.debug-body').text()).toContain('<html>oops</html>')
+    const pres = w.findAll('pre.debug-body')
+    expect(pres.length).toBeGreaterThan(0)
+    const pre = pres[pres.length - 1]
+    expect(pre.text()).toContain('<html>oops</html>')
     expect(w.text()).toMatch(/Could not format the body as JSON|无法格式化为 JSON/)
   })
 
@@ -153,9 +171,17 @@ describe('LogDetail — captured upstream response', () => {
     getLogDebug.mockResolvedValue({
       log_id: 7,
       available: true,
-      bytes: 300000,
-      truncated: true,
-      body: '{"partial":true}',
+      request: null,
+      response: {
+        body: '{"partial":true}',
+        bytes: 300000,
+        truncated: true,
+        meta: { status: 200 },
+        pretty: '{"partial":true}',
+        parseError: false,
+      },
+      breaker: null,
+      meta: {},
     })
     const w = await mountDetail()
     await flushPromises()
@@ -184,5 +210,87 @@ describe('LogDetail — captured upstream response', () => {
     // No throw, and the failure is visible.
     expect(w.text()).toContain('boom')
     expect(w.find('pre.debug-body').exists()).toBe(false)
+  })
+
+  it('shows request section when request is present', async () => {
+    getLogDebug.mockResolvedValue({
+      log_id: 7,
+      available: true,
+      request: {
+        body: '{"model":"gpt-4o"}',
+        bytes: 20,
+        truncated: false,
+        meta: { url: 'https://api.example.com/v1/chat/completions', method: 'POST' },
+        pretty: '{\n  "model": "gpt-4o"\n}',
+        parseError: false,
+      },
+      response: null,
+      breaker: null,
+      meta: {},
+    })
+    const w = await mountDetail()
+    await flushPromises()
+    await findLoadButton(w).trigger('click')
+    await flushPromises()
+    expect(w.text()).toMatch(/Upstream Request|上游请求/)
+    expect(w.text()).toContain('https://api.example.com/v1/chat/completions')
+    const pres = w.findAll('pre.debug-body')
+    expect(pres.length).toBeGreaterThan(0)
+    expect(pres[0].text()).toContain('gpt-4o')
+  })
+
+  it('shows breaker section when breaker state is present', async () => {
+    getLogDebug.mockResolvedValue({
+      log_id: 7,
+      available: true,
+      request: null,
+      response: null,
+      breaker: {
+        key: 'channel1:gpt-4o',
+        is_open: true,
+        reason: 'too many 5xx',
+        cooldown_remaining_secs: 60,
+        current_backoff_secs: 120,
+      },
+      meta: {},
+    })
+    const w = await mountDetail()
+    await flushPromises()
+    await findLoadButton(w).trigger('click')
+    await flushPromises()
+    expect(w.text()).toMatch(/Circuit Breaker State|熔断器状态/)
+    expect(w.text()).toContain('channel1:gpt-4o')
+    expect(w.text()).toMatch(/yes|是/)
+    expect(w.text()).toContain('too many 5xx')
+  })
+
+  it('shows meta section when meta is present', async () => {
+    getLogDebug.mockResolvedValue({
+      log_id: 7,
+      available: true,
+      request: null,
+      response: null,
+      breaker: null,
+      meta: {
+        channel_name: 'test-channel',
+        upstream_model: 'gpt-4o',
+        protocol: 'openai',
+        convert_mode: 'openai_to_anthropic',
+        attempt_number: 1,
+        total_attempts: 3,
+        client_ip: '1.2.3.4',
+        user_agent: 'test-agent',
+        token_name: 'test-token',
+        is_streaming: false,
+        at: 1717000000,
+      },
+    })
+    const w = await mountDetail()
+    await flushPromises()
+    await findLoadButton(w).trigger('click')
+    await flushPromises()
+    expect(w.text()).toMatch(/Metadata|元数据/)
+    expect(w.text()).toContain('test-channel')
+    expect(w.text()).toContain('1 / 3')
   })
 })

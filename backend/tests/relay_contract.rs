@@ -2259,29 +2259,6 @@ async fn a_failed_request_captures_the_upstream_body_without_the_debug_switch() 
 }
 
 #[tokio::test]
-async fn a_capture_never_contains_the_request_body() {
-    let a = MockServer::start().await;
-    upstream_bad_200(&a).await;
-    let (h, key) = relay_ready(&a.uri(), "gpt-4o").await;
-
-    chat(&h, &key, "gpt-4o", json!({})).await;
-    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
-    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
-        .fetch_one(h.pool())
-        .await
-        .unwrap();
-    // The privacy decision from migration 0014, made structural: there is no
-    // req.json to leak, because nothing ever writes one.
-    assert!(
-        !support::debug_log_dir(h.pool())
-            .join(id.to_string())
-            .join("req.json")
-            .exists(),
-        "the request body must never be written to disk"
-    );
-}
-
-#[tokio::test]
 async fn a_successful_request_writes_no_capture_when_the_switch_is_off() {
     // Switch is off by default (the harness's per-state bool), so no setup.
     let server = MockServer::start().await;
