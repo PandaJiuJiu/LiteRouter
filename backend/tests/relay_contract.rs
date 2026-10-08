@@ -1075,6 +1075,99 @@ async fn the_anthropic_version_header_is_forwarded_to_the_upstream() {
     );
 }
 
+// ===================== upstream thinking =====================
+
+/// A channel speaking Anthropic natively, returning a minimal message.
+async fn anthropic_upstream_ok(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "content": [], "stop_reason": "end_turn"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A harness whose single channel is Anthropic-only.
+async fn anthropic_ready(base_url: &str, model: &str) -> (Harness, String) {
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", "", base_url, model, true).await;
+    (h, token.key)
+}
+
+#[tokio::test]
+async fn an_anthropic_upstream_is_told_not_to_think() {
+    // The whole reason this exists: Claude Code's auxiliary calls (its
+    // Bash-safety classifier among them) have to come back inside a tight
+    // `max_tokens`, and a model that thinks unconditionally spends that budget
+    // on reasoning and returns an empty message. See `disable_upstream_thinking`.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    anthropic_chat(&h, &key, "claude-x", json!({})).await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["thinking"], json!({ "type": "disabled" }));
+}
+
+#[tokio::test]
+async fn an_openai_upstream_is_told_not_to_think() {
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    chat(&h, &key, "gpt-4o", json!({})).await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["enable_thinking"], json!(false));
+}
+
+#[tokio::test]
+async fn a_client_that_asked_for_thinking_keeps_it() {
+    // Overriding an explicit request would silently change what the caller
+    // billed for and what it sees in the transcript.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    anthropic_chat(
+        &h,
+        &key,
+        "claude-x",
+        json!({ "thinking": { "type": "enabled", "budget_tokens": 1024 } }),
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["thinking"]["type"], "enabled");
+    assert_eq!(sent["thinking"]["budget_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn the_flag_reaches_an_upstream_reached_by_conversion() {
+    // Protocol conversion rebuilds the body from scratch, so the flag has to
+    // be applied after the rebuild — not before it, or it is simply lost.
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    anthropic_chat(&h, &key, "gpt-4o", json!({})).await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["enable_thinking"], json!(false));
+}
+
 // ===================== client info =====================
 
 #[tokio::test]

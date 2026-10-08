@@ -771,6 +771,48 @@ fn error_response(
     resp
 }
 
+/// Did the client explicitly ask for extended thinking on this request?
+///
+/// Only the Anthropic wire format can express it (`thinking: {"type":
+/// "enabled", …}`); an OpenAI-format client has no way to, so it always
+/// counts as "not asked".
+fn client_asked_for_thinking(req: &Value) -> bool {
+    req.get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("enabled")
+}
+
+/// Ask the upstream not to think, in whatever dialect its protocol uses.
+///
+/// Claude Code fires short auxiliary calls against the same model alias as
+/// the conversation — the Bash-safety classifier in auto mode is the one we
+/// could watch failing — and cancels the request when they don't answer in
+/// time. A gateway only ever sees that as `client_aborted`: a 200 with zero
+/// tokens, typically after 20-40s. Against a model that thinks
+/// unconditionally the call is unwinnable twice over: the reasoning eats the
+/// caller's entire `max_tokens`, so the reply comes back with an empty
+/// message *and* it arrives far too late. u2-flash does exactly this — a
+/// one-word "is this safe?" question returns `content: null`,
+/// `finish_reason: "length"` and 24 seconds later.
+///
+/// Not asking costs nothing on models that don't think and is the whole
+/// difference on the ones that do, so it is applied unconditionally. There
+/// is deliberately no setting for it yet; a channel-level or settings-level
+/// opt-out is the obvious follow-up if a provider ever needs thinking back.
+///
+/// Known limitation: `enable_thinking` is not part of the OpenAI schema.
+/// The relays we talk to ignore unknown fields (verified against OpenRouter
+/// and minimax), but api.openai.com itself answers 400 to one. A channel
+/// that must not receive it needs that opt-out before it can be added here.
+fn disable_upstream_thinking(body: &mut Value, upstream_protocol: &str) {
+    if upstream_protocol == "anthropic" {
+        body["thinking"] = json!({ "type": "disabled" });
+    } else {
+        body["enable_thinking"] = json!(false);
+    }
+}
+
 /// Build the upstream request with auth + protocol-appropriate headers. The
 /// caller still owns the body, so this is just a header recipe.
 /// `upstream_protocol` is the protocol the upstream actually speaks (which
@@ -2179,7 +2221,7 @@ async fn relay(
                 ConvertMode::ToAnthropic => "anthropic",
                 ConvertMode::None => protocol,
             };
-            let body_json = match cand.convert {
+            let mut body_json = match cand.convert {
                 ConvertMode::None => {
                     let mut b = req_json.clone();
                     b["model"] = json!(target_model);
@@ -2190,6 +2232,9 @@ async fn relay(
                     convert::openai_req_to_anthropic(&req_json, target_model)
                 }
             };
+            if !client_asked_for_thinking(&req_json) {
+                disable_upstream_thinking(&mut body_json, upstream_protocol);
+            }
             let target_body = serde_json::to_vec(&body_json).unwrap_or_else(|_| body.to_vec());
             // Breaker gate: skip this (channel, model) without burning a
             // network call while it's OPEN. Recorded as a hop so the log
