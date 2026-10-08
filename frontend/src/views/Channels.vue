@@ -4,7 +4,7 @@
       <span>{{ t('channels.description') }}</span>
       <el-button type="primary" @click="openDialog()">{{ t('channels.add') }}</el-button>
     </div>
-    <el-table :data="channels" v-loading="loading">
+    <el-table :data="sortedChannels" v-loading="loading">
       <el-table-column prop="name" :label="t('channels.col.name')" width="180">
         <template #default="{ row }">
           <a v-if="row.website" :href="row.website" target="_blank" rel="noopener"
@@ -88,7 +88,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
@@ -99,6 +99,11 @@ const { t } = useI18n()
 
 const channels = ref([])
 const loading = ref(false)
+// Disabled channels sink to the bottom; Array.sort is stable, so the backend's
+// id-DESC order survives within each group.
+const sortedChannels = computed(() =>
+  [...channels.value].sort((a, b) => (a.enabled ? 0 : 1) - (b.enabled ? 0 : 1)),
+)
 const dialogVisible = ref(false)
 const editing = ref(null)
 const form = ref({ name: '', website: '', base_url: '', base_url_anthropic: '', api_key: '', models: '', enabled: true, use_proxy: false })

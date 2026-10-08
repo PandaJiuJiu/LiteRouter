@@ -486,7 +486,10 @@ async function load() {
   loading.value = true
   try {
     const all = await listChannels()
-    channels.value = channelId.value ? all.filter((c) => c.id === channelId.value) : all
+    const list = channelId.value ? all.filter((c) => c.id === channelId.value) : all
+    // Disabled channels sink to the bottom; Array.sort is stable, so the
+    // backend's id-DESC order survives within each group.
+    channels.value = [...list].sort((a, b) => (a.enabled ? 0 : 1) - (b.enabled ? 0 : 1))
     // seed known list from enabled ∪ disabled so disabled cards survive refresh
     for (const ch of channels.value) {
       rememberModels(ch.id, [
