@@ -84,7 +84,7 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
 ///   (TOO_MANY_REQUESTS, msg) — rpm or daily-token limit exceeded
 async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, &'static str)> {
     let row =
-        sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit FROM tokens WHERE key=?")
+        sqlx::query("SELECT name, enabled, rpm_limit, daily_token_limit, accessed_at FROM tokens WHERE key=?")
             .bind(key)
             .fetch_optional(&state.pool)
             .await
@@ -128,11 +128,17 @@ async fn auth_token(state: &AppState, key: &str) -> Result<String, (StatusCode, 
         }
     }
 
-    let _ = sqlx::query("UPDATE tokens SET accessed_at=? WHERE key=?")
-        .bind(now())
-        .bind(key)
-        .execute(&state.pool)
-        .await;
+    // Update accessed_at at most once per minute to avoid write contention
+    // on the hot path. The UI only needs "recently used" granularity.
+    let accessed_at: i64 = row.get("accessed_at");
+    let now_ts = now();
+    if now_ts - accessed_at >= 60 {
+        let _ = sqlx::query("UPDATE tokens SET accessed_at=? WHERE key=?")
+            .bind(now_ts)
+            .bind(key)
+            .execute(&state.pool)
+            .await;
+    }
     Ok(name)
 }
 
@@ -2021,12 +2027,12 @@ async fn respond_from_upstream(
     };
     let entry = entry_of(attempt.clone(), attempts);
     let ok = attempt.ok;
-    let log_id = log_request(&state.pool, &entry).await;
-    if should_capture(state, ok) {
+    let log_id = log_request(&ctx.state.pool, &entry).await;
+    if should_capture(ctx.state, ok) {
         let capture = DebugCapture::new();
         capture.push(&bytes);
         if let Some(id) = log_id {
-            write_debug_log(&state.pool, id, &capture).await;
+            write_debug_log(&ctx.state.pool, id, &capture).await;
         }
     }
     let mut builder = Response::builder().status(status);

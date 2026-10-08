@@ -1,8 +1,9 @@
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
 /// PBKDF2-HMAC-SHA256, 100k iterations (OWASP 2023 minimum), 32-byte output.
 const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -13,10 +14,14 @@ const SALT_LEN: usize = 16;
 /// in `backend/migrations/*.sql` and is owned by sqlx::migrate!; this
 /// function should not contain any inline `CREATE TABLE` / `ALTER TABLE`.
 pub async fn init_pool(path: &str) -> SqlitePool {
-    let url = format!("sqlite:{}?mode=rwc", path);
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", path))
+        .expect("invalid sqlite path")
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(30));
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
+        .max_connections(10)
+        .connect_with(opts)
         .await
         .expect("failed to open sqlite database");
 
