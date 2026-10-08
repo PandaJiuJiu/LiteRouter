@@ -16,6 +16,7 @@ pub mod config_backup;
 pub mod config_backup_routes;
 pub mod convert;
 pub mod db;
+pub mod mappings;
 pub mod probe;
 pub mod proxy;
 pub mod settings;

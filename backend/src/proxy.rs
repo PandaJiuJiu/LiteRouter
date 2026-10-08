@@ -17,6 +17,7 @@
 //! (channel, model) incompatibilities, not transient health issues.
 
 use crate::admin;
+use crate::mappings;
 use crate::breaker::{self, Outcome};
 use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
 use crate::convert::{self, ConvertMode, SseConverter};
@@ -226,7 +227,7 @@ async fn resolve_targets(state: &AppState, alias: &str) -> Vec<(String, String)>
             .await
             .unwrap_or(None);
     let base = match row {
-        Some((targets, fallback)) => admin::parse_targets(&targets, &fallback),
+        Some((targets, fallback)) => mappings::parse_targets(&targets, &fallback),
         None => Vec::new(),
     };
     let mut out: Vec<(String, String)> = Vec::new();

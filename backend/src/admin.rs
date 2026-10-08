@@ -1,10 +1,11 @@
 use crate::auth::{check_auth, require_admin, AuthUser};
 use crate::db::{self, now};
+use crate::mappings::{deserialize_targets, encode_targets, parse_targets, clean_targets};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
@@ -678,77 +679,9 @@ pub async fn delete_token(
 #[derive(Deserialize)]
 pub struct MappingReq {
     pub alias: String,
-    /// ordered list of routing targets, tried in array order
-    pub targets: Vec<TargetEntry>,
-}
-
-/// One routing target: an upstream model, optionally pinned to a channel.
-/// Stored in the `targets` column as a JSON array of these objects. Legacy
-/// rows (plain model-name strings) are accepted and read as unpinned.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TargetEntry {
-    Obj {
-        /// empty = any channel serving this model
-        #[serde(default)]
-        channel: String,
-        /// upstream model id; "*" means every model on the pinned channel
-        model: String,
-    },
-    Str(String),
-}
-
-impl TargetEntry {
-    fn normalize(entry: TargetEntry, out: &mut Vec<(String, String)>) {
-        let (channel, model) = match entry {
-            TargetEntry::Obj { channel, model } => {
-                (channel.trim().to_string(), model.trim().to_string())
-            }
-            TargetEntry::Str(s) => (String::new(), s.trim().to_string()),
-        };
-        // a wildcard needs a channel to expand against
-        if model.is_empty() || (model == "*" && channel.is_empty()) {
-            return;
-        }
-        if !out.iter().any(|(c, m)| c == &channel && m == &model) {
-            out.push((channel, model));
-        }
-    }
-}
-
-/// Parse the JSON-array `targets` column into ordered (channel, model)
-/// pairs; fall back to the legacy single `target_model` column when the row
-/// predates the migration. An empty channel means "any channel".
-pub fn parse_targets(targets: &str, fallback: &str) -> Vec<(String, String)> {
-    let entries: Vec<TargetEntry> = serde_json::from_str(targets).unwrap_or_default();
-    let mut out: Vec<(String, String)> = Vec::new();
-    for e in entries {
-        TargetEntry::normalize(e, &mut out);
-    }
-    if out.is_empty() && !fallback.trim().is_empty() {
-        out.push((String::new(), fallback.trim().to_string()));
-    }
-    out
-}
-
-/// Serialize normalized targets back into the stored JSON form.
-pub fn encode_targets(targets: &[(String, String)]) -> String {
-    let entries: Vec<TargetEntry> = targets
-        .iter()
-        .map(|(channel, model)| TargetEntry::Obj {
-            channel: channel.clone(),
-            model: model.clone(),
-        })
-        .collect();
-    serde_json::to_string(&entries).unwrap_or_default()
-}
-
-fn clean_targets(raw: &[TargetEntry]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for e in raw {
-        TargetEntry::normalize(e.clone(), &mut out);
-    }
-    out
+    /// ordered list of routing targets; accepts both string (`["gpt-4o"]`) and
+    /// object (`[{model:"gpt-4o",channel:""}]`) forms via [`deserialize_targets`]
+    pub targets: serde_json::Value,
 }
 
 pub async fn list_mappings(
@@ -784,7 +717,7 @@ pub async fn create_mapping(
     Json(req): Json<MappingReq>,
 ) -> Result<Json<Value>, StatusCode> {
     require_admin(&state, &headers)?;
-    let targets = clean_targets(&req.targets);
+    let targets = clean_targets(&deserialize_targets(req.targets));
     if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -815,7 +748,7 @@ pub async fn update_mapping(
     Json(req): Json<MappingReq>,
 ) -> Result<Json<Value>, StatusCode> {
     require_admin(&state, &headers)?;
-    let targets = clean_targets(&req.targets);
+    let targets = clean_targets(&deserialize_targets(req.targets));
     if req.alias.trim().is_empty() || targets.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }

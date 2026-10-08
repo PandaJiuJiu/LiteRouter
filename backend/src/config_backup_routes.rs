@@ -18,10 +18,10 @@
 //! and `tokens.key` in the clear inside the ciphertext; handing it to a
 //! non-admin would defeat the point of the passphrase.
 
-use crate::admin::{encode_targets, parse_targets};
 use crate::auth::{check_auth, AuthUser};
 use crate::config_backup::{BackupPayload, ChannelRow, MappingRow, MappingTarget, TokenRow};
 use crate::db::now;
+use crate::mappings::{encode_targets, parse_targets};
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
