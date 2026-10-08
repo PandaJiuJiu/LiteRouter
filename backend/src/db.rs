@@ -1,5 +1,6 @@
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
+use serde::Deserialize;
 use sha2::Sha256;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
@@ -159,4 +160,22 @@ pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>,
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|(v,)| v))
+}
+
+/// Deserialize a proxy flag that may arrive as 0/1 (integer) or true/false
+/// (boolean). SQLite stores it as integer; the frontend sends both forms.
+pub fn deserialize_use_proxy<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ProxyVal {
+        Bool(bool),
+        Int(i64),
+    }
+    match ProxyVal::deserialize(deserializer)? {
+        ProxyVal::Bool(b) => Ok(b),
+        ProxyVal::Int(i) => Ok(i != 0),
+    }
 }

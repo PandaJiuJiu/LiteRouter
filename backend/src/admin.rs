@@ -122,7 +122,7 @@ pub struct ChannelReq {
     pub enabled: bool,
     /// Whether to use the global proxy for this channel. Default false.
     /// Accepts 0/1 or true/false from the frontend (DB stores integer).
-    #[serde(default, deserialize_with = "deserialize_use_proxy")]
+    #[serde(default, deserialize_with = "db::deserialize_use_proxy")]
     pub use_proxy: bool,
 }
 fn default_true() -> bool {
@@ -138,7 +138,7 @@ pub struct FetchModelsReq {
     pub api_key: String,
     /// Whether to use the global proxy for this test. Default false.
     /// Accepts 0/1 or true/false from the frontend (DB stores integer).
-    #[serde(default, deserialize_with = "deserialize_use_proxy")]
+    #[serde(default, deserialize_with = "db::deserialize_use_proxy")]
     pub use_proxy: bool,
 }
 
@@ -152,24 +152,8 @@ pub struct TestModelReq {
     pub model: String,
     /// Whether to use the global proxy for this test. Default false.
     /// Accepts 0/1 or true/false from the frontend (DB stores integer).
-    #[serde(default, deserialize_with = "deserialize_use_proxy")]
+    #[serde(default, deserialize_with = "db::deserialize_use_proxy")]
     pub use_proxy: bool,
-}
-
-fn deserialize_use_proxy<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ProxyVal {
-        Bool(bool),
-        Int(i64),
-    }
-    match ProxyVal::deserialize(deserializer)? {
-        ProxyVal::Bool(b) => Ok(b),
-        ProxyVal::Int(i) => Ok(i != 0),
-    }
 }
 
 /// Body for `POST /api/channels/:id/models` — set the enabled + disabled
