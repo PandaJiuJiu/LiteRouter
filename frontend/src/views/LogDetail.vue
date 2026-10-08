@@ -91,145 +91,6 @@
         </p>
       </section>
 
-      <!-- 捕获到的上游响应体。不讲前情——有捕获就只有一个按钮，点开才是
-           那一大段。整段挂在 log.has_debug 上（get_log 里一次 stat），所以
-           没捕获的请求连按钮都不出现。 -->
-      <section v-if="log.has_debug">
-        <div v-if="debug.loading" class="hint">{{ t('common.loading') }}</div>
-        <div v-else-if="debug.error" class="hint">
-          {{ t('common.error') }}: {{ debug.error }}
-        </div>
-        <div v-else-if="debug.data === null">
-          <el-button @click="loadDebug" size="small" :disabled="loading">
-            {{ t('logDetail.debugLoad') }}
-          </el-button>
-        </div>
-        <template v-else-if="debug.data.available">
-          <!-- Request section -->
-          <template v-if="debug.data.request">
-            <h3>{{ t('logDetail.debugSectionRequest') }}</h3>
-            <el-descriptions :column="1" border size="small" class="debug-meta">
-              <el-descriptions-item :label="t('logDetail.debug_meta_url')">
-                {{ debug.data.request.meta.url }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_method')">
-                {{ debug.data.request.meta.method }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_bytes')">
-                {{ debug.data.request.bytes.toLocaleString() }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_captured')">
-                {{ debug.data.request.bytes.toLocaleString() }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_truncated')">
-                {{ debug.data.request.truncated ? t('logDetail.yes') : t('logDetail.no') }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_timestamp')">
-                {{ formatTime(debug.data.request.meta.timestamp) }}
-              </el-descriptions-item>
-            </el-descriptions>
-            <div class="debug-body-section">
-              <h4>{{ t('logDetail.debugSectionRequestBody') }}</h4>
-              <pre class="debug-body"><code>{{ debug.data.request.pretty }}</code></pre>
-            </div>
-          </template>
-
-          <!-- Response section -->
-          <template v-if="debug.data.response">
-            <h3>{{ t('logDetail.debugSectionResponse') }}</h3>
-            <el-descriptions :column="1" border size="small" class="debug-meta">
-              <el-descriptions-item :label="t('logDetail.debug_meta_status')">
-                {{ debug.data.response.meta.status }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_bytes')">
-                {{ debug.data.response.bytes.toLocaleString() }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_captured')">
-                {{ debug.data.response.bytes.toLocaleString() }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_truncated')">
-                {{ debug.data.response.truncated ? t('logDetail.yes') : t('logDetail.no') }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_timestamp')">
-                {{ formatTime(debug.data.response.meta.timestamp) }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_latency')">
-                {{ debug.data.response.meta.latency_ms }} ms
-              </el-descriptions-item>
-            </el-descriptions>
-            <div class="debug-body-section">
-              <h4>{{ t('logDetail.debugSectionResponseBody') }}</h4>
-              <pre class="debug-body"><code>{{ debug.data.response.pretty }}</code></pre>
-              <p v-if="debug.data.response.parseError" class="hint">{{ t('logDetail.debugParseError') }}</p>
-            </div>
-          </template>
-
-          <!-- Breaker state section -->
-          <template v-if="debug.data.breaker">
-            <h3>{{ t('logDetail.debugSectionBreaker') }}</h3>
-            <el-descriptions :column="1" border size="small" class="debug-meta">
-              <el-descriptions-item :label="t('logDetail.debug_meta_breaker_key')">
-                {{ debug.data.breaker.key }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_breaker_open')">
-                {{ debug.data.breaker.is_open ? t('logDetail.yes') : t('logDetail.no') }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_breaker_reason')">
-                {{ debug.data.breaker.reason }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_breaker_cooldown')">
-                {{ debug.data.breaker.cooldown_remaining_secs }}s
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_breaker_backoff')">
-                {{ debug.data.breaker.current_backoff_secs }}s
-              </el-descriptions-item>
-            </el-descriptions>
-          </template>
-
-          <!-- Meta section -->
-          <template v-if="debug.data.meta && Object.keys(debug.data.meta).length > 0">
-            <h3>{{ t('logDetail.debugSectionMeta') }}</h3>
-            <el-descriptions :column="1" border size="small" class="debug-meta">
-              <el-descriptions-item :label="t('logDetail.debug_meta_channel')">
-                {{ debug.data.meta.channel_name || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_upstream_model')">
-                {{ debug.data.meta.upstream_model || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_protocol')">
-                {{ debug.data.meta.protocol || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_convert_mode')">
-                {{ debug.data.meta.convert_mode || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_attempt')">
-                {{ debug.data.meta.attempt_number }} / {{ debug.data.meta.total_attempts }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_client_ip')">
-                {{ debug.data.meta.client_ip || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_user_agent')">
-                {{ debug.data.meta.user_agent || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_token_name')">
-                {{ debug.data.meta.token_name || '—' }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_is_streaming')">
-                {{ debug.data.meta.is_streaming ? t('logDetail.yes') : t('logDetail.no') }}
-              </el-descriptions-item>
-              <el-descriptions-item :label="t('logDetail.debug_meta_timestamp')">
-                {{ formatTime(debug.data.meta.at) }}
-              </el-descriptions-item>
-            </el-descriptions>
-          </template>
-
-          <el-button size="small" @click="loadDebug" :disabled="debug.loading" class="debug-reload">
-            {{ t('logDetail.debugReload') }}
-          </el-button>
-        </template>
-        <p v-else class="hint">{{ t('logDetail.debugNone') }}</p>
-      </section>
-
       <!-- Token 明细：cache 段只在该次请求非零时显示 -->
       <section>
         <h3>{{ t('logDetail.sectionTokens') }}</h3>
@@ -256,11 +117,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { i18n } from '../i18n'
-import { getLog, getLogDebug } from '../api'
+import { getLog } from '../api'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -278,54 +139,6 @@ async function load() {
     loading.value = false
   }
 }
-
-// Captured upstream body. Held as { data, requested, error }:
-  //   - `data` null = not yet fetched (button visible).
-  //   - `data.available: false` = fetched, nothing to show.
-  //   - `data.available: true` = fetched, render the body.
-  //   - data contains: request, response, breaker, meta
-  const debug = reactive({
-    data: null,
-    loading: false,
-    error: null,
-  })
-
-  async function loadDebug() {
-    debug.loading = true
-    debug.error = null
-    try {
-      const payload = await getLogDebug(route.params.id)
-      debug.data = payload
-      // Format pretty bodies
-      if (payload.available) {
-        if (payload.request) {
-          payload.request.pretty = formatBody(payload.request.body)
-        }
-        if (payload.response) {
-          const result = formatBody(payload.response.body)
-          payload.response.pretty = result.pretty
-          payload.response.parseError = result.parseError
-        }
-      }
-    } catch (e) {
-      debug.error = String(e)
-    } finally {
-      debug.loading = false
-    }
-  }
-
-  // Pretty-print JSON when we can. The upstream body can be anything — a relay
-  // station may answer with an HTML error page, a half-streamed SSE chunk, or
-  // just `text/plain`, so a parse failure is the normal case for some of those.
-  // Fall back to showing the raw string so the admin always sees what arrived.
-  function formatBody(raw) {
-    try {
-      const obj = JSON.parse(raw)
-      return { pretty: JSON.stringify(obj, null, 2), parseError: false }
-    } catch {
-      return { pretty: raw, parseError: true }
-    }
-  }
 
 function formatTime(ts) {
   return new Date(ts * 1000).toLocaleString()
@@ -411,29 +224,5 @@ h3 {
 }
 .muted {
   color: #c0c4cc;
-}
-
-/* Captured upstream body. The body can be very long (up to the capture cap
-   is 256 KB) — a fixed max-height with scroll is the right call; expanding
-   to fit would push the token usage section off-screen. JSON is
-   monospaced, so the eye reads it column-wise. */
-.debug-meta {
-  margin: 8px 0;
-}
-.debug-body {
-  background-color: #1e1e1e;
-  color: #d4d4d4;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  padding: 12px;
-  border-radius: 4px;
-  max-height: 480px;
-  overflow: auto;
-  white-space: pre;
-  margin: 0;
-}
-.debug-reload {
-  margin-top: 8px;
 }
 </style>

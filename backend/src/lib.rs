@@ -98,7 +98,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/logs", get(admin::list_logs))
         .route("/api/logs/filter-options", get(admin::log_filter_options))
         .route("/api/logs/:id", get(admin::get_log))
-        .route("/api/logs/:id/debug", get(admin::get_log_debug))
         .route("/api/usage", get(admin::usage))
         .route(
             "/api/settings/debug-logging",

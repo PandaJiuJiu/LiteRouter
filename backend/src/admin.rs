@@ -1,6 +1,5 @@
 use crate::auth::{check_auth, require_admin, AuthUser};
 use crate::db::{self, now};
-use crate::proxy;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -1283,10 +1282,6 @@ pub async fn get_log(
             })
         })
         .collect();
-    // Whether the relay captured an upstream body for this request. Just a
-    // flag here — the body itself stays behind `get_log_debug` so the log
-    // list and detail page don't ship a couple hundred KB they don't render.
-    let has_debug = proxy::debug_log_exists(&state.pool, id).await;
     Ok(Json(json!({
         "log": {
             "id": row.get::<i64, _>("id"),
@@ -1313,90 +1308,10 @@ pub async fn get_log(
             "client_aborted": row.try_get("client_aborted").unwrap_or(0) != 0,
             "failed_count": row.try_get("failed_count").unwrap_or(0),
             "attempts": attempts,
-            "has_debug": has_debug,
             "created_at": row.get::<i64, _>("created_at"),
             "client_ip": row.get::<String, _>("client_ip"),
             "user_agent": row.get::<String, _>("user_agent"),
         }
-    })))
-}
-
-/// GET /api/logs/:id/debug — the full captured debug information for a
-/// request, as written by the relay's debug capture.
-///
-/// Deliberately its own endpoint rather than a field on `get_log`: the body
-/// can be a couple hundred KB, and `get_log` is the hot path the log list
-/// and detail page both hit on every render.
-///
-/// Authorization is identical to `get_log` (including the 404-not-403 rule),
-/// so this can't be used to read other tenants' traffic. `available: false`
-/// with a 200 means "you may see this log, but nothing was captured" — a
-/// success that succeeded, or a failure whose upstream sent no body. The two
-/// cases are deliberately distinguishable from the 404.
-pub async fn get_log_debug(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, StatusCode> {
-    let user = check_auth(&state, &headers)?;
-    load_log_for_user(&state.pool, &user, id).await?;
-    let Some(file) = proxy::read_debug_log(&state.pool, id).await else {
-        return Ok(Json(json!({
-            "log_id": id,
-            "available": false,
-        })));
-    };
-
-    // Read all debug log files
-    let dir = format!("{}/{}", proxy::debug_log_dir_for(&state.pool), id);
-
-    // Helper to read and parse JSON file
-    async fn read_json_file(path: &str) -> Option<Value> {
-        tokio::fs::read(path)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-    }
-
-    // Read request
-    let request = if let Ok(req_body) = tokio::fs::read(format!("{dir}/req.json")).await {
-        let meta = read_json_file(&format!("{dir}/req.meta.json")).await;
-        Some(json!({
-            "body": String::from_utf8_lossy(&req_body),
-            "bytes": req_body.len(),
-            "truncated": file.request_truncated,
-            "meta": meta.unwrap_or(json!({})),
-        }))
-    } else {
-        None
-    };
-
-    // Read response
-    let response = if let Ok(resp_body) = tokio::fs::read(format!("{dir}/resp.json")).await {
-        let meta = read_json_file(&format!("{dir}/resp.meta.json")).await;
-        Some(json!({
-            "body": String::from_utf8_lossy(&resp_body),
-            "bytes": resp_body.len(),
-            "truncated": file.response_truncated,
-            "meta": meta.unwrap_or(json!({})),
-        }))
-    } else {
-        None
-    };
-
-    // Read breaker state
-    let breaker = read_json_file(&format!("{dir}/breaker.json")).await;
-
-    // Read meta
-    let meta = read_json_file(&format!("{dir}/meta.json")).await;
-
-    Ok(Json(json!({
-        "log_id": id,
-        "available": true,
-        "request": request,
-        "response": response,
-        "breaker": breaker,
-        "meta": meta.unwrap_or(json!({})),
     })))
 }
 

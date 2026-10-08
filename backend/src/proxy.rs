@@ -303,7 +303,13 @@ async fn pinned_channel(state: &AppState, name: &str, protocol: &str) -> Option<
 }
 
 /// Default directory where captured response bodies are stored:
-/// `data/debug_logs/{log_id}/` — created on first write for each log_id.
+/// `<db_dir>/debug_logs/{log_id}/` — created on first write for each log_id.
+///
+/// The directory follows the SQLite database file, so debug captures land
+/// next to the DB and inherit its persistence semantics: in dev that's
+/// `data/debug_logs` (beside `data/literouter.db`), and in the Docker image
+/// it's `/app/data/debug_logs`, under the `VOLUME /app/data` mount so the
+/// captures survive container recreation. No separate config needed.
 const DEBUG_LOG_DIR: &str = "data/debug_logs";
 
 /// Per-pool debug directory overrides. Indexed by the SQLite file path the
@@ -412,14 +418,6 @@ pub struct DebugCaptureSnapshot {
     pub response: Option<DebugResponse>,
     pub breaker_state: Option<DebugBreakerState>,
     pub meta: DebugMeta,
-}
-
-/// One captured body plus the metadata `resp.meta.json` records alongside it.
-pub struct DebugCaptureFile {
-    pub request_bytes: Vec<u8>,
-    pub request_truncated: bool,
-    pub response_bytes: Vec<u8>,
-    pub response_truncated: bool,
 }
 
 /// Inner state for DebugCapture, protected by Arc<Mutex> for sharing across
@@ -547,7 +545,7 @@ impl DebugCapture {
 
 /// Write the captured request/response and metadata to disk.
 ///
-/// Files: `data/debug_logs/{log_id}/req.json`, `resp.json`, `breaker.json`, `meta.json`.
+/// Files: `.run/debug_logs/{log_id}/req.json`, `resp.json`, `breaker.json`, `meta.json`.
 /// Errors are swallowed — a diagnostic aid never fails a request.
 pub async fn write_debug_log(pool: &sqlx::SqlitePool, log_id: i64, capture: &DebugCapture) {
     let snapshot = capture.snapshot();
@@ -660,64 +658,6 @@ pub async fn write_debug_log(pool: &sqlx::SqlitePool, log_id: i64, capture: &Deb
             .as_slice(),
     )
     .await;
-}
-
-/// Read back a previously captured debug log. `None` when nothing was captured
-/// for this log id — which is the normal case, since we only write on failure
-/// or when debug logging is on.
-pub async fn read_debug_log(pool: &sqlx::SqlitePool, log_id: i64) -> Option<DebugCaptureFile> {
-    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
-
-    // Try to read request and response
-    let request_bytes = tokio::fs::read(format!("{dir}/req.json")).await.ok();
-    let response_bytes = tokio::fs::read(format!("{dir}/resp.json")).await.ok();
-
-    // If neither exists, return None
-    if request_bytes.is_none() && response_bytes.is_none() {
-        return None;
-    }
-
-    let request_truncated = match tokio::fs::read(format!("{dir}/req.meta.json")).await {
-        Ok(meta) => serde_json::from_slice::<Value>(&meta)
-            .ok()
-            .and_then(|v| v.get("truncated").and_then(|b| b.as_bool()))
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-
-    let response_truncated = match tokio::fs::read(format!("{dir}/resp.meta.json")).await {
-        Ok(meta) => serde_json::from_slice::<Value>(&meta)
-            .ok()
-            .and_then(|v| v.get("truncated").and_then(|b| b.as_bool()))
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-
-    Some(DebugCaptureFile {
-        request_bytes: request_bytes.unwrap_or_default(),
-        request_truncated,
-        response_bytes: response_bytes.unwrap_or_default(),
-        response_truncated,
-    })
-}
-
-/// Whether a debug capture exists for this log id, without reading the body.
-/// The detail page uses it to decide whether to render the section at all, so
-/// a request that captured nothing costs one `stat` instead of a button and a
-/// round trip that comes back empty.
-pub async fn debug_log_exists(pool: &sqlx::SqlitePool, log_id: i64) -> bool {
-    let dir = format!("{}/{log_id}", debug_log_dir_for(pool));
-    // Check for any of the debug log files
-    tokio::fs::metadata(format!("{dir}/req.json")).await.is_ok()
-        || tokio::fs::metadata(format!("{dir}/resp.json"))
-            .await
-            .is_ok()
-        || tokio::fs::metadata(format!("{dir}/breaker.json"))
-            .await
-            .is_ok()
-        || tokio::fs::metadata(format!("{dir}/meta.json"))
-            .await
-            .is_ok()
 }
 
 /// Delete the debug log directory for a given log_id. Idempotent —

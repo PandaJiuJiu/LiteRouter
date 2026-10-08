@@ -86,11 +86,6 @@ export const deleteToken = (id) => api.delete(`/tokens/${id}`)
 export const listLogs = (page = 1, size = 20, range = 1, filters = {}) =>
   api.get('/logs', { params: { page, size, range, ...filters } }).then((r) => r.data)
 export const getLog = (id) => api.get(`/logs/${id}`).then((r) => r.data.log)
-// Captured upstream response body for one log. `available` says whether the
-// relay wrote anything — failures always capture, healthy traffic only
-// when the debug switch is on. Body is returned as a string; pretty-print
-// on the client (see LogDetail.vue).
-export const getLogDebug = (id) => api.get(`/logs/${id}/debug`).then((r) => r.data)
 export const listLogFilterOptions = (range = 1, filters = {}) =>
   api.get('/logs/filter-options', { params: { range, ...filters } }).then((r) => r.data)
 export const fetchUsage = (range = 7) =>
