@@ -456,6 +456,34 @@ fn openai_response_without_choices_does_not_panic() {
 }
 
 #[test]
+fn buffered_reasoning_content_becomes_a_leading_thinking_block() {
+    // Same mapping as the streaming converter. u2-flash returns reasoning with
+    // the answer; dropping it loses the only trace of a response whose text
+    // side is empty.
+    let out = openai_resp_to_anthropic(
+        &v(r#"{"choices":[{"message":{"reasoning_content":"thinking hard","content":"done"}}]}"#),
+        "m",
+    );
+    assert_eq!(out["content"][0]["type"], "thinking");
+    assert_eq!(out["content"][0]["thinking"], "thinking hard");
+    assert_eq!(out["content"][1]["type"], "text");
+    assert_eq!(out["content"][1]["text"], "done");
+}
+
+#[test]
+fn buffered_reasoning_with_no_text_still_produces_content() {
+    let out = openai_resp_to_anthropic(
+        &v(
+            r#"{"choices":[{"message":{"reasoning_content":"only this","content":null},
+             "finish_reason":"length"}]}"#,
+        ),
+        "m",
+    );
+    assert_eq!(out["content"].as_array().unwrap().len(), 1);
+    assert_eq!(out["content"][0]["type"], "thinking");
+}
+
+#[test]
 fn upstream_model_wins_over_the_requested_model_fallback() {
     let out = openai_resp_to_anthropic(&v(r#"{"model":"gpt-4o-mini","choices":[]}"#), "claude");
     assert_eq!(out["model"], "gpt-4o-mini");

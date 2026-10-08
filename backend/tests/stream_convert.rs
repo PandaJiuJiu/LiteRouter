@@ -44,6 +44,13 @@ fn oai_text(text: &str) -> String {
     .to_string()
 }
 
+/// An OpenAI chunk carrying a reasoning delta.
+fn oai_reasoning(text: &str) -> String {
+    json!({"id":"chatcmpl-1","model":"gpt-4o",
+           "choices":[{"index":0,"delta":{"reasoning_content":text},"finish_reason":null}]})
+    .to_string()
+}
+
 // ===================== OpenAI stream -> Anthropic events =====================
 
 #[test]
@@ -324,6 +331,81 @@ fn a_tool_call_whose_name_never_arrives_is_still_flushed() {
         .map(|x| x["delta"]["partial_json"].as_str().unwrap())
         .collect();
     assert_eq!(joined, r#"{"command":"ls"}"#);
+}
+
+#[test]
+fn reasoning_content_becomes_a_thinking_block_ahead_of_the_text() {
+    // u2-flash and friends answer with `reasoning_content`; dropped on the
+    // floor, a reply that was entirely reasoning reaches the client as an
+    // empty message. Anthropic wants it as a leading `thinking` block.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(&oai_reasoning("The user "));
+    events.extend(c.on_data(&oai_reasoning("wants a greeting.")));
+    events.extend(c.on_data(&oai_text("Hi!")));
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    let starts: Vec<_> = d
+        .iter()
+        .filter(|x| x["type"] == "content_block_start")
+        .collect();
+    assert_eq!(starts[0]["content_block"]["type"], "thinking");
+    assert_eq!(starts[1]["content_block"]["type"], "text");
+    // Thinking always precedes text in the Anthropic shape.
+    assert_eq!(starts[0]["index"].as_u64(), Some(0));
+    assert_eq!(starts[1]["index"].as_u64(), Some(1));
+
+    let deltas: Vec<_> = d
+        .iter()
+        .filter(|x| x["type"] == "content_block_delta")
+        .collect();
+    assert_eq!(deltas[0]["delta"]["type"], "thinking_delta");
+    assert_eq!(deltas[0]["delta"]["thinking"], "The user ");
+    assert_eq!(deltas[1]["delta"]["thinking"], "wants a greeting.");
+    assert_eq!(deltas[2]["delta"]["type"], "text_delta");
+
+    // The block is closed, not left dangling.
+    assert!(d
+        .iter()
+        .any(|x| x["type"] == "content_block_stop" && x["index"] == 0));
+}
+
+#[test]
+fn a_thinking_block_with_no_text_after_it_still_completes() {
+    // The reasoning *is* the whole answer, and the budget it burned can leave
+    // `content` null — the exact shape that used to reach the client as
+    // nothing at all.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(&oai_reasoning("all of it"));
+    events.extend(
+        c.on_data(
+            &json!({"id":"c","choices":[{"index":0,"delta":{"content":null},
+                   "finish_reason":"length"}]})
+            .to_string(),
+        ),
+    );
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    assert!(d
+        .iter()
+        .any(|x| x["type"] == "content_block_start" && x["content_block"]["type"] == "thinking"));
+    assert!(d
+        .iter()
+        .any(|x| x["type"] == "content_block_stop" && x["index"] == 0));
+    assert!(!d
+        .iter()
+        .any(|x| x["type"] == "content_block_start" && x["content_block"]["type"] == "text"));
+}
+
+#[test]
+fn a_stream_without_reasoning_opens_no_thinking_block() {
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(&oai_text("just text"));
+    events.extend(c.finish());
+    assert!(!datas(&events)
+        .iter()
+        .any(|x| x["type"] == "content_block_start" && x["content_block"]["type"] == "thinking"));
 }
 
 #[test]

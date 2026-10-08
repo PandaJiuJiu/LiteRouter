@@ -422,6 +422,19 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
     let choice = body.get("choices").and_then(|c| c.get(0));
     let message = choice.and_then(|c| c.get("message"));
     let mut content: Vec<Value> = Vec::new();
+    // Same reasoning-to-thinking mapping as the streaming converter; see
+    // `OpenAiToAnthropicStream::emit_reasoning` for why the empty signature
+    // is safe here.
+    if let Some(reasoning) = message
+        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|r| r.as_str())
+    {
+        if !reasoning.is_empty() {
+            content.push(json!({
+                "type": "thinking", "thinking": reasoning, "signature": ""
+            }));
+        }
+    }
     if let Some(text) = message
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
@@ -708,6 +721,8 @@ pub struct OpenAiToAnthropicStream {
     started: bool,
     next_block: usize,
     text_block: Option<usize>,
+    /// Open block index of the `thinking` block, once one has been opened.
+    thinking_block: Option<usize>,
     /// per OpenAI tool-call index
     tools: Vec<ToolSlot>,
     finish_reason: Option<String>,
@@ -724,6 +739,7 @@ impl OpenAiToAnthropicStream {
             started: false,
             next_block: 0,
             text_block: None,
+            thinking_block: None,
             tools: Vec::new(),
             finish_reason: None,
             usage: Usage::default(),
@@ -788,6 +804,54 @@ impl OpenAiToAnthropicStream {
             ));
         }
         self.tools[idx].block_index
+    }
+
+    /// Forward a `reasoning_content` fragment as an Anthropic `thinking`
+    /// block, opening the block on first use.
+    ///
+    /// The signature is the part worth explaining. Anthropic requires one,
+    /// but an OpenAI-format upstream has no such concept — its reasoning is
+    /// unsigned by construction, and the relays that expose `reasoning_content`
+    /// give nothing to forward. So we mint a stable placeholder. That is only
+    /// safe because the block never reaches a real Anthropic service: the
+    /// client echoes it back on the next turn and
+    /// `anthropic_messages_to_openai` drops it (its `_ => {}` arm), so
+    /// nothing downstream ever tries to verify it. If that ever changes —
+    /// a client that validates signatures itself, or a passthrough path that
+    /// stops dropping the block — this becomes a real forging bug and needs
+    /// rethinking rather than a different placeholder.
+    ///
+    /// Whether the reasoning reaches the client at all is upstream's choice,
+    /// not ours: `disable_upstream_thinking` already asks for none, and a
+    /// model that honours it never emits a fragment. This is the fallback for
+    /// the ones that don't — u2-flash's OpenAI endpoint being the case that
+    /// motivated it, where the reasoning still consumes the caller's whole
+    /// `max_tokens` and the reply would otherwise arrive as `content: null`.
+    fn emit_reasoning(&mut self, reasoning: &str, out: &mut Vec<String>) {
+        if reasoning.is_empty() {
+            return;
+        }
+        if self.thinking_block.is_none() {
+            let block_index = self.next_block;
+            self.next_block += 1;
+            out.push(sse_event(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start", "index": block_index,
+                    "content_block": {
+                        "type": "thinking", "thinking": "", "signature": ""
+                    }
+                }),
+            ));
+            self.thinking_block = Some(block_index);
+        }
+        out.push(sse_event(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta", "index": self.thinking_block,
+                "delta": { "type": "thinking_delta", "thinking": reasoning }
+            }),
+        ));
     }
 
     /// Forward whatever argument fragments `idx` has buffered, now that the
@@ -871,6 +935,13 @@ impl SseConverter for OpenAiToAnthropicStream {
                 self.flush_tool_args(idx, &mut out);
             }
         }
+        // reasoning fragments — an OpenAI upstream's thinking, translated
+        if let Some(reasoning) = delta
+            .and_then(|d| d.get("reasoning_content"))
+            .and_then(|r| r.as_str())
+        {
+            self.emit_reasoning(reasoning, &mut out);
+        }
         // text fragments
         if let Some(text) = delta
             .and_then(|d| d.get("content"))
@@ -927,6 +998,9 @@ impl SseConverter for OpenAiToAnthropicStream {
             .filter_map(|slot| slot.block_index)
             .collect();
         if let Some(t) = self.text_block {
+            open.push(t);
+        }
+        if let Some(t) = self.thinking_block {
             open.push(t);
         }
         open.sort_unstable();
