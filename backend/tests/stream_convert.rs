@@ -757,3 +757,34 @@ fn finish_does_not_re_open_a_message_that_was_already_opened() {
     // Exactly one message_start.
     assert_eq!(joined.matches("\"type\":\"message_start\"").count(), 1);
 }
+
+#[test]
+fn usage_from_sse_payload_handles_null_usage() {
+    // A provider like 云知声 reports `"usage": null` on every streaming chunk.
+    // That is an explicit zero-usage report, not "no usage field at all".
+    // Returning None would cause the merge logic to skip this chunk entirely,
+    // and if all chunks carry null usage, the final log row shows 0 tokens.
+    let result = usage_from_sse_payload(r#"{"id":"c1","choices":[],"usage":null}"#);
+    let u = result.expect("null usage must return Some(Usage), not None");
+    assert_eq!(u.prompt, 0);
+    assert_eq!(u.completion, 0);
+    assert_eq!(u.total, 0);
+}
+
+#[test]
+fn usage_from_sse_payload_handles_anthropic_null_usage() {
+    // Anthropic-style: usage nested under message.usage
+    let result =
+        usage_from_sse_payload(r#"{"type":"message_delta","message":{"usage":null},"usage":null}"#);
+    let u = result.expect("null usage in anthropic shape must return Some(Usage)");
+    assert_eq!(u.prompt, 0);
+    assert_eq!(u.completion, 0);
+}
+
+#[test]
+fn usage_from_sse_payload_still_returns_none_for_missing_usage() {
+    // A payload with no usage field at all should return None so the caller
+    // can distinguish "no usage reported" from "usage reported as zero".
+    let result = usage_from_sse_payload(r#"{"id":"c1","choices":[]}"#);
+    assert!(result.is_none(), "missing usage field must return None");
+}

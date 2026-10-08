@@ -93,6 +93,12 @@ pub fn usage_from_sse_payload(payload: &str) -> Option<Usage> {
     let u = v
         .get("usage")
         .or_else(|| v.get("message").and_then(|m| m.get("usage")))?;
+    // A `null` usage field means the upstream explicitly reported zero usage,
+    // not that it didn't report usage at all. Return a zero Usage so the merge
+    // logic below sees a valid report rather than skipping this chunk.
+    if u.is_null() {
+        return Some(Usage::default());
+    }
     let parsed = parse_usage_obj(u);
     if parsed.is_empty() {
         return None;
