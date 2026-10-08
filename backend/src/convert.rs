@@ -1044,7 +1044,12 @@ pub struct AnthropicToOpenAiStream {
     model: String,
     created: i64,
     id: String,
-    tool_count: usize, // number of tool_use blocks seen -> openai tool index
+    /// Index of the current tool block whose delta events are arriving.
+    /// Set by `content_block_start`, reset on the next `content_block_start`.
+    tool_index: usize,
+    /// Total number of tool_use blocks seen so far — also the index of the
+    /// next block to open.
+    tool_count: usize,
     finish_reason: Option<String>,
     /// Accumulated usage. Anthropic streams it in two places: `message_start`
     /// carries the input counts, `message_delta` the final output count, so
@@ -1058,6 +1063,7 @@ impl AnthropicToOpenAiStream {
             model: model.to_string(),
             created: crate::db::now(),
             id: format!("stream-{}", crate::db::now()),
+            tool_index: 0,
             tool_count: 0,
             finish_reason: None,
             usage: Usage::default(),
@@ -1106,13 +1112,15 @@ impl SseConverter for AnthropicToOpenAiStream {
             "content_block_start" => {
                 let block = v.get("content_block").cloned().unwrap_or_else(|| json!({}));
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    self.tool_index = self.tool_count;
+                    self.tool_count += 1;
                     out.push(openai_chunk(
                         &self.id,
                         self.created,
                         &self.model,
                         json!({
                             "tool_calls": [{
-                                "index": self.tool_count,
+                                "index": self.tool_index,
                                 "id": block.get("id").cloned().unwrap_or(Value::Null),
                                 "type": "function",
                                 "function": {
@@ -1123,7 +1131,6 @@ impl SseConverter for AnthropicToOpenAiStream {
                         }),
                         Value::Null,
                     ));
-                    self.tool_count += 1;
                 }
             }
             "content_block_delta" => {
@@ -1145,7 +1152,7 @@ impl SseConverter for AnthropicToOpenAiStream {
                             &self.model,
                             json!({
                                 "tool_calls": [{
-                                    "index": self.tool_count.saturating_sub(1),
+                                    "index": self.tool_index,
                                     "function": {
                                         "arguments": delta.get("partial_json").and_then(|p| p.as_str()).unwrap_or("")
                                     }
