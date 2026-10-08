@@ -230,6 +230,103 @@ fn a_tool_call_stream_merges_fragments_into_one_block() {
 }
 
 #[test]
+fn a_tool_call_delivered_in_one_chunk_keeps_its_arguments() {
+    // u2-flash sends the whole call — id, name and the complete argument
+    // JSON — in a single chunk. Treating that chunk as "just an opening" and
+    // never forwarding its `arguments` hands the client a tool_use with
+    // `input: {}`, which Claude Code rejects as a missing required parameter.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(
+        &json!({
+            "id":"chatcmpl-1",
+            "choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","type":"function",
+                 "function":{"name":"Bash","arguments":"{\"command\":\"ls /tmp\"}"}}]},
+                "finish_reason":"tool_calls"}]
+        })
+        .to_string(),
+    );
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    let deltas: Vec<_> = d
+        .iter()
+        .filter(|x| x["type"] == "content_block_delta")
+        .collect();
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0]["delta"]["type"], "input_json_delta");
+    assert_eq!(
+        deltas[0]["delta"]["partial_json"].as_str().unwrap(),
+        r#"{"command":"ls /tmp"}"#
+    );
+    let start = d
+        .iter()
+        .find(|x| x["type"] == "content_block_start")
+        .unwrap();
+    assert_eq!(start["content_block"]["id"], "call_1");
+    assert_eq!(start["content_block"]["name"], "Bash");
+}
+
+#[test]
+fn a_tool_name_arriving_after_its_arguments_still_names_the_block() {
+    // Anthropic fixes the name at `content_block_start` and cannot revisit
+    // it, so a provider that leads with a bare argument fragment forces the
+    // block to wait — the arguments are held until the name lands.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(
+        &json!({"id":"c","choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"a","function":{"arguments":"{\"command\":"}}]}}]})
+        .to_string(),
+    );
+    assert!(
+        !datas(&events)
+            .iter()
+            .any(|x| x["type"] == "content_block_start"),
+        "a block cannot open before its name is known"
+    );
+    events.extend(
+        c.on_data(
+            &json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"Bash","arguments":"\"ls\"}"}}]}}]})
+            .to_string(),
+        ),
+    );
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    let start = d
+        .iter()
+        .find(|x| x["type"] == "content_block_start")
+        .unwrap();
+    assert_eq!(start["content_block"]["name"], "Bash");
+    let joined: String = d
+        .iter()
+        .filter(|x| x["type"] == "content_block_delta")
+        .map(|x| x["delta"]["partial_json"].as_str().unwrap())
+        .collect();
+    assert_eq!(joined, r#"{"command":"ls"}"#);
+}
+
+#[test]
+fn a_tool_call_whose_name_never_arrives_is_still_flushed() {
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(
+        &json!({"id":"c","choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"a","function":{"arguments":"{\"command\":\"ls\"}"}}]}}]})
+        .to_string(),
+    );
+    events.extend(c.finish());
+    let d = datas(&events);
+    assert!(d.iter().any(|x| x["type"] == "content_block_start"));
+    let joined: String = d
+        .iter()
+        .filter(|x| x["type"] == "content_block_delta")
+        .map(|x| x["delta"]["partial_json"].as_str().unwrap())
+        .collect();
+    assert_eq!(joined, r#"{"command":"ls"}"#);
+}
+
+#[test]
 fn parallel_tool_calls_get_separate_blocks() {
     let mut c = OpenAiToAnthropicStream::new("m");
     c.on_data(

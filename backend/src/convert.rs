@@ -678,14 +678,38 @@ fn openai_chunk(id: &str, created: i64, model: &str, delta: Value, finish_reason
     format!("data: {}\n\n", data)
 }
 
+/// One OpenAI tool call, assembled from however many fragments the upstream
+/// chose to split it across.
+///
+/// OpenAI has no hard rule about where `id`, `name` and `arguments` land: the
+/// usual shape puts `id` and `name` in the first fragment with an empty
+/// `arguments`, but plenty of providers (u2-flash among them) send the whole
+/// call — `id`, `name` *and* the complete argument JSON — in one fragment.
+/// Anthropic, on the other hand, can only open a `tool_use` block once it
+/// knows the name, and `content_block_start` cannot be retracted afterwards.
+/// So argument fragments are buffered in `pending` rather than emitted on
+/// sight, and flushed as a single `input_json_delta` right after the block
+/// opens. Emitting them eagerly would mean dropping the ones that arrive with
+/// `id`, and the client then sees a tool call with `input: {}` — an
+/// `InputValidationError` on the tool's required parameters.
+#[derive(Clone, Default)]
+struct ToolSlot {
+    /// Set once `content_block_start` has been emitted.
+    block_index: Option<usize>,
+    id: String,
+    name: String,
+    /// Argument fragments held back until the block is open.
+    pending: String,
+}
+
 /// OpenAI chunk SSE -> Anthropic event stream.
 pub struct OpenAiToAnthropicStream {
     model: String,
     started: bool,
     next_block: usize,
     text_block: Option<usize>,
-    /// per OpenAI tool-call index: (block index, started, name)
-    tools: Vec<Option<(usize, bool, String)>>,
+    /// per OpenAI tool-call index
+    tools: Vec<ToolSlot>,
     finish_reason: Option<String>,
     /// Latest usage block seen upstream. OpenAI streams it once, in the
     /// final chunk when the caller asked for `stream_options.include_usage`.
@@ -726,6 +750,62 @@ impl OpenAiToAnthropicStream {
             }),
         )
     }
+
+    /// Emit `content_block_start` for tool call `idx` if it isn't open yet.
+    /// Returns the block index once the block is open.
+    ///
+    /// `allow_unnamed` is for the end-of-stream path: a call whose name never
+    /// arrived opens anyway (an empty name is malformed, but dropping the call
+    /// would discard its arguments in silence), while mid-stream we simply
+    /// wait — a later fragment may still carry the name.
+    fn ensure_tool_block(
+        &mut self,
+        idx: usize,
+        out: &mut Vec<String>,
+        allow_unnamed: bool,
+    ) -> Option<usize> {
+        if self.tools[idx].block_index.is_none() {
+            if self.tools[idx].name.is_empty() && !allow_unnamed {
+                return None;
+            }
+            let block_index = self.next_block;
+            self.next_block += 1;
+            let id = if self.tools[idx].id.is_empty() {
+                format!("toolu_{block_index}")
+            } else {
+                self.tools[idx].id.clone()
+            };
+            self.tools[idx].block_index = Some(block_index);
+            out.push(sse_event(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start", "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id, "name": self.tools[idx].name, "input": {}
+                    }
+                }),
+            ));
+        }
+        self.tools[idx].block_index
+    }
+
+    /// Forward whatever argument fragments `idx` has buffered, now that the
+    /// block they belong to is open.
+    fn flush_tool_args(&mut self, idx: usize, out: &mut Vec<String>) {
+        if let Some(block_index) = self.tools[idx].block_index {
+            let pending = std::mem::take(&mut self.tools[idx].pending);
+            if !pending.is_empty() {
+                out.push(sse_event(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta", "index": block_index,
+                        "delta": { "type": "input_json_delta", "partial_json": pending }
+                    }),
+                ));
+            }
+        }
+    }
 }
 
 impl SseConverter for OpenAiToAnthropicStream {
@@ -761,7 +841,7 @@ impl SseConverter for OpenAiToAnthropicStream {
             for call in calls {
                 let idx = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 if self.tools.len() <= idx {
-                    self.tools.resize(idx + 1, None);
+                    self.tools.resize(idx + 1, ToolSlot::default());
                 }
                 let function = call.get("function");
                 let name = function
@@ -772,59 +852,23 @@ impl SseConverter for OpenAiToAnthropicStream {
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("");
-                let is_new = call.get("id").is_some();
-                if is_new && self.tools[idx].is_none() {
-                    let block_index = self.next_block;
-                    self.next_block += 1;
-                    out.push(sse_event(
-                        "content_block_start",
-                        &json!({
-                            "type": "content_block_start", "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": call.get("id").cloned().unwrap_or(Value::Null),
-                                "name": name, "input": {}
-                            }
-                        }),
-                    ));
-                    self.tools[idx] = Some((block_index, true, name.to_string()));
-                } else if !args.is_empty() {
-                    match self.tools[idx] {
-                        // mid-stream fragments of an already-started block
-                        Some((block_index, true, _)) => out.push(sse_event(
-                            "content_block_delta",
-                            &json!({
-                                "type": "content_block_delta", "index": block_index,
-                                "delta": { "type": "input_json_delta", "partial_json": args }
-                            }),
-                        )),
-                        // fragments before we saw an id: start the block now
-                        None => {
-                            let block_index = self.next_block;
-                            self.next_block += 1;
-                            out.push(sse_event(
-                                "content_block_start",
-                                &json!({
-                                    "type": "content_block_start", "index": block_index,
-                                    "content_block": {
-                                        "type": "tool_use",
-                                        "id": call.get("id").cloned().unwrap_or_else(|| json!(format!("toolu_{}", block_index))),
-                                        "name": name, "input": {}
-                                    }
-                                }),
-                            ));
-                            out.push(sse_event(
-                                "content_block_delta",
-                                &json!({
-                                    "type": "content_block_delta", "index": block_index,
-                                    "delta": { "type": "input_json_delta", "partial_json": args }
-                                }),
-                            ));
-                            self.tools[idx] = Some((block_index, true, name.to_string()));
+                {
+                    let slot = &mut self.tools[idx];
+                    if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                        if !id.is_empty() {
+                            slot.id = id.to_string();
                         }
-                        _ => {}
+                    }
+                    if !name.is_empty() {
+                        slot.name = name.to_string();
+                    }
+                    // Buffered, not emitted on sight — see `ToolSlot`.
+                    if !args.is_empty() {
+                        slot.pending.push_str(args);
                     }
                 }
+                self.ensure_tool_block(idx, &mut out, false);
+                self.flush_tool_args(idx, &mut out);
             }
         }
         // text fragments
@@ -870,12 +914,17 @@ impl SseConverter for OpenAiToAnthropicStream {
         if !self.started {
             out.push(self.message_start_event());
         }
+        // A tool call whose name never arrived opens now, so the arguments
+        // already buffered for it reach the client instead of disappearing.
+        for idx in 0..self.tools.len() {
+            self.ensure_tool_block(idx, &mut out, true);
+            self.flush_tool_args(idx, &mut out);
+        }
         // close open blocks in ascending block order
         let mut open: Vec<usize> = self
             .tools
             .iter()
-            .flatten()
-            .map(|(idx, _, _)| *idx)
+            .filter_map(|slot| slot.block_index)
             .collect();
         if let Some(t) = self.text_block {
             open.push(t);
