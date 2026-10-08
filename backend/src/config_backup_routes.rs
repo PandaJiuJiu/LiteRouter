@@ -74,11 +74,12 @@ struct TableCol(&'static str, &'static str);
 async fn free_name(pool: &sqlx::SqlitePool, base: &str, tc: TableCol) -> String {
     for n in 1..10_000 {
         let candidate = format!("{base}_{n}");
-        let taken: i64 = sqlx::query_scalar(format!("SELECT COUNT(*) FROM {} WHERE {}=?", tc.0, tc.1).as_str())
-            .bind(&candidate)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(1);
+        let taken: i64 =
+            sqlx::query_scalar(format!("SELECT COUNT(*) FROM {} WHERE {}=?", tc.0, tc.1).as_str())
+                .bind(&candidate)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(1);
         if taken == 0 {
             return candidate;
         }
@@ -88,7 +89,11 @@ async fn free_name(pool: &sqlx::SqlitePool, base: &str, tc: TableCol) -> String 
 
 /// Build a 400 with a JSON `{error: ...}` body.
 fn bad_request(msg: impl Into<String>) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg.into() }))).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
+        .into_response()
 }
 
 /// Validate the requested section list against [`ALL_SECTIONS`].
@@ -517,7 +522,8 @@ pub async fn commit_import(
                 skipped += 1;
             }
             (Some(_), Some(ConflictAction::KeepBoth)) => {
-                let alias = free_name(&state.pool, &m.alias, TableCol("model_mappings", "alias")).await;
+                let alias =
+                    free_name(&state.pool, &m.alias, TableCol("model_mappings", "alias")).await;
                 insert_mapping(&state, m, &alias, &targets).await?;
                 kept_both += 1;
             }

@@ -89,9 +89,7 @@ impl AppState {
     /// is deliberate — a misconfiguration should not take a channel out of
     /// service.
     pub fn client_for_channel(&self, use_proxy: bool) -> Client {
-        let global = self
-            .proxy_on
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let global = self.proxy_on.load(std::sync::atomic::Ordering::Relaxed);
         if use_proxy || global {
             if let Ok(guard) = self.http_proxied.read() {
                 if let Some(c) = guard.as_ref() {
@@ -109,9 +107,7 @@ impl AppState {
     /// uses this to render the per-channel "代理" tag so it doesn't claim a
     /// proxy is in use when it isn't.
     pub fn proxy_active_for(&self, channel_use_proxy: bool) -> bool {
-        let global = self
-            .proxy_on
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let global = self.proxy_on.load(std::sync::atomic::Ordering::Relaxed);
         if !channel_use_proxy && !global {
             return false;
         }
@@ -129,8 +125,7 @@ impl AppState {
     /// Atomic because the admin handler mutates it without a lock and
     /// requests are reading it concurrently.
     pub fn proxy_on(&self) -> bool {
-        self.proxy_on
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.proxy_on.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Flip the global proxy switch.

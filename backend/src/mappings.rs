@@ -95,9 +95,19 @@ pub fn deserialize_targets(raw: serde_json::Value) -> Vec<TargetEntry> {
             .filter_map(|v| match v {
                 serde_json::Value::String(s) => Some(TargetEntry::Str(s)),
                 serde_json::Value::Object(mut obj) => {
-                    let model = obj.remove("model").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-                    let channel = obj.remove("channel").and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-                    if model.is_empty() { None } else { Some(TargetEntry::Obj { channel, model }) }
+                    let model = obj
+                        .remove("model")
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_default();
+                    let channel = obj
+                        .remove("channel")
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_default();
+                    if model.is_empty() {
+                        None
+                    } else {
+                        Some(TargetEntry::Obj { channel, model })
+                    }
                 }
                 _ => None,
             })
@@ -123,7 +133,10 @@ mod tests {
         let raw = serde_json::json!([{"channel": "volc", "model": "gpt-4o-mini"}]);
         let entries = deserialize_targets(raw);
         let targets = clean_targets(&entries);
-        assert_eq!(targets, vec![("volc".to_string(), "gpt-4o-mini".to_string())]);
+        assert_eq!(
+            targets,
+            vec![("volc".to_string(), "gpt-4o-mini".to_string())]
+        );
     }
 
     #[test]
