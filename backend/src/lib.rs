@@ -51,7 +51,7 @@ pub async fn build_state(pool: SqlitePool) -> Arc<AppState> {
     // built whenever host+port are valid, regardless of the enable flag —
     // flipping the switch later doesn't require rebuilding.
     let (host, port, enabled) = settings::current_proxy_settings(&state.pool).await;
-    state.set_proxy_enabled(enabled);
+    state.set_proxy_on(enabled);
     let proxy_url = settings::proxy_url_from(&host, port);
     state.set_proxied_client(proxy_url.as_deref());
     Arc::new(state)

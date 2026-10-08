@@ -38,7 +38,7 @@ pub struct AppState {
     /// has to flip this on, otherwise the configured host/port is dormant.
     /// Atomic because the admin handler mutates it without a lock and
     /// requests are reading it concurrently.
-    proxy_enabled: std::sync::atomic::AtomicBool,
+    proxy_on: std::sync::atomic::AtomicBool,
     /// session token -> metadata
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     /// Whether request/response bodies are captured to disk. Held on the
@@ -61,7 +61,7 @@ impl AppState {
                 .build()
                 .expect("build http client"),
             http_proxied: RwLock::new(None),
-            proxy_enabled: std::sync::atomic::AtomicBool::new(false),
+            proxy_on: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             debug_logging: std::sync::atomic::AtomicBool::new(false),
             breaker,
@@ -90,7 +90,7 @@ impl AppState {
     /// service.
     pub fn client_for_channel(&self, use_proxy: bool) -> Client {
         let global = self
-            .proxy_enabled
+            .proxy_on
             .load(std::sync::atomic::Ordering::Relaxed);
         if use_proxy || global {
             if let Ok(guard) = self.http_proxied.read() {
@@ -110,7 +110,7 @@ impl AppState {
     /// proxy is in use when it isn't.
     pub fn proxy_active_for(&self, channel_use_proxy: bool) -> bool {
         let global = self
-            .proxy_enabled
+            .proxy_on
             .load(std::sync::atomic::Ordering::Relaxed);
         if !channel_use_proxy && !global {
             return false;
@@ -128,16 +128,14 @@ impl AppState {
     /// implicitly enable it — the admin has to flip this on.
     /// Atomic because the admin handler mutates it without a lock and
     /// requests are reading it concurrently.
-    pub fn proxy_enabled(&self) -> bool {
-        self.proxy_enabled
+    pub fn proxy_on(&self) -> bool {
+        self.proxy_on
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Flip the global proxy switch. Independent of the cached proxied
-    /// client — `set_proxied_client` is for host/port changes, this is for
-    /// the on/off switch.
-    pub fn set_proxy_enabled(&self, enabled: bool) {
-        self.proxy_enabled
+    /// Flip the global proxy switch.
+    pub fn set_proxy_on(&self, enabled: bool) {
+        self.proxy_on
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -150,7 +148,7 @@ impl AppState {
     /// whether it's talking HTTP CONNECT or SOCKS5, and a bare `host:port`
     /// would be parsed as an unknown scheme. `None` clears the client.
     /// Note: this only sets/clears the cached client; whether it actually
-    /// gets used is gated by [`Self::set_proxy_enabled`].
+    /// gets used is gated by [`Self::set_proxy_on`].
     pub fn set_proxied_client(&self, proxy_url: Option<&str>) {
         let mut guard = self.http_proxied.write().unwrap_or_else(|e| e.into_inner());
         match proxy_url {

@@ -456,7 +456,7 @@ pub async fn set_proxy_settings(
         state.set_proxied_client(proxy_url.as_deref());
     }
     if req.enabled.is_some() {
-        state.set_proxy_enabled(new_enabled);
+        state.set_proxy_on(new_enabled);
     }
 
     Ok(Json(json!({
