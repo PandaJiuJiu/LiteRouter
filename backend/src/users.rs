@@ -36,6 +36,17 @@ fn row_user(row: &sqlx::sqlite::SqliteRow) -> Value {
     })
 }
 
+/// True if at least one admin would remain after demoting/deleting `id`.
+async fn has_other_admin(pool: &sqlx::SqlitePool, id: i64) -> bool {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    count > 0
+}
+
 /// GET /api/users — admin only.
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
@@ -130,13 +141,7 @@ pub async fn update_user(
     if let Some(flag) = req.is_admin {
         // Demoting an admin: make sure at least one admin stays.
         if target_is_admin != 0 && !flag {
-            let remaining: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?")
-                    .bind(id)
-                    .fetch_one(&state.pool)
-                    .await
-                    .unwrap_or(0);
-            if remaining == 0 {
+            if !has_other_admin(&state.pool, id).await {
                 return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
             }
         }
@@ -206,16 +211,8 @@ pub async fn delete_user(
     let target = target.ok_or((StatusCode::NOT_FOUND, json_err("用户不存在")))?;
     let target_is_admin: i64 = target.get("is_admin");
 
-    if target_is_admin != 0 {
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?")
-                .bind(id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap_or(0);
-        if remaining == 0 {
-            return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
-        }
+    if target_is_admin != 0 && !has_other_admin(&state.pool, id).await {
+        return Err((StatusCode::BAD_REQUEST, json_err("至少保留一个管理员")));
     }
 
     if id == caller.id {
