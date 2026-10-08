@@ -85,7 +85,11 @@ pub enum Outcome {
     /// human-readable cause — `"HTTP 429"`, `"transport: connect timeout"`,
     /// or a probe-side message. Surfaced in the admin snapshot so an
     /// operator can tell an outage from a bad key without reading logs.
-    Failure(String),
+    ///
+    /// `backoff_hint` overrides the normal exponential backoff for this
+    /// failure. Intended for HTTP 429 with a `Retry-After` header: the
+    /// upstream knows its own rate-limit window better than our heuristic.
+    Failure(String, Option<std::time::Duration>),
 }
 
 /// One transition the breaker made after `record()` ran, returned to the
@@ -247,17 +251,29 @@ impl Breaker {
                     reason: String::new(),
                 }
             }
-            Outcome::Failure(reason) => {
+            Outcome::Failure(reason, backoff_hint) => {
                 let reason = clip_reason(&reason);
                 let (kind, backoff) = match guard.entry(key.to_owned()) {
                     Entry::Occupied(o) => {
-                        let backoff = o.get().current_backoff.saturating_mul(2).min(cfg.max_delay);
+                        // Use the provider's own hint if present; fall back to
+                        // doubling. Cap both at max_delay.
+                        let backoff =
+                            backoff_hint
+                                .map(|d| d.min(cfg.max_delay))
+                                .unwrap_or_else(|| {
+                                    o.get().current_backoff.saturating_mul(2).min(cfg.max_delay)
+                                });
                         (TransitionKind::Updated, backoff)
                     }
                     Entry::Vacant(v) => {
-                        let deadline = now.checked_add(cfg.base_delay).unwrap_or(now);
-                        v.insert(BreakerState::open(cfg.base_delay, deadline, reason.clone()));
-                        (TransitionKind::Inserted, cfg.base_delay)
+                        // First failure: use hint if given, otherwise base_delay.
+                        // Cap at max_delay either way.
+                        let backoff = backoff_hint
+                            .map(|d| d.min(cfg.max_delay))
+                            .unwrap_or(cfg.base_delay);
+                        let deadline = now.checked_add(backoff).unwrap_or(now);
+                        v.insert(BreakerState::open(backoff, deadline, reason.clone()));
+                        (TransitionKind::Inserted, backoff)
                     }
                 };
                 let entry = guard.get_mut(key).expect("just inserted");
@@ -476,7 +492,8 @@ mod tests {
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
         assert!(b.allow(&key).await);
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert!(!b.allow(&key).await);
         assert_eq!(b.snapshot().await[0].state, "open");
         assert_eq!(b.snapshot().await[0].reason, "HTTP 500");
@@ -489,8 +506,9 @@ mod tests {
         // one rather than being discarded.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
-        b.record(&key, Outcome::Failure("HTTP 429".into())).await;
-        b.record(&key, Outcome::Failure("transport: timeout".into()))
+        b.record(&key, Outcome::Failure("HTTP 429".into(), None))
+            .await;
+        b.record(&key, Outcome::Failure("transport: timeout".into(), None))
             .await;
         assert_eq!(b.snapshot().await[0].reason, "transport: timeout");
     }
@@ -502,7 +520,7 @@ mod tests {
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
         let long = "transport: ".to_string() + &"x".repeat(500);
-        b.record(&key, Outcome::Failure(long)).await;
+        b.record(&key, Outcome::Failure(long, None)).await;
         let reason = b.snapshot().await[0].reason.clone();
         assert!(reason.ends_with('…'), "got {reason:?}");
         assert_eq!(reason.chars().count(), REASON_MAX + 1);
@@ -515,7 +533,8 @@ mod tests {
         // should return true again.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert!(!b.allow(&key).await);
         assert_eq!(b.snapshot().await.len(), 1);
 
@@ -530,7 +549,8 @@ mod tests {
         // itself act as a probe. Only the background task does probing.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "model");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!b.allow(&key).await);
     }
@@ -540,8 +560,10 @@ mod tests {
         let b = Breaker::new(cfg());
         let key1 = breaker_key("ch1", "m1");
         let key2 = breaker_key("ch2", "m2");
-        b.record(&key1, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&key2, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key1, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&key2, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         // Right after trip: none are due (cooldown = 1s)
         let now = Instant::now();
         assert!(b.expired_keys(now).await.is_empty());
@@ -576,21 +598,26 @@ mod tests {
                 .as_secs()
         }
 
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, 1);
 
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, 2);
 
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, 4);
 
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, 5);
         assert_eq!(b.snapshot().await[0].state, "open");
 
         // Cap holds for additional failures
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, 5);
     }
 
@@ -610,9 +637,12 @@ mod tests {
         }
 
         // Fail three times → backoff should have doubled to 4s
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, Some(4));
 
         // Probe succeeds → entry removed entirely
@@ -620,7 +650,8 @@ mod tests {
         assert_eq!(backoff(&b, &key).await, None);
 
         // Next failure should use base_delay, not 4s
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(backoff(&b, &key).await, Some(1));
     }
 
@@ -632,7 +663,8 @@ mod tests {
         let key = breaker_key("ch", "model");
         for _ in 0..20 {
             assert!(b.allow(&key).await);
-            b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+            b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+                .await;
         }
         // No state should be tracked at all when disabled.
         assert!(b.snapshot().await.is_empty());
@@ -643,8 +675,10 @@ mod tests {
         let b = Breaker::new(cfg());
         let k1 = breaker_key("ch1", "m");
         let k2 = breaker_key("ch2", "m");
-        b.record(&k1, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&k2, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&k1, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&k2, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(b.snapshot().await.len(), 2);
         b.reset().await;
         assert!(b.snapshot().await.is_empty());
@@ -657,8 +691,10 @@ mod tests {
         let b = Breaker::new(cfg());
         let k1 = breaker_key("ch1", "m");
         let k2 = breaker_key("ch2", "m");
-        b.record(&k1, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&k2, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&k1, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&k2, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         b.reset_key(&k1).await;
         let snap = b.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -673,7 +709,8 @@ mod tests {
         let a = breaker_key("ch1", "gpt-4o");
         let c = breaker_key("ch2", "gpt-4o");
         let d = breaker_key("ch1", "claude-x");
-        b.record(&a, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&a, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert!(!b.allow(&a).await);
         assert!(b.allow(&c).await);
         assert!(b.allow(&d).await);
@@ -686,7 +723,8 @@ mod tests {
         // the wrong channel.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "weird|model|name");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         let snap = b.snapshot().await;
         assert_eq!(snap[0].channel, "ch");
         assert_eq!(snap[0].target_model, "weird|model|name");
@@ -699,7 +737,8 @@ mod tests {
         let key = breaker_key("ch", "m");
         let mut seen = Vec::new();
         for _ in 0..6 {
-            b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+            b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+                .await;
             seen.push(
                 b.inner
                     .read()
@@ -714,10 +753,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_after_hint_is_used_instead_of_exponential_backoff() {
+        // When a failure carries a Retry-After hint, the breaker uses that
+        // instead of doubling. This lets HTTP 429 responses with a
+        // Retry-After header set the backoff directly.
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+
+        // First failure with Retry-After hint of 3s (overrides base_delay of 1s).
+        b.record(
+            &key,
+            Outcome::Failure("HTTP 429".into(), Some(Duration::from_secs(3))),
+        )
+        .await;
+        assert_eq!(
+            b.inner.read().await.get(&key).unwrap().current_backoff,
+            Duration::from_secs(3)
+        );
+
+        // Subsequent failure with another hint of 2s (overrides the previous 3s).
+        b.record(
+            &key,
+            Outcome::Failure("HTTP 429".into(), Some(Duration::from_secs(2))),
+        )
+        .await;
+        assert_eq!(
+            b.inner.read().await.get(&key).unwrap().current_backoff,
+            Duration::from_secs(2)
+        );
+
+        // Hint exceeding max_delay (5s) is capped.
+        b.record(
+            &key,
+            Outcome::Failure("HTTP 429".into(), Some(Duration::from_secs(100))),
+        )
+        .await;
+        assert_eq!(
+            b.inner.read().await.get(&key).unwrap().current_backoff,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn without_hint_exponential_backoff_still_applies() {
+        // A failure without a hint still uses the normal doubling strategy.
+        let b = Breaker::new(cfg());
+        let key = breaker_key("ch", "m");
+
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        assert_eq!(
+            b.inner
+                .read()
+                .await
+                .get(&key)
+                .unwrap()
+                .current_backoff
+                .as_secs(),
+            1
+        );
+
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        assert_eq!(
+            b.inner
+                .read()
+                .await
+                .get(&key)
+                .unwrap()
+                .current_backoff
+                .as_secs(),
+            2
+        );
+
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        assert_eq!(
+            b.inner
+                .read()
+                .await
+                .get(&key)
+                .unwrap()
+                .current_backoff
+                .as_secs(),
+            4
+        );
+    }
+
+    #[tokio::test]
     async fn replacing_the_config_takes_effect_without_a_restart() {
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "m");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert!(!b.allow(&key).await);
 
         let mut next = cfg();
@@ -731,7 +859,8 @@ mod tests {
         // off — the new base applies to the *first* failure of a fresh entry,
         // not retroactively to a key that is already up the ladder.
         assert!(!b.allow(&key).await);
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(
             b.inner.read().await.get(&key).unwrap().current_backoff,
             Duration::from_secs(2)
@@ -739,7 +868,8 @@ mod tests {
 
         // Once the key clears, the next trip starts from the new base_delay.
         b.record(&key, Outcome::Success).await;
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert_eq!(
             b.inner.read().await.get(&key).unwrap().current_backoff,
             Duration::from_secs(30)
@@ -750,7 +880,8 @@ mod tests {
     async fn disabling_the_breaker_mid_flight_stops_short_circuiting() {
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "m");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         assert!(!b.allow(&key).await);
 
         let mut next = cfg();
@@ -767,12 +898,12 @@ mod tests {
         let b = Breaker::new(cfg());
         b.record(
             &breaker_key("ch1", "m1"),
-            Outcome::Failure("HTTP 500".into()),
+            Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
         b.record(
             &breaker_key("ch2", "m2"),
-            Outcome::Failure("HTTP 500".into()),
+            Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -791,8 +922,10 @@ mod tests {
         let b = Breaker::new(cfg());
         let a = breaker_key("ch1", "m");
         let c = breaker_key("ch2", "m");
-        b.record(&a, Outcome::Failure("HTTP 500".into())).await;
-        b.record(&c, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&a, Outcome::Failure("HTTP 500".into(), None))
+            .await;
+        b.record(&c, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         b.reset_key(&a).await;
         assert!(b.allow(&a).await);
         assert!(!b.allow(&c).await);
@@ -806,7 +939,8 @@ mod tests {
         // traffic that should be spared.
         let b = Breaker::new(cfg());
         let key = breaker_key("ch", "m");
-        b.record(&key, Outcome::Failure("HTTP 500".into())).await;
+        b.record(&key, Outcome::Failure("HTTP 500".into(), None))
+            .await;
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(
             !b.allow(&key).await,
@@ -824,8 +958,11 @@ mod tests {
         let mut c = cfg();
         c.base_delay = Duration::from_secs(30);
         let b = Breaker::new(c);
-        b.record(&breaker_key("ch", "m"), Outcome::Failure("HTTP 500".into()))
-            .await;
+        b.record(
+            &breaker_key("ch", "m"),
+            Outcome::Failure("HTTP 500".into(), None),
+        )
+        .await;
         let first = b.snapshot().await[0].cooldown_remaining_secs;
         // Truncated to whole seconds, so a few microseconds of elapsed time
         // can already have knocked it down by one.

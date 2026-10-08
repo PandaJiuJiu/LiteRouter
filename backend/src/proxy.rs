@@ -1517,7 +1517,7 @@ async fn record_outcome_in_breaker(
     breaker_key: &str,
     code: u16,
     detail: Option<&str>,
-    _retry_after_secs: Option<u64>,
+    retry_after_secs: Option<u64>,
     retriable_429_count: &mut usize,
 ) {
     if code == 429 {
@@ -1531,9 +1531,12 @@ async fn record_outcome_in_breaker(
             Some(d) => format!("HTTP {code}: {d}"),
             None => format!("HTTP {code}"),
         };
+        // Use Retry-After as a backoff hint when present — the upstream knows
+        // its own rate-limit window better than our exponential heuristic.
+        let backoff_hint = retry_after_secs.map(std::time::Duration::from_secs);
         let transition = state
             .breaker
-            .record(breaker_key, Outcome::Failure(reason))
+            .record(breaker_key, Outcome::Failure(reason, backoff_hint))
             .await;
         let event_kind = match transition.kind {
             breaker::TransitionKind::Inserted => Some(BreakerEventKind::Tripped),
@@ -1626,7 +1629,7 @@ impl StreamLog {
             }
             self.state
                 .breaker
-                .record(&self.breaker_key, Outcome::Failure(reason))
+                .record(&self.breaker_key, Outcome::Failure(reason, None))
                 .await;
         }
         if let Some(winner) = self.entry.winner.as_mut() {
@@ -2699,7 +2702,7 @@ async fn relay(
                         .breaker
                         .record(
                             &breaker_key,
-                            Outcome::Failure(format!("HTTP {code}: {detail}")),
+                            Outcome::Failure(format!("HTTP {code}: {detail}"), None),
                         )
                         .await;
                     // Keep the offending body for the log detail page. Only
@@ -2722,7 +2725,7 @@ async fn relay(
                     transport_err_count += 1;
                     state
                         .breaker
-                        .record(&breaker_key, Outcome::Failure(err_msg.clone()))
+                        .record(&breaker_key, Outcome::Failure(err_msg.clone(), None))
                         .await;
                     // Fall through to the next candidate / next target.
                 }

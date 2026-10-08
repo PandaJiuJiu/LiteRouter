@@ -166,7 +166,7 @@ async fn sweep(
                     if success {
                         Outcome::Success
                     } else {
-                        Outcome::Failure(result.reason())
+                        Outcome::Failure(result.reason(), None)
                     },
                 )
                 .await;

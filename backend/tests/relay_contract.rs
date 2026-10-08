@@ -592,7 +592,7 @@ async fn trip(h: &Harness, channel: &str, model: &str) {
     h.breaker
         .record(
             &literouter::breaker::breaker_key(channel, model),
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
 }
@@ -705,7 +705,7 @@ async fn an_open_breaker_skips_the_upstream_without_sending_a_request() {
     h.breaker
         .record(
             &bkey,
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
 
@@ -733,7 +733,7 @@ async fn a_skipped_hop_is_recorded_as_skipped_not_as_a_failure() {
     h.breaker
         .record(
             &literouter::breaker::breaker_key("ch", "gpt-4o"),
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
     chat(&h, &key, "gpt-4o", json!({})).await;
@@ -758,7 +758,7 @@ async fn a_success_clears_the_breaker_for_that_channel_and_model() {
     h.breaker
         .record(
             &bkey,
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
     assert!(!h.breaker.allow(&bkey).await);
@@ -873,7 +873,7 @@ async fn probing_now_clears_a_key_whose_upstream_recovered() {
     h.breaker
         .record(
             &bkey,
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
     assert_eq!(h.breaker.snapshot().await.len(), 1, "still open pre-probe");
@@ -909,7 +909,7 @@ async fn probing_now_leaves_a_still_broken_key_open_with_a_fresh_backoff() {
     h.breaker
         .record(
             &bkey,
-            literouter::breaker::Outcome::Failure("HTTP 500".into()),
+            literouter::breaker::Outcome::Failure("HTTP 500".into(), None),
         )
         .await;
 
