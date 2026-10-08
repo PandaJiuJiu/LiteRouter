@@ -203,8 +203,10 @@ describe('status tag', () => {
       return cls
     })
     // Each row has *two* tags (status + the per-attempt "fail-badge"); flatten
-    // by counting them in document order. We expect: success, danger, danger.
+    // by counting them in document order. We expect: success, danger, success.
+    // Row 3 is a 200 with failed_count=1 (failed once then succeeded) — the
+    // final status is 2xx so the status badge should be green.
     const statusTypes = types.filter((t) => t === 'success' || t === 'danger')
-    expect(statusTypes).toEqual(['success', 'danger', 'danger'])
+    expect(statusTypes).toEqual(['success', 'danger', 'success'])
   })
 })

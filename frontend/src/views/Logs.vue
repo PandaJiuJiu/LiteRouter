@@ -88,7 +88,7 @@
       </el-table-column>
       <el-table-column :label="t('logs.col.statusCode')" width="90">
         <template #default="{ row }">
-          <el-tag :type="row.status_code >= 200 && row.status_code < 300 && row.failed_count === 0 ? 'success' : 'danger'">
+          <el-tag :type="row.status_code >= 200 && row.status_code < 300 ? 'success' : 'danger'">
             {{ row.status_code }}
           </el-tag>
         </template>
