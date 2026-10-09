@@ -229,6 +229,7 @@ export default {
     title: '调用日志',
     range: { hour: '一小时', day: '当日', week: '一周', all: '全部' },
     col: {
+      requestId: '请求ID',
       tokens: 'tokens',
       time: '请求时间',
       source: '来源',

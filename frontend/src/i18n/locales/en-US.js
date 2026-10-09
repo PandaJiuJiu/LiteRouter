@@ -237,6 +237,7 @@ export default {
     title: 'Request logs',
     range: { hour: 'Last hour', day: 'Today', week: 'Last week', all: 'All' },
     col: {
+      requestId: 'Req ID',
       tokens: 'Tokens',
       time: 'Time',
       source: 'Source',

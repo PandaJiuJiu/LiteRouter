@@ -42,6 +42,11 @@
       </el-button>
     </div>
     <el-table :data="logs" v-loading="loading" @row-click="open">
+      <el-table-column :label="t('logs.col.requestId')" width="80" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span class="num" style="color: #909399;">#{{ row.id }}</span>
+        </template>
+      </el-table-column>
       <el-table-column :label="t('logs.col.time')" width="165" show-overflow-tooltip>
         <template #default="{ row }">
           {{ new Date(row.created_at * 1000).toLocaleString() }}
