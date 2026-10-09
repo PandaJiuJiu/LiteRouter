@@ -3,6 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import ElementPlus from 'element-plus'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import i18n, { setLocale } from '../src/i18n'
+import zhCN from '../src/i18n/locales/zh-CN'
 
 const listLogs = vi.fn()
 const listLogFilterOptions = vi.fn()
@@ -127,6 +128,19 @@ describe('log filter dropdowns', () => {
     })
   })
 
+  it('always offers the in-progress filter and sends it as status_code 0', async () => {
+    // The server's facet list only carries 0 while a request is genuinely in
+    // flight (that is the facet rule), but the option has to be there anyway:
+    // without it there is no way to ask for the in-progress rows at all.
+    const w = await mountLogs()
+    await pick(w, 4, zhCN.logs.pending)
+
+    expect(lastLogParams()).toEqual({ status: 0 })
+    expect(lastOptionParams()).toEqual({ status: 0 })
+    // The closed select shows the label, not the raw 0 it filters on.
+    expect(selects(w)[4].text()).toContain(zhCN.logs.pending)
+  })
+
   it('goes back to page 1 when a filter changes', async () => {
     const w = await mountLogs()
     w.vm.page = 3
@@ -210,5 +224,78 @@ describe('status tag', () => {
     // final status is 2xx so the status badge should be green.
     const statusTypes = types.filter((t) => t === 'success' || t === 'danger')
     expect(statusTypes).toEqual(['success', 'danger', 'success'])
+  })
+})
+
+describe('in-progress rows', () => {
+  const now = Math.floor(Date.now() / 1000)
+  const event = (id, request_id, over = {}) => ({
+    id,
+    request_id,
+    token_name: 't',
+    request_model: 'gpt-4o',
+    upstream_model: '',
+    channel_name: '',
+    status_code: 0,
+    latency_ms: 0,
+    total_tokens: 0,
+    created_at: now,
+    failed_count: 0,
+    client_ip: '',
+    user_agent: '',
+    client_aborted: false,
+    pending: true,
+    ...over,
+  })
+
+  // The real callbacks the view passed to openLogStream — the row background
+  // and the status filter both react to what arrives on this stream.
+  let onLog
+
+  beforeEach(() => {
+    openLogStream.mockImplementation((cb) => {
+      onLog = cb
+      return { close: vi.fn() }
+    })
+    listLogs.mockImplementation(() => ({ logs: [event(1, 'r1')], total: 1 }))
+  })
+
+  it('marks pending rows with a class the background keys on', async () => {
+    listLogs.mockImplementation(() => ({
+      logs: [event(1, 'r1'), event(2, 'r2', { status_code: 200, pending: false, latency_ms: 100 })],
+      total: 2,
+    }))
+    const w = await mountLogs()
+    const rows = w.findAll('.el-table__row')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].classes()).toContain('row-pending')
+    expect(rows[1].classes()).not.toContain('row-pending')
+  })
+
+  it('shows only in-progress rows once the in-progress filter is on', async () => {
+    const w = await mountLogs()
+    await pick(w, 4, zhCN.logs.pending)
+
+    onLog(event(3, 'r3')) // another request starts
+    onLog(event(4, 'r4', { status_code: 200, pending: false })) // one that already finished
+    await flushPromises()
+
+    const rows = w.findAll('.el-table__row')
+    expect(rows).toHaveLength(2)
+    expect(rows.every((r) => r.classes().includes('row-pending'))).toBe(true)
+  })
+
+  it('drops a row from the list the moment it settles', async () => {
+    const w = await mountLogs()
+    await pick(w, 4, zhCN.logs.pending)
+    expect(w.findAll('.el-table__row')).toHaveLength(1)
+
+    // r1 finishes: status_code 0 → 200, so it no longer matches the filter.
+    // Leaving it would show a settled row masquerading as an in-progress one
+    // until the next page load.
+    onLog(event(1, 'r1', { status_code: 200, pending: false, latency_ms: 100 }))
+    await flushPromises()
+
+    expect(w.findAll('.el-table__row')).toHaveLength(0)
   })
 })

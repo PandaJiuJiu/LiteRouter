@@ -31,9 +31,9 @@
         @change="applyFilters"
       >
         <el-option
-          v-for="v in options[f.key] || []"
+          v-for="v in optionList(f)"
           :key="String(v)"
-          :label="String(v)"
+          :label="optionLabel(f, v)"
           :value="v"
         />
       </el-select>
@@ -41,7 +41,12 @@
         {{ t('logs.filter.reset') }}
       </el-button>
     </div>
-    <el-table :data="logs" v-loading="loading" @row-click="open">
+    <el-table
+      :data="logs"
+      v-loading="loading"
+      :row-class-name="rowClassName"
+      @row-click="open"
+    >
       <el-table-column :label="t('logs.col.requestId')" width="80" show-overflow-tooltip>
         <template #default="{ row }">
           <span class="num" style="color: #909399;">#{{ row.id }}</span>
@@ -212,6 +217,27 @@ const options = ref({})
 const optionsLoading = ref(false)
 const hasFilters = computed(() => FILTER_FIELDS.some((f) => filters[f.key] !== ''))
 
+// status_code 0 = 请求还在进行中。对用户来说"0"读不出任何含义，翻成和状态
+// 列一致的文案；其余状态码就显示数字本身。
+function optionLabel(f, v) {
+  return f.key === 'status' && Number(v) === 0 ? t('logs.pending') : String(v)
+}
+
+// 下拉里的取值。只有 status 特殊：facet 列表只在当下真有进行中请求时才带 0，
+// 而进行中是瞬态的 —— 筛选期间请求一结束，0 就从列表里消失，选中态会退化成
+// 一个裸数字（下次打开下拉也找不到自己选的是什么）。所以这一个选项永远在位：
+// 没有进行中请求时选它，只会得到空列表，这正是"筛出进行中的行"该有的答案。
+function optionList(f) {
+  const list = options.value[f.key] || []
+  if (f.key === 'status' && !list.includes(0)) return [0, ...list]
+  return list
+}
+
+// 进行中的行整行标出来，CSS 靠这个 class 上底色。
+function rowClassName({ row }) {
+  return row.pending === true ? 'row-pending' : ''
+}
+
 // Map of request_id -> row index for efficient matching of final events.
 // When a final event arrives, we update the row in place by request_id
 // (the DB row already exists with a real id). The pending row written at
@@ -228,6 +254,18 @@ function filterParams() {
     if (v !== '' && v !== null && v !== undefined) params[key] = v
   }
   return params
+}
+
+/**
+ * status 是唯一一个"值会自己变"的筛选字段：0 表示进行中，请求结束时同一行
+ * 的状态码就换成了真实结果。所以判断要看键在不在，不能用 truthiness —— 0 正是
+ * 进行中筛选的值，`if (fp.status)` 会把整个筛选跳过。顺带修掉字符串和数字用
+ * `!==` 比较恒为真的老问题（429 筛选下任何 SSE 事件都进不来）。
+ */
+function statusMatches(statusCode) {
+  const fp = filterParams()
+  if (!('status' in fp)) return true
+  return String(statusCode) === String(fp.status)
 }
 
 function applyFilters() {
@@ -358,8 +396,10 @@ function connectStream() {
       if (fp.token && event.token_name !== fp.token) return
       if (fp.model && event.request_model !== fp.model) return
       if (fp.upstream_model && event.upstream_model !== fp.upstream_model) return
-      if (fp.status && String(event.status_code) !== fp.status) return
       if (fp.ip && event.client_ip !== fp.ip) return
+      // status can't be checked here: the status filter is the one predicate a
+      // row can *stop* matching (0 → 200 when the request settles), and a final
+      // event for such a row still has to reach the branch below that drops it.
 
       const isPending = event.pending === true
       const rid = event.request_id
@@ -368,6 +408,7 @@ function connectStream() {
         // Pending event: the request just arrived. The row is already
         // persisted in the DB (status_code = 0), so on a fresh page load
         // `load()` may have brought it in already — dedup by request_id.
+        if (!statusMatches(event.status_code)) return // e.g. filtered to 429
         if (!rid) return // safety
         if (logs.value.some(l => l.request_id === rid)) return
 
@@ -388,13 +429,22 @@ function connectStream() {
         const existing = rid ? logs.value.findIndex(l => l.request_id === rid) : -1
         if (existing !== -1) {
           const updated = transformSseEvent(event)
-          // Keep the same object reference for Vue reactivity
-          Object.assign(logs.value[existing], updated)
-          logs.value[existing].pending = false
+          if (!statusMatches(updated.status_code)) {
+            // 状态码已经不满足当前的 status 筛选（筛"进行中"时请求结束了，或
+            // 筛429 时它落成了 200）。这一行不再属于结果集，移掉而不是留一行
+            // 过期数据 —— 下次翻页之前它会一直在列表里冒充匹配项。
+            logs.value.splice(existing, 1)
+            total.value = Math.max(0, total.value - 1)
+          } else {
+            // Keep the same object reference for Vue reactivity
+            Object.assign(logs.value[existing], updated)
+            logs.value[existing].pending = false
+          }
         } else {
           // No pending row found — treat as normal final event (historical
           // rows loaded from /api/logs predating request_id, or a race where
           // the pending event was missed).
+          if (!statusMatches(event.status_code)) return
           const newLog = transformSseEvent(event)
           // Avoid duplicates by id (DB-assigned id)
           if (!logs.value.find(l => l.id === event.id)) {
@@ -534,6 +584,16 @@ onUnmounted(() => {
 }
 :deep(.el-table__row) {
   cursor: pointer;
+}
+/* 进行中的行：整行刷成暖黄，扫一眼就能和已完成的行分开。表格自己的 hover
+   底色优先级不低，得连 hover 态一起钉死同一个颜色 —— 否则鼠标扫过时这一行
+   会变回灰白，"进行中"的信号刚好在你找它的时候消失。 */
+:deep(.el-table__row.row-pending > td.el-table__cell) {
+  background-color: #fffbf0;
+}
+:deep(.el-table--enable-row-hover .el-table__body tr.row-pending > td.el-table__cell),
+:deep(.el-table--enable-row-hover .el-table__body tr.row-pending:hover > td.el-table__cell) {
+  background-color: #fffbf0;
 }
 .chev {
   color: #c0c4cc;
