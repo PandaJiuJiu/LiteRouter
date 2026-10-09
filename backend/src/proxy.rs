@@ -833,6 +833,68 @@ async fn insert_pending_log(
     Some(res.last_insert_rowid())
 }
 
+/// The status recorded when the client hangs up before we ever got a response
+/// to give it. 499 is the de-facto "Client Closed Request" code (nginx); the
+/// row is *not* a gateway failure, hence the paired `client_aborted = 1`, which
+/// is what the log UI keys its "aborted" tag off of. It must be non-zero:
+/// `status_code = 0` is how every layer (list, detail, SSE) recognizes a row
+/// that is still in flight.
+const CLIENT_CLOSED_STATUS: i64 = 499;
+
+/// Settles the pre-created "in progress" row when the request future is
+/// dropped before any code path got to log the result.
+///
+/// axum/hyper drop the handler future the moment the client disconnects, and
+/// the drop happens wherever the future happened to be parked — usually inside
+/// the upstream `await`. The buffered path's `log_request` and the streaming
+/// path's body `Drop` both live *after* that point, so neither runs: without
+/// this guard the row keeps `status_code = 0` (rendered as "in progress") until
+/// the hourly sweep deletes it. The guard's own Drop runs in that case, so it
+/// can settle the row as an abort.
+///
+/// `disarm` is called by every path that *does* write the settled row (the
+/// synchronous `log_request` calls and the streaming response that will log on
+/// its body Drop). The spawned UPDATE is additionally fenced by
+/// `WHERE status_code = 0`, so even a mis-armed guard can only touch a row
+/// that is still genuinely pending — it can never clobber a real result.
+struct PendingLogGuard {
+    state: Arc<AppState>,
+    log_id: Option<i64>,
+    start: Instant,
+    armed: bool,
+}
+
+impl PendingLogGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingLogGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(log_id) = self.log_id else {
+            return;
+        };
+        let state = self.state.clone();
+        let latency_ms = self.start.elapsed().as_millis() as i64;
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "UPDATE logs SET status_code = ?, client_aborted = 1, error = ?, latency_ms = ? \
+                 WHERE id = ? AND status_code = 0",
+            )
+            .bind(CLIENT_CLOSED_STATUS)
+            .bind("client disconnected")
+            .bind(latency_ms)
+            .bind(log_id)
+            .execute(&state.pool)
+            .await;
+        });
+    }
+}
+
 /// The result of a client request, in the shape the `logs` row needs. Written
 /// exactly once per request — by the streaming path from `Drop`, by the
 /// buffered path inline.
@@ -2745,6 +2807,16 @@ async fn relay(
     )
     .await;
 
+    // Settles the pending row if the client hangs up while we're still waiting
+    // on an upstream (which drops this future and skips every `log_request`
+    // below). Disarmed by each path that writes the real result.
+    let mut pending_guard = PendingLogGuard {
+        state: state_arc.clone(),
+        log_id,
+        start: relay_start,
+        armed: true,
+    };
+
     // Broadcast pending event so the log page shows "in progress" immediately.
     // The id is the real `logs.id` unless the pending insert failed (then 0).
     let pending_event = LogEvent {
@@ -2802,7 +2874,12 @@ async fn relay(
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
                 Ok(c) => c,
-                Err(s) => return error_response(protocol, s, "internal error", None),
+                Err(s) => {
+                    // A real (if rare) gateway-side failure, not a client
+                    // disconnect — disarm so the guard doesn't mislabel it.
+                    pending_guard.disarm();
+                    return error_response(protocol, s, "internal error", None);
+                }
             }
         } else {
             match pinned_channel(state, pin_channel, protocol).await {
@@ -2883,7 +2960,14 @@ async fn relay(
             match outcome {
                 UpstreamOutcome::Ok(body) => {
                     state.breaker.record(&breaker_key, Outcome::Success).await;
-                    return respond_from_upstream(
+                    // Keep the guard armed *through* `respond_from_upstream`:
+                    // it can still be dropped mid-`await` (the buffered path's
+                    // DB write, the streaming path's peek), and the guard's
+                    // `WHERE status_code = 0` makes settling again a no-op once
+                    // the result is in. Only after it returns do we hand the row
+                    // off — to the inline log (buffered) or to the stream's body
+                    // `Drop` (which will write it later).
+                    let (resp, _attempt) = respond_from_upstream(
                         &RelayCtx {
                             state,
                             state_arc: state_arc.clone(),
@@ -2902,8 +2986,9 @@ async fn relay(
                         body,
                         attempts,
                     )
-                    .await
-                    .0;
+                    .await;
+                    pending_guard.disarm();
+                    return resp;
                 }
                 UpstreamOutcome::Http {
                     status: code,
@@ -3044,6 +3129,7 @@ async fn relay(
             created_at,
         };
         // Synchronous log write so tests and admin UI see it immediately.
+        pending_guard.disarm();
         let _ = log_request(state, &entry).await;
         return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
     }
@@ -3117,6 +3203,7 @@ async fn relay(
     };
     // Synchronous log write so tests and admin UI see it immediately. Debug
     // file writes stay async off the response path.
+    pending_guard.disarm();
     let log_event = log_request(state, &entry).await;
     // Unconditional: a request that exhausted every candidate is exactly the
     // one an admin will want to investigate, and whether the debug switch was

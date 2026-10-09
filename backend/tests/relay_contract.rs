@@ -13,11 +13,12 @@
 
 mod support;
 
-use axum::body::to_bytes;
-use axum::http::StatusCode;
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sqlx::Row;
 use support::Harness;
+use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2531,5 +2532,86 @@ async fn a_converted_stream_captures_the_upstream_bytes_too() {
     assert!(
         body.contains("[DONE]"),
         "captured stream was empty: {body:?}"
+    );
+}
+
+// ===================== client disconnect =====================
+
+/// hyper drops the handler future the moment the downstream socket closes.
+/// That happens *before* either the buffered `log_request` or a stream's body
+/// `Drop` runs, so without `PendingLogGuard` the row pre-created by
+/// `insert_pending_log` kept `status_code = 0` ("in progress") until the hourly
+/// sweep deleted it. The guard's own Drop settles the row as a client abort.
+#[tokio::test]
+async fn a_client_that_disconnects_before_the_response_settles_the_log_as_aborted() {
+    let server = MockServer::start().await;
+    // Slow enough that the client is guaranteed to hang up long before the
+    // upstream answers.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let router = h.router.clone();
+    let task = tokio::spawn(async move {
+        let _ = router.oneshot(req).await;
+    });
+
+    // Wait until the relay has persisted its pending row, so aborting here
+    // reproduces the real ordering (row exists, response does not) rather than
+    // racing the spawn.
+    let mut pending = false;
+    for _ in 0..200 {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE status_code = 0")
+            .fetch_one(h.pool())
+            .await
+            .unwrap();
+        if n > 0 {
+            pending = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(pending, "the relay never wrote its pending row");
+
+    task.abort();
+    let _ = task.await;
+
+    // The guard settles the row from its Drop, asynchronously.
+    let mut settled = false;
+    for _ in 0..200 {
+        if let Some(row) = sqlx::query(
+            "SELECT status_code, client_aborted, error FROM logs WHERE status_code <> 0",
+        )
+        .fetch_optional(h.pool())
+        .await
+        .unwrap()
+        {
+            assert_eq!(row.get::<i64, _>("status_code"), 499);
+            assert_eq!(row.get::<i64, _>("client_aborted"), 1);
+            assert_eq!(row.get::<String, _>("error"), "client disconnected");
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        settled,
+        "the pending row was never settled after disconnect"
     );
 }
