@@ -6,6 +6,50 @@
 
 ---
 
+## [0.0.6] - 2026-10-09
+
+自 v0.0.5 起共 34 个提交。
+
+### 新增
+
+- **日志页增加 TTFT 指标**：新增 `logs.ttft_ms` / `log_attempts.ttft_ms` 字段，
+  记录流式请求从发起到收到首个 token 的耗时（毫秒），在日志详情页展示
+- **熔断器支持 Retry-After 提示**：上游返回 429 时携带 `Retry-After` 响应头，
+  优先使用该值作为退避时长（上限 600s），而非自行计算指数退避
+- **用量统计图**：前端用量页新增柱状图展示，直观对比各时段的 token 消耗
+- **流截断原因诊断**：当上游在协议终止符（`message_stop` / `[DONE]`）前断开连接时，
+  `error` 字段记录详细原因——`'upstream closed before stream end'` / `'upstream stream error'` /
+  `'upstream transport error'`，无需查看 debug capture 即可定位 provider 问题
+
+### 修复
+
+- **streaming 响应 `usage: null` 导致 0 token**：云知声等 provider 的流式 chunk 带 `"usage": null`，
+  原代码将其视为「无 usage 字段」返回 `None`，merge 逻辑跳过这些 chunk 导致 log 显示 0 tokens。
+  修复：`usage_from_sse_payload()` 检测 `null` 后返回 `Some(Usage::default())`
+- **Anthropic→OpenAI 流式转换的 usage 合并**：Anthropic 流将 input/output tokens 拆分到不同事件，
+  原来 wholesale replace 会被最后一帧的 output only chunk 覆盖 prompt tokens。
+  修复：改为字段级合并
+- **OpenAI 请求未带 `include_usage` 导致流式请求记录 0 tokens**：OpenAI 端点需要显式请求
+  `stream_options: { include_usage: true }` 才会返回 usage，原 convert 漏掉了
+
+### 重构
+
+- **后端**：
+  - `convert.rs` 拆分为 `convert/` 目录（`mod.rs` + `openai.rs` + `anthropic.rs` + `streaming.rs`）
+  - `mappings.rs` 提取 `TargetEntry` + `parse/encode/clean_targets` 工具函数，解决 proxy 和 config_backup 的循环依赖
+  - `db.rs` 统一 `deserialize_use_proxy` 消除三处重复定义
+  - `settings.rs` 三组 proxy UPSERT 合并为循环
+  - `users.rs` 提取 `has_other_admin` 复用逻辑
+  - `proxy_enabled` 字段改名为 `proxy_on` 避免遮蔽
+  - 配置备份三组 `free_channel/token/alias` 循环合并为单个通用循环
+- **前端**：设置入口从侧边栏移至用户下拉菜单；模型管理页支持拖拽排序
+
+### 移除
+
+- **GitHub Actions CI**：fmt / clippy 改为本地手动检查，加快迭代速度
+
+---
+
 ## [0.0.5] - 2026-10-04
 
 自 v0.0.4 起共 19 个提交。
