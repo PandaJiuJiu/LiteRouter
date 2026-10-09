@@ -1928,9 +1928,8 @@ impl<S> Drop for LogOnEnd<S> {
                 None
             };
 
-            let client_aborted = stream_error.is_none()
-                && !self.pump_saw_err
-                && !finish.saw_terminal;
+            let client_aborted =
+                stream_error.is_none() && !self.pump_saw_err && !finish.saw_terminal;
             tokio::spawn(async move {
                 log.spawn_inline(usage, capture, stream_error, client_aborted, abort_reason)
                     .await;
