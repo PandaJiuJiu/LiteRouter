@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 
 /// One entry in the ordered `targets` array. The `#[serde(untagged)]` lets
 /// both the new object form and the legacy plain-string form deserialize
-/// from the same column.
+/// from the same column — and, just as importantly, makes `encode_targets`
+/// serialize the `Obj` variant as a flat `{"channel":…,"model":…}` object
+/// instead of serde's default externally-tagged `{"Obj":{…}}` wrapper,
+/// which `deserialize_targets` cannot read back.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum TargetEntry {
     Obj {
         /// empty = any channel serving this model
@@ -95,6 +99,15 @@ pub fn deserialize_targets(raw: serde_json::Value) -> Vec<TargetEntry> {
             .filter_map(|v| match v {
                 serde_json::Value::String(s) => Some(TargetEntry::Str(s)),
                 serde_json::Value::Object(mut obj) => {
+                    // Rows written by the pre-untagged `encode_targets` carry
+                    // serde's external tag as a wrapper: {"Obj":{channel,model}}.
+                    // Unwrap it so those rows still load instead of silently
+                    // dropping every target.
+                    if obj.len() == 1 && obj.contains_key("Obj") {
+                        if let Some(serde_json::Value::Object(inner)) = obj.remove("Obj") {
+                            obj = inner;
+                        }
+                    }
                     let model = obj
                         .remove("model")
                         .and_then(|v| v.as_str().map(String::from))
@@ -150,5 +163,25 @@ mod tests {
     fn parse_targets_from_string_json() {
         let parsed = parse_targets(r#"["gpt-4o-mini"]"#, "");
         assert_eq!(parsed, vec![("".to_string(), "gpt-4o-mini".to_string())]);
+    }
+
+    #[test]
+    fn encode_targets_writes_flat_objects() {
+        // Regression guard: serde's default external tagging writes
+        // {"Obj":{...}}, which deserialize_targets cannot read back.
+        let encoded = encode_targets(&[("volc".to_string(), "gpt-4o".to_string())]);
+        let parsed = parse_targets(&encoded, "");
+        assert_eq!(
+            parsed,
+            vec![("volc".to_string(), "gpt-4o".to_string())],
+            "encode output must round-trip through parse_targets, got: {encoded}"
+        );
+    }
+
+    #[test]
+    fn parse_targets_unwraps_legacy_external_tag() {
+        // Rows already corrupted in production DBs by the old encoder.
+        let parsed = parse_targets(r#"[{"Obj":{"channel":"OpenRouter","model":"*"}}]"#, "");
+        assert_eq!(parsed, vec![("OpenRouter".to_string(), "*".to_string())]);
     }
 }
