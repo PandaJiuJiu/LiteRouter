@@ -122,6 +122,11 @@ pub fn verify_password(plain: &str, hash_hex: &str, salt_hex: &str) -> bool {
 /// match nothing and leak every child row.
 pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<u64, sqlx::Error> {
     let cutoff = now() - retention_days * 86400;
+    // "In progress" rows (status_code = 0) belong to requests whose final
+    // update never arrived — e.g. the process crashed mid-relay. They must not
+    // linger as fake pending rows forever, so sweep them once they're older
+    // than this grace period (generous: legitimate streams can run minutes).
+    let pending_cutoff = now() - 30 * 60;
 
     // Collect the IDs whose debug files need to be purged before we delete the
     // rows. Errors there are non-fatal — see `proxy::delete_debug_log`.
@@ -130,6 +135,14 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
         .fetch_all(pool)
         .await
         .unwrap_or_default();
+    // Pending-stale rows have no debug files yet (they were never finalized),
+    // but keep the list complete for the file purge below anyway.
+    let _stale_pending_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM logs WHERE status_code = 0 AND created_at < ?")
+            .bind(pending_cutoff)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -138,8 +151,18 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
     .bind(cutoff)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "DELETE FROM log_attempts WHERE log_id IN (SELECT id FROM logs WHERE status_code = 0 AND created_at < ?)",
+    )
+    .bind(pending_cutoff)
+    .execute(&mut *tx)
+    .await?;
     let res = sqlx::query("DELETE FROM logs WHERE created_at < ?")
         .bind(cutoff)
+        .execute(&mut *tx)
+        .await?;
+    let pending_res = sqlx::query("DELETE FROM logs WHERE status_code = 0 AND created_at < ?")
+        .bind(pending_cutoff)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -147,8 +170,9 @@ pub async fn cleanup_old_logs(pool: &SqlitePool, retention_days: i64) -> Result<
     for id in ids {
         crate::proxy::delete_debug_log(pool, id).await;
     }
+    // Stale pending rows never produced a debug file; nothing to purge there.
 
-    Ok(res.rows_affected())
+    Ok(res.rows_affected() + pending_res.rows_affected())
 }
 
 /// Read one key from the settings table. Returns None if the key does not

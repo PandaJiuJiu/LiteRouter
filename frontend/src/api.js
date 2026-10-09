@@ -113,6 +113,17 @@ export function openLogStream(onLog, onError, onPing) {
     }
   })
 
+  // Pending events (request in flight) have event type "pending"
+  // and carry { pending: true, request_id: "..." }.
+  es.addEventListener('pending', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      onLog(data)
+    } catch (_) {
+      // ignore parse errors
+    }
+  })
+
   es.addEventListener('ping', () => {
     onPing?.()
   })

@@ -33,6 +33,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use serde_json::{json, Value};
 use sqlx::Row;
+use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -781,6 +782,57 @@ fn extract_client_info(headers: &HeaderMap, direct_ip: Option<std::net::SocketAd
     ClientInfo { ip, user_agent }
 }
 
+/// Generate a per-request correlation ID.
+/// Format: `{token_name}|{request_model}|{nanos_since_epoch}`.
+/// Used to match the pending event with the final event on the frontend.
+fn new_request_id(token_name: &str, model: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{token_name}|{model}|{nanos}")
+}
+
+/// Write the "in progress" `logs` row for a request that just arrived.
+///
+/// `status_code = 0` marks the row as pending; `request_id` is persisted so
+/// the row can be matched to its final event and so a page refresh keeps
+/// showing in-flight requests. The row is later updated in place by
+/// `log_request` once the request settles. Returns the new `logs.id`, or
+/// `None` if the insert fails (the relay proceeds anyway — the final
+/// `log_request` will insert the row then).
+async fn insert_pending_log(
+    pool: &SqlitePool,
+    token_name: &str,
+    request_model: &str,
+    protocol: &str,
+    streaming: bool,
+    client_info: &ClientInfo,
+    request_id: &str,
+) -> Option<i64> {
+    let res = sqlx::query(
+        "INSERT INTO logs \
+         (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, \
+          total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, \
+          upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, \
+          failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id) \
+         VALUES (?, ?, '', 0, 0, 0, 0, ?, ?, 0, ?, ?, '', '', '', 0, 0, 0, 0, ?, ?, 0, 0, ?)",
+    )
+    .bind(token_name)
+    .bind(request_model) // `model` — overwritten on finalize; keeps list fallback sane
+    .bind(now())
+    .bind(request_model)
+    .bind(streaming as i64)
+    .bind(protocol)
+    .bind(&client_info.ip)
+    .bind(&client_info.user_agent)
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .ok()?;
+    Some(res.last_insert_rowid())
+}
+
 /// The result of a client request, in the shape the `logs` row needs. Written
 /// exactly once per request — by the streaming path from `Drop`, by the
 /// buffered path inline.
@@ -811,6 +863,19 @@ struct LogEntry {
     /// Time to First Token in milliseconds. Only meaningful for streaming
     /// requests; 0 for non-streaming.
     ttft_ms: i64,
+    /// Per-request correlation ID, identical across the pending and final
+    /// events. Used by the frontend to match the "in progress" row to its
+    /// final result.
+    request_id: String,
+    /// The `logs.id` of the pre-inserted pending row (written by
+    /// `insert_pending_log` when the request arrived). `Some(id)` makes
+    /// `log_request` update that row in place; `None` (pending insert failed)
+    /// makes it insert a fresh row.
+    log_id: Option<i64>,
+    /// Unix timestamp (seconds) when the request arrived. Preserved on the
+    /// final row and event so the list order and detail page reflect when
+    /// the request started, not when it settled.
+    created_at: i64,
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
@@ -827,39 +892,86 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         Ok(t) => t,
         Err(_) => return None,
     };
-    let inserted = match sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&e.token_name)
-    .bind(&winner.upstream_model)
-    .bind(&winner.channel_name)
-    .bind(winner.status)
-    .bind(u.prompt)
-    .bind(u.completion)
-    .bind(u.total)
-    .bind(now())
-    .bind(&e.request_model)
-    .bind(winner.latency_ms)
-    .bind(e.streaming as i64)
-    .bind(&e.protocol)
-    .bind(convert_label(winner.convert))
-    .bind(&winner.upstream_model)
-    .bind(&winner.error)
-    .bind(u.cache_read)
-    .bind(u.cache_creation)
-    .bind(u.reasoning)
-    .bind(failed_count)
-    .bind(&e.client_ip)
-    .bind(&e.user_agent)
-    .bind(e.client_aborted as i64)
-    .bind(e.ttft_ms)
-    .execute(&mut *tx)
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => return None,
+    // The pending row was inserted when the request arrived (see
+    // `insert_pending_log`); settle it in place so the id stays stable across
+    // the list, the detail page, and the SSE pending/final events. If the
+    // pending insert failed (`log_id == None`), fall back to a fresh INSERT.
+    let log_id = match e.log_id {
+        Some(id) => {
+            let updated = sqlx::query(
+                "UPDATE logs SET token_name=?, model=?, channel_name=?, status_code=?, \
+                 prompt_tokens=?, completion_tokens=?, total_tokens=?, request_model=?, \
+                 latency_ms=?, stream=?, protocol=?, convert=?, upstream_model=?, error=?, \
+                 cache_read_tokens=?, cache_creation_tokens=?, reasoning_tokens=?, \
+                 failed_count=?, client_ip=?, user_agent=?, client_aborted=?, ttft_ms=? \
+                 WHERE id=?",
+            )
+            .bind(&e.token_name)
+            .bind(&winner.upstream_model)
+            .bind(&winner.channel_name)
+            .bind(winner.status)
+            .bind(u.prompt)
+            .bind(u.completion)
+            .bind(u.total)
+            .bind(&e.request_model)
+            .bind(winner.latency_ms)
+            .bind(e.streaming as i64)
+            .bind(&e.protocol)
+            .bind(convert_label(winner.convert))
+            .bind(&winner.upstream_model)
+            .bind(&winner.error)
+            .bind(u.cache_read)
+            .bind(u.cache_creation)
+            .bind(u.reasoning)
+            .bind(failed_count)
+            .bind(&e.client_ip)
+            .bind(&e.user_agent)
+            .bind(e.client_aborted as i64)
+            .bind(e.ttft_ms)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+            match updated {
+                Ok(_) => id,
+                Err(_) => return None,
+            }
+        }
+        None => {
+            let res = sqlx::query(
+                "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&e.token_name)
+            .bind(&winner.upstream_model)
+            .bind(&winner.channel_name)
+            .bind(winner.status)
+            .bind(u.prompt)
+            .bind(u.completion)
+            .bind(u.total)
+            .bind(e.created_at)
+            .bind(&e.request_model)
+            .bind(winner.latency_ms)
+            .bind(e.streaming as i64)
+            .bind(&e.protocol)
+            .bind(convert_label(winner.convert))
+            .bind(&winner.upstream_model)
+            .bind(&winner.error)
+            .bind(u.cache_read)
+            .bind(u.cache_creation)
+            .bind(u.reasoning)
+            .bind(failed_count)
+            .bind(&e.client_ip)
+            .bind(&e.user_agent)
+            .bind(e.client_aborted as i64)
+            .bind(e.ttft_ms)
+            .bind(&e.request_id)
+            .execute(&mut *tx)
+            .await;
+            match res {
+                Ok(r) => r.last_insert_rowid(),
+                Err(_) => return None,
+            }
+        }
     };
-    let log_id = inserted.last_insert_rowid();
 
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
@@ -893,13 +1005,15 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         status_code: winner.status,
         latency_ms: winner.latency_ms,
         total_tokens: u.total,
-        created_at: now(),
+        created_at: e.created_at,
         failed_count,
         client_ip: e.client_ip.clone(),
         user_agent: e.user_agent.clone(),
         client_aborted: e.client_aborted,
         streaming: e.streaming,
         protocol: e.protocol.clone(),
+        request_id: e.request_id.clone(),
+        pending: false,
     };
     let _ = state.log_sender.send(event.clone());
 
@@ -2321,6 +2435,15 @@ struct RelayCtx<'a> {
     streaming: bool,
     start: Instant,
     client_info: ClientInfo,
+    /// Per-request correlation ID, passed through to LogEntry for the final
+    /// broadcast event. Matches the pending event's request_id.
+    request_id: &'a str,
+    /// `logs.id` of the pre-inserted pending row, if the pending insert
+    /// succeeded. Passed through to LogEntry so the final log write settles
+    /// the same row.
+    log_id: Option<i64>,
+    /// Unix timestamp (seconds) when the request arrived.
+    created_at: i64,
 }
 
 /// Convert an upstream response into the client response, returning the
@@ -2364,6 +2487,9 @@ async fn respond_from_upstream(
         // TTFT: for buffered responses, it's the whole latency (no meaningful TTFT
         // distinction). Streaming responses compute TTFT when the first content arrives.
         ttft_ms: latency_ms,
+        request_id: ctx.request_id.to_string(),
+        log_id: ctx.log_id,
+        created_at: ctx.created_at,
     };
 
     let (status, content_type, bytes, capture) = match body {
@@ -2495,20 +2621,20 @@ async fn respond_from_upstream(
 
     let entry = entry_of(attempt.clone(), attempts);
     let ok = attempt.ok;
-    // Spawned, not awaited: the fsync-heavy log INSERT and any debug-file
-    // writes must not sit between the client and their response bytes. The
-    // streaming path already logs this way (LogOnEnd::drop).
-    let state_arc = ctx.state_arc.clone();
-    let capture_clone = capture.clone();
-    tokio::spawn(async move {
-        let log_event = log_request(&state_arc, &entry).await;
-        // Only write debug file if should_capture (failure or debug switch on)
-        if should_capture(&state_arc, ok) {
-            if let Some(event) = log_event {
+    // Synchronous log write for non-streaming: tests and admin UI expect the
+    // row to be visible immediately after the response returns. The debug file
+    // write stays async to keep the response hot path fast.
+    let log_event = log_request(ctx.state, &entry).await;
+    // Only write debug file if should_capture (failure or debug switch on)
+    if should_capture(ctx.state, ok) {
+        if let Some(event) = log_event {
+            let capture_clone = capture.clone();
+            let state_arc = ctx.state_arc.clone();
+            tokio::spawn(async move {
                 write_debug_log(&state_arc.pool, event.id, &capture_clone).await;
-            }
+            });
         }
-    });
+    }
     let mut builder = Response::builder().status(status);
     if let Some(ct) = content_type {
         if let Some(h) = builder.headers_mut() {
@@ -2581,6 +2707,48 @@ async fn relay(
     // One clock per request, started after auth+parse so the logged
     // latency reflects only the upstream work.
     let relay_start = Instant::now();
+
+    // Per-request correlation ID: used to match pending/final events.
+    let request_id = new_request_id(&token_name, &model);
+    let created_at = now();
+
+    // Persist the "in progress" row before any upstream work, so the log page
+    // keeps showing the request after a refresh and the row has a real id for
+    // the detail page. `log_id` is threaded into `LogEntry` so `log_request`
+    // settles this same row instead of inserting a second one.
+    let log_id = insert_pending_log(
+        &state.pool,
+        &token_name,
+        &model,
+        protocol,
+        is_streaming,
+        &client_info,
+        &request_id,
+    )
+    .await;
+
+    // Broadcast pending event so the log page shows "in progress" immediately.
+    // The id is the real `logs.id` unless the pending insert failed (then 0).
+    let pending_event = LogEvent {
+        id: log_id.unwrap_or(0),
+        token_name: token_name.clone(),
+        request_model: model.clone(),
+        upstream_model: String::new(),
+        channel_name: String::new(),
+        status_code: 0,
+        latency_ms: 0,
+        total_tokens: 0,
+        created_at,
+        failed_count: 0,
+        client_ip: client_info.ip.clone(),
+        user_agent: client_info.user_agent.clone(),
+        client_aborted: false,
+        streaming: is_streaming,
+        protocol: protocol.to_string(),
+        request_id: request_id.clone(),
+        pending: true,
+    };
+    let _ = state.log_sender.send(pending_event);
 
     // 3+4. walk the ordered target list; for each (channel, model) target,
     // rewrite the request body's model field and try it — pinned targets go
@@ -2707,6 +2875,9 @@ async fn relay(
                             streaming: is_streaming,
                             start: relay_start,
                             client_info: client_info.clone(),
+                            request_id: &request_id,
+                            log_id,
+                            created_at,
                         },
                         target_model,
                         cand,
@@ -2850,13 +3021,12 @@ async fn relay(
             user_agent: client_info.user_agent.clone(),
             client_aborted: false,
             ttft_ms: 0, // No upstream contacted for routing failures
+            request_id: request_id.clone(),
+            log_id,
+            created_at,
         };
-        // Spawned, not awaited: keep DB fsync and file writes off the response
-        // path. We clone `state_arc` so the owned Arc can move into the task.
-        let state_arc2 = state_arc.clone();
-        tokio::spawn(async move {
-            let _ = log_request(&state_arc2, &entry).await;
-        });
+        // Synchronous log write so tests and admin UI see it immediately.
+        let _ = log_request(state, &entry).await;
         return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
     }
     // Pick the most informative status code:
@@ -2912,7 +3082,6 @@ async fn relay(
     let protocol_for_log = protocol.to_string();
     let is_streaming_for_log = is_streaming;
     let last_capture_for_log = last_capture;
-    let state_for_log = state_arc.clone();
     let entry = LogEntry {
         token_name,
         request_model: model,
@@ -2924,54 +3093,57 @@ async fn relay(
         user_agent: client_info.user_agent.clone(),
         client_aborted: false,
         ttft_ms: 0, // All candidates failed, no meaningful TTFT
+        request_id: request_id.clone(),
+        log_id,
+        created_at,
     };
-    // Spawned, not awaited: keep DB fsync and file writes off the response
-    // path. We clone `state_arc` so the owned Arc can move into the task.
-    let state_arc2 = state_arc.clone();
-    tokio::spawn(async move {
-        let log_event = log_request(&state_arc2, &entry).await;
-        // Unconditional: a request that exhausted every candidate is exactly the
-        // one an admin will want to investigate, and whether the debug switch was
-        // on when it happened is not something they can retroactively know.
-        if let Some(capture) = last_capture_for_log {
-            // Add metadata to the captured debug info
-            let last_attempt = entry.attempts.last().cloned();
-            if let Some(attempt) = last_attempt {
-                let breaker_key =
-                    breaker::breaker_key(&attempt.channel_name, &attempt.upstream_model);
-                capture.set_meta(DebugMeta {
-                    channel_name: attempt.channel_name,
-                    upstream_model: attempt.upstream_model,
-                    protocol: protocol_for_log,
-                    convert_mode: match attempt.convert {
-                        ConvertMode::None => "none".to_string(),
-                        ConvertMode::ToOpenAI => "to_openai".to_string(),
-                        ConvertMode::ToAnthropic => "to_anthropic".to_string(),
-                    },
-                    attempt_number: entry.attempts.len(),
-                    total_attempts: entry.attempts.len(),
-                    client_ip: client_info_for_log.ip.clone(),
-                    user_agent: client_info_for_log.user_agent.clone(),
-                    token_name: token_name_for_log,
-                    is_streaming: is_streaming_for_log,
+    // Synchronous log write so tests and admin UI see it immediately. Debug
+    // file writes stay async off the response path.
+    let log_event = log_request(state, &entry).await;
+    // Unconditional: a request that exhausted every candidate is exactly the
+    // one an admin will want to investigate, and whether the debug switch was
+    // on when it happened is not something they can retroactively know.
+    if let Some(capture) = last_capture_for_log {
+        // Add metadata to the captured debug info
+        let last_attempt = entry.attempts.last().cloned();
+        if let Some(attempt) = last_attempt {
+            let breaker_key = breaker::breaker_key(&attempt.channel_name, &attempt.upstream_model);
+            capture.set_meta(DebugMeta {
+                channel_name: attempt.channel_name,
+                upstream_model: attempt.upstream_model,
+                protocol: protocol_for_log,
+                convert_mode: match attempt.convert {
+                    ConvertMode::None => "none".to_string(),
+                    ConvertMode::ToOpenAI => "to_openai".to_string(),
+                    ConvertMode::ToAnthropic => "to_anthropic".to_string(),
+                },
+                attempt_number: entry.attempts.len(),
+                total_attempts: entry.attempts.len(),
+                client_ip: client_info_for_log.ip.clone(),
+                user_agent: client_info_for_log.user_agent.clone(),
+                token_name: token_name_for_log,
+                is_streaming: is_streaming_for_log,
+            });
+            if let Some((is_open, reason, cooldown, backoff)) =
+                state.breaker.get_key_state(&breaker_key).await
+            {
+                capture.set_breaker_state(DebugBreakerState {
+                    key: breaker_key,
+                    is_open,
+                    reason,
+                    cooldown_remaining_secs: cooldown,
+                    current_backoff_secs: backoff,
                 });
-                if let Some((is_open, reason, cooldown, backoff)) =
-                    state_for_log.breaker.get_key_state(&breaker_key).await
-                {
-                    capture.set_breaker_state(DebugBreakerState {
-                        key: breaker_key,
-                        is_open,
-                        reason,
-                        cooldown_remaining_secs: cooldown,
-                        current_backoff_secs: backoff,
-                    });
-                }
-            }
-            if let Some(event) = log_event {
-                write_debug_log(&state_arc2.pool, event.id, &capture).await;
             }
         }
-    });
+        if let Some(event) = log_event {
+            let capture_clone = capture.clone();
+            let state_arc2 = state_arc.clone();
+            tokio::spawn(async move {
+                write_debug_log(&state_arc2.pool, event.id, &capture_clone).await;
+            });
+        }
+    }
     error_response(protocol, final_status, &err, relay_retry_after.as_deref())
 }
 

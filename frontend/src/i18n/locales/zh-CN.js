@@ -254,6 +254,8 @@ export default {
       reset: '重置',
     },
     debugLogging: '调试日志',
+    pending: '进行中',
+    timeout: '超时',
   },
   logDetail: {
     back: '‹ 返回日志列表',

@@ -8,7 +8,11 @@
     <template v-if="log">
       <!-- 一眼扫到的状态条 -->
       <div class="status-bar">
-        <el-tag :type="ok ? 'success' : 'danger'" size="large">{{ log.status_code }}</el-tag>
+        <el-tag v-if="log.pending" type="info" size="large">
+          <i class="el-icon-loading" style="margin-right: 4px;" />
+          {{ t('logs.pending') }}
+        </el-tag>
+        <el-tag v-else :type="ok ? 'success' : 'danger'" size="large">{{ log.status_code }}</el-tag>
         <span class="latency" v-if="log.latency_ms > 0">
           {{ log.latency_ms.toLocaleString() }} ms
           <span class="hint">{{ t('logDetail.latencyHint') }}</span>
@@ -28,7 +32,7 @@
         </el-tooltip>
       </div>
 
-      <el-alert v-if="log.error" type="error" :title="log.error" :closable="false" show-icon />
+      <el-alert v-if="log && !log.pending && log.error" type="error" :title="log.error" :closable="false" show-icon />
 
       <!-- 基本信息 -->
       <section>
@@ -139,7 +143,7 @@ async function load() {
   loading.value = true
   try {
     log.value = await getLog(route.params.id)
-    ok.value = log.value && log.value.status_code >= 200 && log.value.status_code < 300
+    ok.value = log.value?.pending ? null : (log.value && log.value.status_code >= 200 && log.value.status_code < 300)
   } finally {
     loading.value = false
   }

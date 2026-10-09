@@ -1034,13 +1034,14 @@ pub async fn list_logs(
             };
             let id = r.get::<i64, _>("id");
             let failed_count: i64 = r.try_get("failed_count").unwrap_or(0);
+            let status_code = r.get::<i64, _>("status_code");
             json!({
                 "id": id,
                 "token_name": r.get::<String, _>("token_name"),
                 "request_model": r.get::<String, _>("request_model"),
                 "upstream_model": upstream_model,
                 "channel_name": r.get::<String, _>("channel_name"),
-                "status_code": r.get::<i64, _>("status_code"),
+                "status_code": status_code,
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "total_tokens": r.get::<i64, _>("total_tokens"),
@@ -1059,6 +1060,11 @@ pub async fn list_logs(
                 "created_at": r.get::<i64, _>("created_at"),
                 "client_ip": r.get::<String, _>("client_ip"),
                 "user_agent": r.get::<String, _>("user_agent"),
+                // `status_code == 0` marks a request still in flight — the
+                // pending row written by `insert_pending_log`. `request_id`
+                // lets the SSE stream correlate this row with live events.
+                "pending": status_code == 0,
+                "request_id": r.try_get::<String, _>("request_id").unwrap_or_default(),
             })
         })
         .collect();
@@ -1236,6 +1242,10 @@ pub async fn get_log(
             "created_at": row.get::<i64, _>("created_at"),
             "client_ip": row.get::<String, _>("client_ip"),
             "user_agent": row.get::<String, _>("user_agent"),
+            // `status_code == 0` marks a request still in flight; the detail
+            // page renders it as "in progress" rather than a failed 0.
+            "pending": row.get::<i64, _>("status_code") == 0,
+            "request_id": row.try_get::<String, _>("request_id").unwrap_or_default(),
         }
     })))
 }
@@ -1650,8 +1660,12 @@ pub async fn log_stream(
                             }
 
                             idle_count = 0;
+                            // Pending events use "pending" type, final events use "log".
+                            // Both carry the same LogEvent JSON; the frontend distinguishes
+                            // by the `pending` field.
+                            let event_type = if event.pending { "pending" } else { "log" };
                             let sse = Event::default()
-                                .event("log")
+                                .event(event_type)
                                 .json_data(&event)
                                 .unwrap_or_else(|_| {
                                     Event::default()

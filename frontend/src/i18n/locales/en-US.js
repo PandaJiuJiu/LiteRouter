@@ -263,6 +263,8 @@ export default {
       reset: 'Reset',
     },
     debugLogging: 'Debug log',
+    pending: 'Pending',
+    timeout: 'Timed out',
   },
   logDetail: {
     back: '‹ Back to logs',

@@ -353,15 +353,19 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 use tower::ServiceExt;
 
-/// Poll the DB until at least `expected` rows exist in `logs`, or `timeout`
-/// elapses. Use this after a non-streaming relay request when the backend logs
+/// Poll the DB until at least `expected` settled rows exist in `logs`, or
+/// `timeout` elapses. Use this after a relay request when the backend logs
 /// asynchronously off the response hot path.
+///
+/// Rows with `status_code = 0` are "in progress" (written when the request
+/// arrived) and are not settled yet — they only count once finalized, so a
+/// test that waits for one log row won't accidentally read a pending row.
 pub async fn wait_for_logs(pool: &SqlitePool, expected: i64, timeout: Duration) {
     let mut ticker = interval(Duration::from_millis(10));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE status_code <> 0")
             .fetch_one(pool)
             .await
             .unwrap_or(0);

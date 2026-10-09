@@ -5,10 +5,28 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
-/// Event emitted when a request completes and is logged.
+/// Event emitted for a client request's lifecycle on the log page.
+///
+/// Emitted **twice** per request:
+/// - `pending == true`: the request has just arrived and is being relayed.
+///   A `logs` row with `status_code = 0` is already committed at this point
+///   (`id` is its real primary key), so the in-progress request survives a
+///   page refresh. If the pending row insert fails, `id` falls back to `0`.
+/// - `pending == false`: the request has completed (success, failure, or
+///   stream end) and the same `logs` row has been updated in place. `id` is
+///   unchanged — it was assigned when the pending row was written.
+///
+/// Both events share the same `request_id`, which the frontend uses to match
+/// the "in progress" row to its final result.
 #[derive(Clone, serde::Serialize)]
 pub struct LogEvent {
+    /// Real `logs.id` — assigned when the pending row is inserted, and kept
+    /// when the row is updated on completion. `0` only if the pending insert
+    /// failed and the row is written later.
     pub id: i64,
+    /// Per-request correlation key, identical across the pending and final
+    /// events for one client request. Format: `{token}|{model}|{nanos}`.
+    pub request_id: String,
     pub token_name: String,
     pub request_model: String,
     pub upstream_model: String,
@@ -23,6 +41,9 @@ pub struct LogEvent {
     pub client_aborted: bool,
     pub streaming: bool,
     pub protocol: String,
+    /// `true` = request in flight (a `status_code = 0` row in `logs`);
+    /// `false` = request settled and the same row has been updated.
+    pub pending: bool,
 }
 
 /// One issued session. Carries enough info to authorize requests without
@@ -73,12 +94,15 @@ pub struct AppState {
     pub breaker: Arc<Breaker>,
     /// Broadcast channel for SSE log stream. Large capacity to handle burst
     /// of requests. Dropping the sender stops the stream.
+    /// Capacity 1000: each request emits two events (pending + final), so the
+    /// effective per-request headroom is 500 concurrent in-flight requests
+    /// without losing events.
     pub log_sender: broadcast::Sender<LogEvent>,
 }
 
 impl AppState {
     pub fn new(pool: SqlitePool, breaker: Arc<Breaker>) -> Self {
-        let log_sender = broadcast::channel::<LogEvent>(100).0;
+        let log_sender = broadcast::channel::<LogEvent>(1000).0;
         Self {
             pool,
             http: Client::builder()

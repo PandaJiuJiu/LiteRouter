@@ -1370,14 +1370,20 @@ async fn a_stream_conversion_succeeds_in_translating_the_event_shapes() {
 /// Poll for the log row a streaming request writes when its body is dropped.
 /// The row is finalized by a task spawned from `Drop`, so it lands shortly
 /// after the body is exhausted rather than synchronously with the response.
+/// Now that a pending row (status_code=0) is inserted before streaming starts,
+/// we must wait for the row to be finalized (status_code > 0).
 async fn await_log_row(pool: &sqlx::SqlitePool) -> sqlx::sqlite::SqliteRow {
     for _ in 0..100 {
-        if let Ok(row) =
-            sqlx::query("SELECT stream, total_tokens FROM logs ORDER BY id DESC LIMIT 1")
-                .fetch_one(pool)
-                .await
+        if let Ok(row) = sqlx::query(
+            "SELECT stream, total_tokens, status_code FROM logs ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
         {
-            return row;
+            // Wait for the row to be finalized (status_code > 0 means it's settled).
+            if row.get::<i64, _>("status_code") > 0 {
+                return row;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

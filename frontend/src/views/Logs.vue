@@ -93,27 +93,42 @@
       </el-table-column>
       <el-table-column :label="t('logs.col.statusCode')" width="90">
         <template #default="{ row }">
-          <el-tag :type="row.status_code >= 200 && row.status_code < 300 ? 'success' : 'danger'">
-            {{ row.status_code }}
+          <el-tag
+            :type="row.pending === true
+              ? 'info'
+              : row.pending === 'timeout'
+              ? 'warning'
+              : row.status_code >= 200 && row.status_code < 300
+              ? 'success'
+              : 'danger'"
+            size="small"
+            effect="plain"
+          >
+            <template v-if="row.pending === true">
+              <i class="el-icon-loading" style="margin-right: 4px;" />
+              {{ t('logs.pending') }}
+            </template>
+            <template v-else-if="row.pending === 'timeout'">
+              {{ t('logs.timeout') }}
+            </template>
+            <template v-else>
+              {{ row.status_code }}
+            </template>
           </el-tag>
         </template>
       </el-table-column>
       <el-table-column :label="t('logs.col.duration')" width="90">
         <template #default="{ row }">
-          <span v-if="row.latency_ms > 0" class="num">{{ (row.latency_ms / 1000).toFixed(2) }}s</span>
+          <span v-if="row.pending === true" class="hint">—</span>
+          <span v-else-if="row.latency_ms > 0" class="num">{{ (row.latency_ms / 1000).toFixed(2) }}s</span>
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
       <el-table-column :label="t('logs.col.tokens')" width="110" prop="total_tokens">
         <template #default="{ row }">
-          <!-- A stream the client hung up on usually reports no usage: the
-               count lives in the tail the client never waited for. Without
-               this the cell is a bare dash and the row reads like a free
-               call. Only replaces the dash — a row that did capture usage
-               says nothing confusing. Neutral info styling: a client cancel
-               is not a failure, so it must not borrow the red of one. -->
+          <span v-if="row.pending === true" class="hint">—</span>
           <el-tooltip
-            v-if="!row.total_tokens && row.client_aborted"
+            v-else-if="!row.total_tokens && row.client_aborted"
             placement="top"
             :show-after="200"
             :content="t('logs.abortedTip')"
@@ -191,6 +206,13 @@ const filters = reactive({ ip: '', token: '', model: '', upstream_model: '', sta
 const options = ref({})
 const optionsLoading = ref(false)
 const hasFilters = computed(() => FILTER_FIELDS.some((f) => filters[f.key] !== ''))
+
+// Map of request_id -> row index for efficient matching of final events.
+// When a final event arrives, we update the row in place by request_id
+// (the DB row already exists with a real id). The pending row written at
+// request start has status_code=0 and pending=true; the final event
+// carries the same request_id and updates the same row.
+const pendingByRequestId = new Map()
 
 let logStream = null
 
@@ -310,6 +332,8 @@ function transformSseEvent(event) {
     client_ip: event.client_ip || '',
     user_agent: event.user_agent || '',
     client_aborted: event.client_aborted,
+    pending: event.pending,
+    request_id: event.request_id,
     failed_attempts: [], // not available in SSE, loaded on detail view
   }
 }
@@ -332,15 +356,49 @@ function connectStream() {
       if (fp.status && String(event.status_code) !== fp.status) return
       if (fp.ip && event.client_ip !== fp.ip) return
 
-      // Add to the beginning of the list
-      const newLog = transformSseEvent(event)
-      // Avoid duplicates if the same log somehow arrives twice
-      if (!logs.value.find(l => l.id === event.id)) {
+      const isPending = event.pending === true
+      const rid = event.request_id
+
+      if (isPending) {
+        // Pending event: the request just arrived. The row is already
+        // persisted in the DB (status_code = 0), so on a fresh page load
+        // `load()` may have brought it in already — dedup by request_id.
+        if (!rid) return // safety
+        if (logs.value.some(l => l.request_id === rid)) return
+
+        const newLog = transformSseEvent(event)
+        // Add at the beginning
         logs.value.unshift(newLog)
         total.value++
+
         // Keep the list from growing indefinitely
         if (logs.value.length > size.value) {
           logs.value.pop()
+        }
+      } else {
+        // Final event: the request settled and the same DB row was updated.
+        // Try to update the existing row in place by request_id first; this
+        // covers both rows that arrived via the SSE pending event and rows
+        // loaded from the DB that are still pending.
+        const existing = rid ? logs.value.findIndex(l => l.request_id === rid) : -1
+        if (existing !== -1) {
+          const updated = transformSseEvent(event)
+          // Keep the same object reference for Vue reactivity
+          Object.assign(logs.value[existing], updated)
+          logs.value[existing].pending = false
+        } else {
+          // No pending row found — treat as normal final event (historical
+          // rows loaded from /api/logs predating request_id, or a race where
+          // the pending event was missed).
+          const newLog = transformSseEvent(event)
+          // Avoid duplicates by id (DB-assigned id)
+          if (!logs.value.find(l => l.id === event.id)) {
+            logs.value.unshift(newLog)
+            total.value++
+            if (logs.value.length > size.value) {
+              logs.value.pop()
+            }
+          }
         }
       }
     },
@@ -384,6 +442,7 @@ onUnmounted(() => {
     logStream.close()
     logStream = null
   }
+  pendingByRequestId.clear()
 })
 </script>
 
