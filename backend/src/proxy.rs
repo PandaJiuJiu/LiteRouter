@@ -1594,6 +1594,7 @@ impl StreamLog {
         capture: DebugCapture,
         stream_error: Option<String>,
         client_aborted: bool,
+        abort_reason: Option<&'static str>,
     ) {
         // A 200 whose body turned out to be an error is a failure, and it has
         // to be recorded as one: the log page otherwise shows a green 200 with
@@ -1631,6 +1632,15 @@ impl StreamLog {
                 .breaker
                 .record(&self.breaker_key, Outcome::Failure(reason, None))
                 .await;
+        } else if let Some(reason) = abort_reason {
+            // Stream ended without an explicit error but without a terminator
+            // either. Record the diagnostic reason so it's visible in the log list.
+            if let Some(winner) = self.entry.winner.as_mut() {
+                winner.error = reason.to_string();
+            }
+            if let Some(last) = self.entry.attempts.last_mut() {
+                last.error = reason.to_string();
+            }
         }
         if let Some(winner) = self.entry.winner.as_mut() {
             winner.usage = usage;
@@ -1842,27 +1852,31 @@ impl<S> Drop for LogOnEnd<S> {
             };
             let capture = self.capture.clone();
             let mut stream_error = self.stream_error.lock().unwrap().clone();
-            // A stream the upstream abandoned mid-flight is a failure even
-            // though the client saw a clean 200. Fold it into the existing
-            // in-stream-error slot so `spawn_inline` applies one rule for
-            // both — the byte stream is already committed to the client by
-            // this point, so the row's status stays 200 either way; what
-            // changes is `ok` and what the breaker learns.
-            if stream_error.is_none() && self.finish.lock().unwrap().truncated() {
+
+            // Determine abort reason for logging purposes.
+            // Only set a reason when the provider is at fault; a clean stream
+            // or a client disconnect gets no reason (empty error in the log).
+            let finish = self.finish.lock().unwrap();
+            let abort_reason = if stream_error.is_some() {
+                Some("upstream stream error")
+            } else if finish.truncated() {
                 stream_error = Some(STREAM_TRUNCATED.to_string());
-            }
-            // No fault of the upstream's, and no terminator: the only way that
-            // happens is this side dropping the stream, i.e. the client hung
-            // up. That is not a provider failure — the hop did answer, and the
-            // breaker already recorded Success — but the row has to say why it
-            // looks like a 200 that bought no tokens: the usage of both
-            // protocols lives in the tail of the stream, which the client
-            // never waited for.
+                Some("upstream closed before stream end")
+            } else if self.pump_saw_err {
+                Some("upstream transport error")
+            } else {
+                // No provider fault — either a clean completion or a client
+                // disconnect. Don't set a reason in either case; the log's
+                // error field stays empty and client_aborted distinguishes
+                // the two.
+                None
+            };
+
             let client_aborted = stream_error.is_none()
                 && !self.pump_saw_err
-                && !self.finish.lock().unwrap().saw_terminal;
+                && !finish.saw_terminal;
             tokio::spawn(async move {
-                log.spawn_inline(usage, capture, stream_error, client_aborted)
+                log.spawn_inline(usage, capture, stream_error, client_aborted, abort_reason)
                     .await;
             });
         }
