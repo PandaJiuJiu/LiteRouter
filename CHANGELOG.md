@@ -6,6 +6,23 @@
 
 ---
 
+## [0.0.7] - 2026-10-09
+
+自 v0.0.6 起 1 个提交，紧急修复。
+
+### 修复
+
+- **Mappings 保存后 targets 被改写为不可读形式**：`TargetEntry` 的文档注释声称
+  `#[serde(untagged)]` 但实际从未添加该属性，serde 默认的外部标签化让
+  `encode_targets` 存成 `{"Obj":{"channel":…,"model":…}}`——这一形态
+  `deserialize_targets` 会静默丢弃，导致每个 target 都塌缩到 legacy
+  `target_model` 兜底（显示「全部模型」且无渠道）。修复：
+  - 补上真正的 `#[serde(untagged)]`，存储形态可正常 round-trip
+  - 读取时解包旧数据里的 `{"Obj":{…}}` 包装，已损坏的存量 DB 无需数据修复即可恢复
+  - 新增 encode→parse round-trip 与解包逻辑的回归测试
+
+---
+
 ## [0.0.6] - 2026-10-09
 
 自 v0.0.5 起共 34 个提交。
