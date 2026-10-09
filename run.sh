@@ -2,6 +2,7 @@
 # 开发模式启动/停止脚本（host 直跑，不用 Docker）：
 #   ./run.sh start [port]   启动后端 (cargo run) + 前端 (vite dev server)
 #   ./run.sh stop           停止
+#   ./run.sh restart [port] 重启（stop 后 start）
 #   ./run.sh status         查看运行状态
 #   ./run.sh logs [be|fe]   查看后端/前端日志（默认全部）
 # port 默认 3000；前端 dev server 固定 5173，/api 与 /v1 自动代理到后端。
@@ -65,6 +66,13 @@ cmd_stop() {
     stop_one backend "$PID_DIR/backend.pid"
 }
 
+cmd_restart() {
+    cmd_stop
+    # Give the old processes a moment to release their ports before rebinding.
+    sleep 1
+    cmd_start
+}
+
 cmd_status() {
     for name in backend frontend; do
         if is_running "$PID_DIR/$name.pid"; then
@@ -85,12 +93,13 @@ cmd_logs() {
 }
 
 case "${1:-}" in
-    start)  cmd_start ;;
-    stop)   cmd_stop ;;
-    status) cmd_status ;;
-    logs)   cmd_logs "${2:-all}" ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs "${2:-all}" ;;
     *)
-        echo "用法: $0 {start [port] | stop | status | logs [backend|frontend]}"
+        echo "用法: $0 {start [port] | stop | restart [port] | status | logs [backend|frontend]}"
         exit 1
         ;;
 esac
