@@ -1182,7 +1182,7 @@ pub async fn get_log(
     // The relay chain behind this request. One row per upstream attempt, in
     // the order they happened — empty for logs written before 0015.
     let attempt_rows = sqlx::query(
-        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped \
+        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms \
          FROM log_attempts WHERE log_id=? ORDER BY seq ASC",
     )
     .bind(id)
@@ -1202,6 +1202,7 @@ pub async fn get_log(
                 "convert": a.get::<String, _>("convert"),
                 "ok": a.get::<i64, _>("ok") != 0,
                 "skipped": a.get::<i64, _>("skipped") != 0,
+                "ttft_ms": a.get::<i64, _>("ttft_ms"),
             })
         })
         .collect();
@@ -1230,6 +1231,7 @@ pub async fn get_log(
             // `try_get` because rows written before migration 0033 predate it.
             "client_aborted": row.try_get("client_aborted").unwrap_or(0) != 0,
             "failed_count": row.try_get("failed_count").unwrap_or(0),
+            "ttft_ms": row.try_get("ttft_ms").unwrap_or(0),
             "attempts": attempts,
             "created_at": row.get::<i64, _>("created_at"),
             "client_ip": row.get::<String, _>("client_ip"),

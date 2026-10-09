@@ -110,6 +110,11 @@
             {{ log.reasoning_tokens.toLocaleString() }}
             <span class="hint">{{ t('logDetail.reasoningHint') }}</span>
           </el-descriptions-item>
+          <!-- TTFT: Time to First Token, only meaningful for streaming requests -->
+          <el-descriptions-item v-if="log.stream && log.ttft_ms > 0" :label="t('logDetail.field.ttft')">
+            {{ log.ttft_ms.toLocaleString() }} ms
+            <span class="hint">{{ t('logDetail.ttftHint') }}</span>
+          </el-descriptions-item>
         </el-descriptions>
       </section>
     </template>

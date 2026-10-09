@@ -706,6 +706,9 @@ struct Attempt {
     /// produced no usable response to read usage from, and a non-retriable 4xx
     /// has none either.
     usage: Option<convert::Usage>,
+    /// Time to First Token in milliseconds. Only meaningful for streaming
+    /// requests; 0 for non-streaming.
+    ttft_ms: i64,
 }
 
 impl Attempt {
@@ -727,6 +730,7 @@ impl Attempt {
             ok,
             skipped: false,
             usage: None,
+            ttft_ms: 0, // Set later for streaming requests
         }
     }
 
@@ -804,6 +808,9 @@ struct LogEntry {
     /// admin's actual question about such a row — "why is this 200 worth zero
     /// tokens?" — without painting a healthy provider red.
     client_aborted: bool,
+    /// Time to First Token in milliseconds. Only meaningful for streaming
+    /// requests; 0 for non-streaming.
+    ttft_ms: i64,
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
@@ -821,7 +828,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         Err(_) => return None,
     };
     let inserted = match sqlx::query(
-        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&e.token_name)
     .bind(&winner.upstream_model)
@@ -845,6 +852,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
     .bind(&e.client_ip)
     .bind(&e.user_agent)
     .bind(e.client_aborted as i64)
+    .bind(e.ttft_ms)
     .execute(&mut *tx)
     .await
     {
@@ -855,7 +863,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
 
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(log_id)
         .bind(seq as i64)
@@ -867,6 +875,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         .bind(convert_label(a.convert))
         .bind(a.ok as i64)
         .bind(a.skipped as i64)
+        .bind(a.ttft_ms)
         .execute(&mut *tx)
         .await;
     }
@@ -1602,6 +1611,8 @@ struct StreamLog {
     /// stream's verdict can only be settled when the stream *ends* — long
     /// after `relay()` returned and gave up ownership of the candidate walk.
     breaker_key: String,
+    /// When the first content chunk arrived. Used to compute TTFT.
+    first_token_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl StreamLog {
@@ -1666,6 +1677,17 @@ impl StreamLog {
             winner.usage = usage;
         }
         self.entry.client_aborted = client_aborted;
+
+        // Compute TTFT from the first token timestamp
+        if let Some(first_token) = *self.first_token_at.lock().unwrap() {
+            let ttft = first_token.elapsed().as_millis() as i64;
+            self.entry.ttft_ms = ttft;
+            // Also set on the winning attempt if present
+            if let Some(winner) = self.entry.winner.as_mut() {
+                winner.ttft_ms = ttft;
+            }
+        }
+
         let ok = self.entry.winner.as_ref().map(|w| w.ok).unwrap_or(false);
         let log_event = log_request(&self.state, &self.entry).await;
         if should_capture(&self.state, ok) {
@@ -1750,6 +1772,8 @@ struct LogOnEnd<S> {
     /// upstream's" from "no fault was observed, yet the protocol terminator
     /// never arrived" — the residue of a client that hung up mid-stream.
     pump_saw_err: bool,
+    /// Reference to the first token timestamp in StreamLog. Set at wrap time.
+    first_token_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// How a stream ended, from the upstream's point of view.
@@ -1788,6 +1812,7 @@ impl<S> LogOnEnd<S> {
         stream_error: Arc<Mutex<Option<String>>>,
         finish: Arc<Mutex<StreamFinish>>,
     ) -> Self {
+        let first_token_at = Arc::clone(&log.first_token_at);
         Self {
             inner,
             log: Some(log),
@@ -1797,6 +1822,7 @@ impl<S> LogOnEnd<S> {
             stream_error,
             finish,
             pump_saw_err: false,
+            first_token_at,
         }
     }
     fn wrap_with_converter(
@@ -1807,6 +1833,7 @@ impl<S> LogOnEnd<S> {
         stream_error: Arc<Mutex<Option<String>>>,
         finish: Arc<Mutex<StreamFinish>>,
     ) -> Self {
+        let first_token_at = Arc::clone(&log.first_token_at);
         Self {
             inner,
             log: Some(log),
@@ -1816,6 +1843,7 @@ impl<S> LogOnEnd<S> {
             stream_error,
             finish,
             pump_saw_err: false,
+            first_token_at,
         }
     }
 }
@@ -1839,6 +1867,7 @@ where
         // Split borrow: `inner` pins `this.inner`, so the error bookkeeping
         // has to reach its own field directly rather than through `this`.
         let saw_err = &mut this.pump_saw_err;
+        let first_token_at = &this.first_token_at;
         let inner = unsafe { std::pin::Pin::new_unchecked(&mut this.inner) };
         match inner.poll_next(cx) {
             std::task::Poll::Ready(Some(item)) => {
@@ -1848,6 +1877,13 @@ where
                 // the passthrough and converted streams are covered alike.
                 if item.is_err() {
                     *saw_err = true;
+                }
+                // Record first token timestamp on first Ok item
+                if item.as_ref().is_ok() {
+                    let mut guard = first_token_at.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(std::time::Instant::now());
+                    }
                 }
                 std::task::Poll::Ready(Some(item))
             }
@@ -2326,6 +2362,9 @@ async fn respond_from_upstream(
         // path has no stream to hang up on. `spawn_inline` sets this for the
         // streaming row.
         client_aborted: false,
+        // TTFT: for buffered responses, it's the whole latency (no meaningful TTFT
+        // distinction). Streaming responses compute TTFT when the first content arrives.
+        ttft_ms: latency_ms,
     };
 
     let (status, content_type, bytes, capture) = match body {
@@ -2353,6 +2392,7 @@ async fn respond_from_upstream(
                 state: ctx.state_arc.clone(),
                 entry,
                 breaker_key: breaker::breaker_key(&cand.name, model),
+                first_token_at: Arc::new(Mutex::new(None)),
             };
             // The capture from the peek already has request/response info set up.
             // Just add the prefix bytes and metadata.
@@ -2804,11 +2844,13 @@ async fn relay(
                 ok: false,
                 skipped: false,
                 usage: None,
+                ttft_ms: 0,
             }),
             attempts: Vec::new(),
             client_ip: client_info.ip.clone(),
             user_agent: client_info.user_agent.clone(),
             client_aborted: false,
+            ttft_ms: 0, // No upstream contacted for routing failures
         };
         // Spawned, not awaited: keep DB fsync and file writes off the response
         // path. We clone `state_arc` so the owned Arc can move into the task.
@@ -2863,6 +2905,7 @@ async fn relay(
         ok: false,
         skipped: false,
         usage: None,
+        ttft_ms: 0,
     };
     // Clone values needed for the async log task before moving into entry
     let token_name_for_log = token_name.clone();
@@ -2881,6 +2924,7 @@ async fn relay(
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
         client_aborted: false,
+        ttft_ms: 0, // All candidates failed, no meaningful TTFT
     };
     // Spawned, not awaited: keep DB fsync and file writes off the response
     // path. We clone `state_arc` so the owned Arc can move into the task.
@@ -3306,6 +3350,7 @@ mod tests {
                     ok: false,
                     skipped: false,
                     usage: None,
+                    ttft_ms: 0,
                 },
             );
         }
