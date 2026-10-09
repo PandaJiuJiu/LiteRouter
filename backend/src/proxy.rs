@@ -1727,6 +1727,10 @@ struct StreamLog {
     breaker_key: String,
     /// When the first content chunk arrived. Used to compute TTFT.
     first_token_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// When the relay started (after auth+parse). The stream's real end-to-end
+    /// duration is only knowable when the stream finishes, so we keep the
+    /// start clock here and update `latency_ms` in `spawn_inline`.
+    start: Instant,
 }
 
 impl StreamLog {
@@ -1800,6 +1804,19 @@ impl StreamLog {
             if let Some(winner) = self.entry.winner.as_mut() {
                 winner.ttft_ms = ttft;
             }
+        }
+
+        // The stream has now fully ended — this is the true end-to-end
+        // duration of the request. Earlier, `latency_ms` was frozen at the
+        // TTFB moment (when `respond_from_upstream` ran); overwrite it on the
+        // winner and on the winning hop in `attempts` so the list and detail
+        // pages show the whole round trip, not just the time to first byte.
+        let end_to_end = self.start.elapsed().as_millis() as i64;
+        if let Some(winner) = self.entry.winner.as_mut() {
+            winner.latency_ms = end_to_end;
+        }
+        if let Some(last) = self.entry.attempts.last_mut() {
+            last.latency_ms = end_to_end;
         }
 
         let ok = self.entry.winner.as_ref().map(|w| w.ok).unwrap_or(false);
@@ -2518,6 +2535,7 @@ async fn respond_from_upstream(
                 entry,
                 breaker_key: breaker::breaker_key(&cand.name, model),
                 first_token_at: Arc::new(Mutex::new(None)),
+                start: ctx.start,
             };
             // The capture from the peek already has request/response info set up.
             // Just add the prefix bytes and metadata.

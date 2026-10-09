@@ -261,7 +261,7 @@ export default {
   logDetail: {
     back: '‹ 返回日志列表',
     title: '调用详情 #{id}',
-    latencyHint: '（上游响应耗时）',
+    latencyHint: '（请求总耗时）',
     convert: '协议转换 {convert}',
     failedThenOk: '失败 {count} 次后成功',
     sectionRequest: '请求',

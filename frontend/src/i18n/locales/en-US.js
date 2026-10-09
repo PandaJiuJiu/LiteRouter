@@ -270,7 +270,7 @@ export default {
   logDetail: {
     back: '‹ Back to logs',
     title: 'Request #{id}',
-    latencyHint: '(upstream response time)',
+    latencyHint: '(request total time)',
     convert: 'Converted {convert}',
     failedThenOk: 'Succeeded after {count} failures',
     sectionRequest: 'Request',
