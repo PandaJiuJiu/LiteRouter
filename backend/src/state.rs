@@ -3,6 +3,27 @@ use reqwest::Client;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::broadcast;
+
+/// Event emitted when a request completes and is logged.
+#[derive(Clone, serde::Serialize)]
+pub struct LogEvent {
+    pub id: i64,
+    pub token_name: String,
+    pub request_model: String,
+    pub upstream_model: String,
+    pub channel_name: String,
+    pub status_code: i64,
+    pub latency_ms: i64,
+    pub total_tokens: i64,
+    pub created_at: i64,
+    pub failed_count: i64,
+    pub client_ip: String,
+    pub user_agent: String,
+    pub client_aborted: bool,
+    pub streaming: bool,
+    pub protocol: String,
+}
 
 /// One issued session. Carries enough info to authorize requests without
 /// hitting the DB on every check. In-memory only: restarts clear sessions,
@@ -50,10 +71,14 @@ pub struct AppState {
     /// restart clears every key, matching the session-stores-don't-
     /// survive-restart stance. See `breaker.rs` for the state machine.
     pub breaker: Arc<Breaker>,
+    /// Broadcast channel for SSE log stream. Large capacity to handle burst
+    /// of requests. Dropping the sender stops the stream.
+    pub log_sender: broadcast::Sender<LogEvent>,
 }
 
 impl AppState {
     pub fn new(pool: SqlitePool, breaker: Arc<Breaker>) -> Self {
+        let log_sender = broadcast::channel::<LogEvent>(100).0;
         Self {
             pool,
             http: Client::builder()
@@ -65,6 +90,7 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             debug_logging: std::sync::atomic::AtomicBool::new(false),
             breaker,
+            log_sender,
         }
     }
 

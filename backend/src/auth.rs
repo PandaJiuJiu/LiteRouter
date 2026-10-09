@@ -248,11 +248,16 @@ pub async fn change_password(
 /// use `require_admin` instead.
 pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthUser, StatusCode> {
     let session = bearer_session(headers)?;
+    check_session(state, &session)
+}
+
+/// Validate a session string directly (used by SSE endpoint).
+pub fn check_session(state: &AppState, session: &str) -> Result<AuthUser, StatusCode> {
     let info = state
         .sessions
         .lock()
         .unwrap()
-        .get(&session)
+        .get(session)
         .cloned()
         .ok_or(StatusCode::UNAUTHORIZED)?;
     Ok(AuthUser {

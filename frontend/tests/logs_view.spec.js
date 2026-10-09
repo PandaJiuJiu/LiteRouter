@@ -7,7 +7,8 @@ import i18n, { setLocale } from '../src/i18n'
 const listLogs = vi.fn()
 const listLogFilterOptions = vi.fn()
 const loadDebugLogging = vi.fn()
-vi.mock('../src/api', () => ({ listLogs, listLogFilterOptions }))
+const openLogStream = vi.fn()
+vi.mock('../src/api', () => ({ listLogs, listLogFilterOptions, openLogStream }))
 vi.mock('../src/session', () => ({ loadSession: vi.fn(), session: { isAdmin: false } }))
 vi.mock('../src/debug', () => ({
   debugLogging: { enabled: false, loading: false },
@@ -77,6 +78,7 @@ beforeEach(() => {
   listLogs.mockReset()
   listLogFilterOptions.mockReset()
   loadDebugLogging.mockReset()
+  openLogStream.mockReset()
   setLocale('zh-CN')
   listLogs.mockResolvedValue({ logs: [], total: 0 })
   listLogFilterOptions.mockResolvedValue(OPTIONS)

@@ -91,6 +91,39 @@ export const listLogFilterOptions = (range = 1, filters = {}) =>
 export const fetchUsage = (range = 7) =>
   api.get('/usage', { params: { range } }).then((r) => r.data)
 
+/**
+ * Open an SSE connection to receive real-time log events.
+ * Returns an EventSource instance. Call .close() to disconnect.
+ *
+ * @param {function} onLog - Called with a log event object when a new log arrives
+ * @param {function} onError - Called on connection error
+ * @param {function} onPing - Called on heartbeat ping
+ */
+export function openLogStream(onLog, onError, onPing) {
+  const session = localStorage.getItem('session')
+  const url = `/api/logs/stream${session ? `?session=${encodeURIComponent(session)}` : ''}`
+  const es = new EventSource(url)
+
+  es.addEventListener('log', (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      onLog(data)
+    } catch (_) {
+      // ignore parse errors
+    }
+  })
+
+  es.addEventListener('ping', () => {
+    onPing?.()
+  })
+
+  es.onerror = (err) => {
+    onError?.(err)
+  }
+
+  return es
+}
+
 // ---------- mappings ----------
 export const listChannelModels = () => api.get('/models').then((r) => r.data.channels)
 export const listMappings = () => api.get('/mappings').then((r) => r.data.mappings)

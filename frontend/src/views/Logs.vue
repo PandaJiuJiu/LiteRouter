@@ -9,7 +9,12 @@
           <el-radio-button :value="168">{{ t('logs.range.week') }}</el-radio-button>
           <el-radio-button :value="0">{{ t('logs.range.all') }}</el-radio-button>
         </el-radio-group>
-        <el-button @click="refresh">{{ t('common.refresh') }}</el-button>
+        <el-button @click="onRefreshClick" :loading="loading">
+          {{ t('common.refresh') }}
+          <el-tag :type="streamConnected ? 'success' : 'danger'" size="small" effect="plain">
+            {{ streamConnected ? '● Live' : '○ Offline' }}
+          </el-tag>
+        </el-button>
       </div>
     </div>
     <div class="filter-row">
@@ -149,10 +154,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { listLogFilterOptions, listLogs } from '../api'
+import { listLogFilterOptions, listLogs, openLogStream } from '../api'
 import { loadSession, session } from '../session'
 import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
 
@@ -161,6 +166,7 @@ const router = useRouter()
 const logs = ref([])
 const total = ref(0)
 const loading = ref(false)
+const streamConnected = ref(false)
 const page = ref(1)
 const size = ref(20)
 // Window in hours; 0 = all time. Default 1h to match the backend default.
@@ -186,9 +192,8 @@ const options = ref({})
 const optionsLoading = ref(false)
 const hasFilters = computed(() => FILTER_FIELDS.some((f) => filters[f.key] !== ''))
 
-/** The current selection as query params. Unset boxes are dropped rather than
- *  sent empty — `status=` would deserialize to nothing server-side and 400 the
- *  whole list. */
+let logStream = null
+
 function filterParams() {
   const params = {}
   for (const { key } of FILTER_FIELDS) {
@@ -285,6 +290,83 @@ function open(row) {
   router.push(`/logs/${row.id}`)
 }
 
+/**
+ * Transform a SSE log event into the shape the table expects.
+ * The SSE event has fewer fields than the full log object from /api/logs/:id,
+ * but contains all the fields needed for the list view.
+ */
+function transformSseEvent(event) {
+  return {
+    id: event.id,
+    token_name: event.token_name,
+    request_model: event.request_model,
+    upstream_model: event.upstream_model,
+    channel_name: event.channel_name,
+    status_code: event.status_code,
+    latency_ms: event.latency_ms,
+    total_tokens: event.total_tokens,
+    created_at: event.created_at,
+    failed_count: event.failed_count,
+    client_ip: event.client_ip || '',
+    user_agent: event.user_agent || '',
+    client_aborted: event.client_aborted,
+    failed_attempts: [], // not available in SSE, loaded on detail view
+  }
+}
+
+function connectStream() {
+  logStream = openLogStream(
+    (event) => {
+      // Only add if within current filter scope
+      // If range is not "all" and log is outside range, skip
+      if (range.value > 0) {
+        const now = Math.floor(Date.now() / 1000)
+        const windowStart = now - range.value * 3600
+        if (event.created_at < windowStart) return
+      }
+      // Apply filter constraints
+      const fp = filterParams()
+      if (fp.token && event.token_name !== fp.token) return
+      if (fp.model && event.request_model !== fp.model) return
+      if (fp.upstream_model && event.upstream_model !== fp.upstream_model) return
+      if (fp.status && String(event.status_code) !== fp.status) return
+      if (fp.ip && event.client_ip !== fp.ip) return
+
+      // Add to the beginning of the list
+      const newLog = transformSseEvent(event)
+      // Avoid duplicates if the same log somehow arrives twice
+      if (!logs.value.find(l => l.id === event.id)) {
+        logs.value.unshift(newLog)
+        total.value++
+        // Keep the list from growing indefinitely
+        if (logs.value.length > size.value) {
+          logs.value.pop()
+        }
+      }
+    },
+    (err) => {
+      streamConnected.value = false
+      console.error('Log stream error:', err)
+    },
+    () => {
+      streamConnected.value = true
+    }
+  )
+}
+
+function onRefreshClick() {
+  if (!streamConnected.value) {
+    // Reconnect stream
+    if (logStream) {
+      logStream.close()
+      logStream = null
+    }
+    connectStream()
+  } else {
+    refresh()
+  }
+}
+
 onMounted(async () => {
   await loadSession()
   if (isAdmin.value) {
@@ -293,6 +375,15 @@ onMounted(async () => {
   load()
   // The dropdowns are scoped to the window, so they move with it.
   loadOptions()
+  // Open SSE stream for real-time updates
+  connectStream()
+})
+
+onUnmounted(() => {
+  if (logStream) {
+    logStream.close()
+    logStream = null
+  }
 })
 </script>
 
@@ -301,6 +392,10 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.filters :deep(.el-button .el-tag) {
+  margin-left: 8px;
+  border: none;
 }
 .filter-row {
   display: flex;

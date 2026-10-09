@@ -22,7 +22,7 @@ use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEven
 use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::mappings;
-use crate::state::AppState;
+use crate::state::{AppState, LogEvent};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
@@ -807,16 +807,16 @@ struct LogEntry {
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
-/// Returns the `logs.id` on success so the caller can name debug files.
+/// Returns the `logs.id` and `LogEvent` on success so the caller can broadcast.
 /// A no-op when there is no winner AND no attempts (nothing was tried).
-async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
+async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
     let winner = e.winner.as_ref().or_else(|| e.attempts.last())?;
     let u = winner.usage_or_zero();
     // Skipped hops are breaker decisions, not upstream failures — don't pollute
     // the visible failure count with "we deliberately didn't try this".
     let failed_count = e.attempts.iter().filter(|a| !a.ok && !a.skipped).count() as i64;
 
-    let mut tx = match pool.begin().await {
+    let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(_) => return None,
     };
@@ -873,7 +873,28 @@ async fn log_request(pool: &sqlx::SqlitePool, e: &LogEntry) -> Option<i64> {
     if tx.commit().await.is_err() {
         return None;
     }
-    Some(log_id)
+
+    // Broadcast the event to SSE subscribers
+    let event = LogEvent {
+        id: log_id,
+        token_name: e.token_name.clone(),
+        request_model: e.request_model.clone(),
+        upstream_model: winner.upstream_model.clone(),
+        channel_name: winner.channel_name.clone(),
+        status_code: winner.status,
+        latency_ms: winner.latency_ms,
+        total_tokens: u.total,
+        created_at: now(),
+        failed_count,
+        client_ip: e.client_ip.clone(),
+        user_agent: e.user_agent.clone(),
+        client_aborted: e.client_aborted,
+        streaming: e.streaming,
+        protocol: e.protocol.clone(),
+    };
+    let _ = state.log_sender.send(event.clone());
+
+    Some(event)
 }
 
 fn convert_label(mode: ConvertMode) -> &'static str {
@@ -1573,7 +1594,6 @@ async fn record_outcome_in_breaker(
 ///
 /// `LogEntry` is already fully owned, so it moves into the spawned task as-is.
 struct StreamLog {
-    pool: sqlx::SqlitePool,
     /// Shared with the relay that owns this stream, so the Drop-driven
     /// capture writes the live (not frozen) debug flag value.
     state: Arc<AppState>,
@@ -1647,10 +1667,10 @@ impl StreamLog {
         }
         self.entry.client_aborted = client_aborted;
         let ok = self.entry.winner.as_ref().map(|w| w.ok).unwrap_or(false);
-        let log_id = log_request(&self.pool, &self.entry).await;
+        let log_event = log_request(&self.state, &self.entry).await;
         if should_capture(&self.state, ok) {
-            if let Some(id) = log_id {
-                write_debug_log(&self.pool, id, &capture).await;
+            if let Some(event) = log_event {
+                write_debug_log(&self.state.pool, event.id, &capture).await;
             }
         }
     }
@@ -2330,7 +2350,6 @@ async fn respond_from_upstream(
             let attempts_for_entry = attempts.clone();
             let entry = entry_of(attempt.clone(), attempts_for_entry);
             let log = StreamLog {
-                pool: state.pool.clone(),
                 state: ctx.state_arc.clone(),
                 entry,
                 breaker_key: breaker::breaker_key(&cand.name, model),
@@ -2443,11 +2462,11 @@ async fn respond_from_upstream(
     let state_arc = ctx.state_arc.clone();
     let capture_clone = capture.clone();
     tokio::spawn(async move {
-        let log_id = log_request(&state_arc.pool, &entry).await;
+        let log_event = log_request(&state_arc, &entry).await;
         // Only write debug file if should_capture (failure or debug switch on)
         if should_capture(&state_arc, ok) {
-            if let Some(id) = log_id {
-                write_debug_log(&state_arc.pool, id, &capture_clone).await;
+            if let Some(event) = log_event {
+                write_debug_log(&state_arc.pool, event.id, &capture_clone).await;
             }
         }
     });
@@ -2795,7 +2814,7 @@ async fn relay(
         // path. We clone `state_arc` so the owned Arc can move into the task.
         let state_arc2 = state_arc.clone();
         tokio::spawn(async move {
-            let _ = log_request(&state_arc2.pool, &entry).await;
+            let _ = log_request(&state_arc2, &entry).await;
         });
         return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
     }
@@ -2867,7 +2886,7 @@ async fn relay(
     // path. We clone `state_arc` so the owned Arc can move into the task.
     let state_arc2 = state_arc.clone();
     tokio::spawn(async move {
-        let log_id = log_request(&state_arc2.pool, &entry).await;
+        let log_event = log_request(&state_arc2, &entry).await;
         // Unconditional: a request that exhausted every candidate is exactly the
         // one an admin will want to investigate, and whether the debug switch was
         // on when it happened is not something they can retroactively know.
@@ -2905,8 +2924,8 @@ async fn relay(
                     });
                 }
             }
-            if let Some(id) = log_id {
-                write_debug_log(&state_arc2.pool, id, &capture).await;
+            if let Some(event) = log_event {
+                write_debug_log(&state_arc2.pool, event.id, &capture).await;
             }
         }
     });

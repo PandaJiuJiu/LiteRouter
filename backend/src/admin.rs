@@ -4,12 +4,18 @@ use crate::mappings::{clean_targets, deserialize_targets, encode_targets, parse_
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::Event;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Deserialize)]
+pub struct SessionQuery {
+    pub session: Option<String>,
+}
 
 fn row_channel(row: &sqlx::sqlite::SqliteRow, state: &AppState) -> Value {
     let use_proxy: i64 = row.get("use_proxy");
@@ -1574,4 +1580,98 @@ pub async fn breaker_history_filter_options(
     out.insert("event".to_string(), json!(BREAKER_EVENT_VALUES));
 
     Ok(Json(Value::Object(out)))
+}
+
+/// GET /api/logs/stream — SSE stream of new log events.
+///
+/// Each event is a JSON object:
+///   event: log
+///   data: { id, token_name, request_model, upstream_model, channel_name,
+///           status_code, latency_ms, total_tokens, created_at, failed_count,
+///           client_ip, user_agent, client_aborted, streaming, protocol }
+///
+/// Clients receive only logs they are authorized to see (admins see all,
+/// regular users see only their own tokens).
+pub async fn log_stream(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionQuery>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    // Accept session from query param for SSE (EventSource doesn't support custom headers)
+    let user = if let Some(session) = &query.session {
+        match crate::auth::check_session(&state, session) {
+            Ok(u) => u,
+            Err(_) => return Err(StatusCode::UNAUTHORIZED),
+        }
+    } else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    // Resolve allowed token names for non-admin users
+    let allowed: Option<Vec<String>> = if user.is_admin {
+        None
+    } else {
+        Some(token_names_for_user(&state.pool, user.id, false).await)
+    };
+
+    let mut receiver = state.log_sender.subscribe();
+
+    use async_stream::stream;
+    let stream = stream! {
+        // Send initial ping to establish connection
+        yield Ok::<_, std::convert::Infallible>(
+            Event::default().event("ping").data("")
+        );
+        let mut idle_count = 0u64;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Heartbeat every 30s to keep connection alive
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    yield Ok(Event::default().event("ping").data(""));
+                    idle_count += 1;
+                    // After ~5 minutes idle, stop sending heartbeats and exit
+                    if idle_count > 10 {
+                        break;
+                    }
+                }
+
+                result = receiver.recv() => {
+                    match result {
+                        Ok(event) => {
+                            // Filter by allowed tokens for non-admin users
+                            if let Some(ref allowed_names) = allowed {
+                                if !allowed_names.contains(&event.token_name) {
+                                    continue;
+                                }
+                            }
+
+                            idle_count = 0;
+                            let sse = Event::default()
+                                .event("log")
+                                .json_data(&event)
+                                .unwrap_or_else(|_| {
+                                    Event::default()
+                                        .event("error")
+                                        .data("serialization error")
+                                });
+                            yield Ok(sse);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Too many events, skip and continue
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Channel closed, exit stream
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    use axum::response::sse::Sse;
+    Ok(Sse::new(stream))
 }
