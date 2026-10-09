@@ -22,3 +22,6 @@ TODO.md
 source.googlekey
 source.netproxy
 testgoogleapi.sh
+
+# temp scratch
+tmp/
