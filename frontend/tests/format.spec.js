@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { fmtNum, fmtDate, tableNum } from '../src/format'
+import { fmtNum, fmtDate, fmtCompact, tableNum } from '../src/format'
 
 describe('fmtNum', () => {
   it('groups thousands', () => {
@@ -21,6 +21,23 @@ describe('tableNum', () => {
     // el-table-column calls formatter(row, column, cellValue) — a form that
     // takes the bare value would read `undefined` and print 0 for every cell.
     expect(tableNum({ n: 5 }, { property: 'n' }, 1234)).toBe(fmtNum(1234))
+  })
+})
+
+describe('fmtCompact', () => {
+  it('shortens thousands, millions and billions', () => {
+    expect(fmtCompact(1234)).toBe('1.2K')
+    expect(fmtCompact(5_000_000)).toBe('5M')
+    expect(fmtCompact(2_500_000_000)).toBe('2.5B')
+  })
+
+  it('leaves small integers alone so axis zeros read as "0"', () => {
+    expect(fmtCompact(0)).toBe('0')
+    expect(fmtCompact(999)).toBe('999')
+  })
+
+  it('trims a trailing zero decimal', () => {
+    expect(fmtCompact(2000)).toBe('2K')
   })
 })
 

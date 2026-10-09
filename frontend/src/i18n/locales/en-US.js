@@ -231,6 +231,10 @@ export default {
       totalTokens: 'Total',
       date: 'Date',
     },
+    chart: {
+      title: 'Token usage distribution',
+      empty: 'No usage in this range',
+    },
   },
   stream: 'Streaming',
   logs: {

@@ -88,3 +88,55 @@ describe('usage tables', () => {
     expect(w.vm.totes.requests).toBe(7)
   })
 })
+
+describe('usage bar chart', () => {
+  const barValues = (w) => w.findAll('.bar').map((b) => b.attributes('data-value'))
+
+  it('plots the active tab, one bar per row, defaulting to total tokens', async () => {
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      by_token: [
+        { key: 'a', requests: 1, prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+        { key: 'b', requests: 4, prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+      ],
+    })
+    const w = await mountUsage()
+    expect(barValues(w)).toEqual(['3', '11'])
+  })
+
+  it('follows the selected tab', async () => {
+    // by_token has two rows, by_model one: switching tabs must swap the bars,
+    // not leave the previous dimension on screen.
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      by_token: [
+        { key: 'a', requests: 1, prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+        { key: 'b', requests: 4, prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+      ],
+      by_model: [{ key: 'gpt-4o', requests: 2, prompt_tokens: 0, completion_tokens: 0, total_tokens: 7 }],
+    })
+    const w = await mountUsage()
+    expect(w.findAll('.bar')).toHaveLength(2)
+    w.vm.activeTab = 'model'
+    await flushPromises()
+    expect(barValues(w)).toEqual(['7'])
+  })
+
+  it('re-plots the same rows when the metric selector changes', async () => {
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      by_token: [{ key: 'a', requests: 2, prompt_tokens: 7, completion_tokens: 5, total_tokens: 15 }],
+    })
+    const w = await mountUsage()
+    expect(barValues(w)).toEqual(['15'])
+    w.vm.metric = 'prompt_tokens'
+    await flushPromises()
+    expect(barValues(w)).toEqual(['7'])
+  })
+
+  it('shows the empty hint when the active tab has no usage', async () => {
+    fetchUsage.mockResolvedValue({ by_token: [], by_model: [], by_channel: [], by_day: [] })
+    const w = await mountUsage()
+    expect(w.find('.empty').text()).toBe(zhCN.usage.chart.empty)
+  })
+})

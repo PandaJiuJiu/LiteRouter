@@ -223,6 +223,10 @@ export default {
       totalTokens: '合计',
       date: '日期',
     },
+    chart: {
+      title: 'Token 用量分布',
+      empty: '该时间范围内暂无用量',
+    },
   },
   stream: '流式',
   logs: {
