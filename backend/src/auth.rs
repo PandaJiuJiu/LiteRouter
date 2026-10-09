@@ -68,6 +68,7 @@ pub async fn setup_status(State(state): State<Arc<AppState>>, headers: HeaderMap
     };
     Json(json!({
         "needsSetup": user_count == 0,
+        "version": env!("CARGO_PKG_VERSION"),
         "authenticated": auth.is_some(),
         "is_admin": auth.map(|u| u.is_admin).unwrap_or(false),
         "username": username,

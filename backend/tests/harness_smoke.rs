@@ -15,6 +15,7 @@ async fn empty_database_needs_setup() {
     assert_eq!(body["needsSetup"], true);
     assert_eq!(body["authenticated"], false);
     assert_eq!(body["language"], "zh-CN");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]

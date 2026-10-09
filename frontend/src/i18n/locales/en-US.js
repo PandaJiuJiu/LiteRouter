@@ -339,6 +339,9 @@ export default {
   },
   settings: {
     description: 'Global settings',
+    version: {
+      title: 'Current version',
+    },
     language: {
       title: 'Interface language',
       desc: 'The language is a site-wide setting — a change by any signed-in user takes effect for everyone immediately.',

@@ -97,6 +97,13 @@
       v-model:exportVisible="exportDialogVisible"
       v-model:importVisible="importDialogVisible"
     />
+
+    <!-- 当前系统版本：后端 Cargo.toml 的版本号，由 /api/setup-status 透出。
+         所有用户可见，纯展示，没有交互。 -->
+    <div class="row">
+      <div class="row-label">{{ t('settings.version.title') }}</div>
+      <div class="row-control row-version">{{ version ? 'v' + version : '—' }}</div>
+    </div>
   </el-card>
 </template>
 
@@ -105,7 +112,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { LANGUAGES } from '../i18n'
 import { languageSaving, locale, switchLanguage } from '../language'
-import { getLogRetention, setLogRetention, getProxySettings, setProxySettings } from '../api'
+import { getLogRetention, setLogRetention, getProxySettings, setProxySettings, setupStatus } from '../api'
 import { session } from '../session'
 import ConfigBackup from './ConfigBackup.vue'
 
@@ -197,11 +204,21 @@ async function onProxyEnabledChange(value) {
 const exportDialogVisible = ref(false)
 const importDialogVisible = ref(false)
 
+// 系统版本号，来自 /api/setup-status。取不到（后端还没起来）就显示占位横线。
+const version = ref('')
+
 onMounted(() => {
   if (isAdmin.value) {
     loadRetention()
     loadProxy()
   }
+  setupStatus()
+    .then((s) => {
+      version.value = s?.version ?? ''
+    })
+    .catch(() => {
+      version.value = ''
+    })
 })
 </script>
 
@@ -237,6 +254,12 @@ onMounted(() => {
   padding-bottom: 10px;
   margin-left: 176px;
   font-size: 12px;
+  color: #909399;
+}
+/* 版本号是只读文本，不是控件 —— 用弱化色和等宽字体把它跟可改的设置区分开。 */
+.row-version {
+  font-family: monospace;
+  font-size: 13px;
   color: #909399;
 }
 </style>

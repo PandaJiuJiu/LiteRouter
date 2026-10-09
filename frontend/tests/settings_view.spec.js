@@ -7,7 +7,8 @@ import zhCN from '../src/i18n/locales/zh-CN'
 import enUS from '../src/i18n/locales/en-US'
 
 const setLanguage = vi.fn()
-vi.mock('../src/api', () => ({ setLanguage }))
+const setupStatus = vi.fn()
+vi.mock('../src/api', () => ({ setLanguage, setupStatus }))
 
 const { default: Settings } = await import('../src/views/Settings.vue')
 const { languageSaving, locale, switchLanguage } = await import('../src/language')
@@ -25,6 +26,8 @@ async function mountSettings() {
 
 beforeEach(() => {
   setLanguage.mockReset()
+  setupStatus.mockReset()
+  setupStatus.mockResolvedValue({ version: '0.0.8' })
   localStorage.clear()
   setLocale('zh-CN')
   languageSaving.value = false
@@ -141,5 +144,20 @@ describe('Settings view', () => {
     await w.vm.onChange('en-US')
     await flushPromises()
     expect(locale.value).toBe('en-US')
+  })
+})
+
+describe('version row', () => {
+  it('shows the system version reported by the backend', async () => {
+    setupStatus.mockResolvedValue({ version: '1.2.3' })
+    const w = await mountSettings()
+    expect(w.text()).toContain(zhCN.settings.version.title)
+    expect(w.find('.row-version').text()).toBe('v1.2.3')
+  })
+
+  it('falls back to a placeholder when the version is unavailable', async () => {
+    setupStatus.mockRejectedValue(new Error('backend down'))
+    const w = await mountSettings()
+    expect(w.find('.row-version').text()).toBe('—')
   })
 })

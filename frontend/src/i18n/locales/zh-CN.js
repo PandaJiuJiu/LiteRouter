@@ -329,6 +329,9 @@ export default {
   },
   settings: {
     description: '全局设置',
+    version: {
+      title: '当前版本',
+    },
     language: {
       title: '界面语言',
       desc: '语言是全站统一的设置，任何登录用户修改后立即对所有人生效。',
