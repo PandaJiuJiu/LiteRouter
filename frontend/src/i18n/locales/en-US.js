@@ -313,6 +313,7 @@ export default {
     skipped: 'Skipped',
     ok: 'OK',
     connFailed: 'Connection failed',
+    inProgress: 'In flight',
     latencyNote:
       'Duration is cumulative from the moment the request entered the gateway until that attempt finished, so later attempts show larger values.',
   },

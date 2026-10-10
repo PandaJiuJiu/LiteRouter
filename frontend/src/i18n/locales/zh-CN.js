@@ -304,6 +304,7 @@ export default {
     skipped: '跳过',
     ok: '成功',
     connFailed: '连接失败',
+    inProgress: '进行中',
     latencyNote: '耗时为从请求进入网关到该次尝试结束的累计值，因此后面的尝试会更大。',
   },
   breakerHistory: {

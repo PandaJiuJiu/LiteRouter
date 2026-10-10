@@ -5,7 +5,8 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 import i18n from '../src/i18n'
 
 const getLog = vi.fn()
-vi.mock('../src/api', () => ({ getLog }))
+const openLogStream = vi.fn(() => ({ close: vi.fn() }))
+vi.mock('../src/api', () => ({ getLog, openLogStream }))
 vi.mock('../src/session', () => ({ session: { isAdmin: true } }))
 
 const { default: LogDetail } = await import('../src/views/LogDetail.vue')
@@ -52,10 +53,21 @@ async function mountDetail() {
   return w
 }
 
+// The callback the view hands to openLogStream — capturing it lets a test feed
+// a "pending" event in and watch the chain react, without an SSE connection.
+let onLog
+
 beforeEach(() => {
   getLog.mockReset()
+  openLogStream.mockReset()
+  openLogStream.mockImplementation((cb) => {
+    onLog = cb
+    return { close: vi.fn() }
+  })
   // Default: metadata load returns a clean log row.
   getLog.mockResolvedValue({ ...LOG })
+  // The assertions below match the en-US strings ("In flight").
+  i18n.global.locale.value = 'en-US'
   for (const w of wrappers.splice(0)) {
     w.unmount()
   }
@@ -73,5 +85,94 @@ describe('LogDetail', () => {
     await flushPromises()
     expect(w.text()).toContain('gpt-4o')
     expect(w.text()).toContain('relay')
+  })
+
+  it('follows a pending request\u2019s relay chain live via SSE', async () => {
+    getLog.mockResolvedValue({
+      ...LOG,
+      pending: true,
+      status_code: 0,
+      attempts: [],
+    })
+    const w = await mountDetail()
+    await flushPromises()
+
+    // One hop goes in flight: it must appear in the chain as "in flight",
+    // not as a status, and the request must stay pending.
+    onLog({
+      id: 7,
+      request_id: 'r1',
+      token_name: 'relay',
+      request_model: 'gpt-4o',
+      upstream_model: 'gpt-4o',
+      channel_name: 'ch',
+      status_code: 0,
+      total_tokens: 0,
+      failed_count: 0,
+      client_aborted: false,
+      pending: true,
+      attempts: [
+        {
+          seq: 0,
+          upstream_model: 'gpt-4o',
+          channel_name: 'ch',
+          status_code: 0,
+          error: '',
+          latency_ms: 0,
+          ok: false,
+          skipped: false,
+        },
+      ],
+    })
+    await flushPromises()
+
+    expect(w.text()).toContain('ch')
+    expect(w.text()).toContain('In flight')
+    expect(getLog).toHaveBeenCalledTimes(1)
+  })
+
+  it('refetches the full row when the request settles via SSE', async () => {
+    getLog.mockResolvedValue({
+      ...LOG,
+      pending: true,
+      status_code: 0,
+      attempts: [],
+    })
+    const w = await mountDetail()
+    await flushPromises()
+
+    // The bound log starts "In flight" (en-US locale used above) and the event
+    // subscription is set before the final event; a settle must trigger a fresh
+    // getLog instead of only merging the list-level event fields.
+    onLog({
+      id: 7,
+      request_id: 'r1',
+      token_name: 'relay',
+      request_model: 'gpt-4o',
+      upstream_model: 'gpt-4o',
+      channel_name: 'ch',
+      status_code: 200,
+      latency_ms: 42,
+      total_tokens: 6,
+      failed_count: 0,
+      client_aborted: false,
+      pending: false,
+      attempts: [
+        {
+          seq: 0,
+          upstream_model: 'gpt-4o',
+          channel_name: 'ch',
+          status_code: 200,
+          error: '',
+          latency_ms: 42,
+          ok: true,
+          skipped: false,
+        },
+      ],
+    })
+    await flushPromises()
+    await flushPromises()
+
+    expect(getLog).toHaveBeenCalledTimes(2)
   })
 })

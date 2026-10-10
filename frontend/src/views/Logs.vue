@@ -361,6 +361,15 @@ function open(row) {
  * but contains all the fields needed for the list view.
  */
 function transformSseEvent(event) {
+  const attempts = (event.attempts || []).map((a) => ({ ...a }))
+  // While a request is in flight the chain itself is authoritative for the
+  // failed badge: the parent's `failed_count` starts at 0 and only updates at
+  // settle, so derive the tooltip rows from the hops (settled failures only —
+  // a still-running hop isn't a failure, and a client-aborted 499 was excluded
+  // from `failed_count` by the backend too).
+  const failed = attempts.filter(
+    (a) => !a.ok && !a.skipped && a.status_code !== 0 && a.status_code !== 499
+  )
   return {
     id: event.id,
     token_name: event.token_name,
@@ -377,7 +386,8 @@ function transformSseEvent(event) {
     client_aborted: event.client_aborted,
     pending: event.pending,
     request_id: event.request_id,
-    failed_attempts: [], // not available in SSE, loaded on detail view
+    failed_attempts: failed,
+    attempts,
   }
 }
 
@@ -405,12 +415,24 @@ function connectStream() {
       const rid = event.request_id
 
       if (isPending) {
-        // Pending event: the request just arrived. The row is already
-        // persisted in the DB (status_code = 0), so on a fresh page load
-        // `load()` may have brought it in already — dedup by request_id.
+        // Pending event: the request just arrived — or its chain grew. The row
+        // is already persisted in the DB (status_code = 0), so on a fresh page
+        // load `load()` may have brought it in already — dedup by request_id.
         if (!statusMatches(event.status_code)) return // e.g. filtered to 429
         if (!rid) return // safety
-        if (logs.value.some(l => l.request_id === rid)) return
+        const existing = logs.value.findIndex(l => l.request_id === rid)
+        if (existing !== -1) {
+          // A later pending event for a request already in the list: a
+          // failover hop settled, or a new one went in flight. Refresh the
+          // live failure badge instead of ignoring it.
+          const updated = transformSseEvent(event)
+          logs.value[existing].failed_attempts = updated.failed_attempts
+          logs.value[existing].failed_count = updated.failed_count
+          logs.value[existing].attempts = updated.attempts
+          logs.value[existing].upstream_model = updated.upstream_model
+          logs.value[existing].channel_name = updated.channel_name
+          return
+        }
 
         const newLog = transformSseEvent(event)
         // Add at the beginning

@@ -991,7 +991,12 @@ pub async fn list_logs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // The list shows a "failed N times" badge whose tooltip lists the failed
     // hops. Fetch every attempt for the visible page in one query and group in
-    // Rust — a per-row lookup would be N+1 on the hottest endpoint.
+    // Rust — a per-row lookup would be N+1 on the hottest endpoint. Two codes
+    // are excluded, matching the parent `failed_count` column: `499` is the
+    // client-abort marker the guard writes on the hop that was in flight when
+    // the socket closed, and `0` is a hop that is still in flight right now
+    // (the relay persists each hop the moment it starts). Neither is an
+    // upstream failure.
     let ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
     let mut failed_by_log: std::collections::HashMap<i64, Vec<Value>> =
         std::collections::HashMap::new();
@@ -1001,7 +1006,9 @@ pub async fn list_logs(
             .join(",");
         let sql = format!(
             "SELECT log_id, upstream_model, channel_name, status_code, error \
-             FROM log_attempts WHERE ok=0 AND skipped=0 AND log_id IN ({ph}) ORDER BY seq ASC"
+             FROM log_attempts \
+             WHERE ok=0 AND skipped=0 AND status_code NOT IN (0, 499) AND log_id IN ({ph}) \
+             ORDER BY seq ASC"
         );
         let mut query = sqlx::query(&sql);
         for id in &ids {

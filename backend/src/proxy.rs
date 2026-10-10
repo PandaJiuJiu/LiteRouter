@@ -22,7 +22,7 @@ use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEven
 use crate::convert::{self, ConvertMode, SseConverter};
 use crate::db::now;
 use crate::mappings;
-use crate::state::{AppState, LogEvent};
+use crate::state::{AppState, LogAttemptEvent, LogEvent};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
@@ -841,6 +841,38 @@ async fn insert_pending_log(
 /// that is still in flight.
 const CLIENT_CLOSED_STATUS: i64 = 499;
 
+/// The wording recorded when the request future is dropped because the
+/// downstream socket closed. Kept distinct from an upstream error for the same
+/// reason [`CLIENT_CLOSED_STATUS`] is: a client hang-up is not a hop failure.
+const CLIENT_DISCONNECTED: &str = "client disconnected";
+
+/// Relay breadcrumbs shared with [`PendingLogGuard`].
+///
+/// The relay's attempt chain normally lives on the request future's stack, and
+/// axum drops that future the instant the client hangs up — so at the moment
+/// the guard settles an aborted request, none of the code that would have
+/// written the chain ever runs. These fields survive the drop because the guard
+/// holds an `Arc` to them, which is what lets an aborted row still answer the
+/// admin's question: *what had we forwarded before the client left?*
+struct RelayBreadcrumbs {
+    /// Completed hops, in order — the same content the success path turns into
+    /// `log_attempts` rows.
+    attempts: Mutex<Vec<Attempt>>,
+    /// The hop awaiting an upstream answer right now, if any. Set just before
+    /// `try_upstream` and cleared once its outcome arrives, so the guard's Drop
+    /// can append it as the aborted hop even though no outcome ever did.
+    inflight: Mutex<Option<Attempt>>,
+}
+
+impl RelayBreadcrumbs {
+    fn new() -> Self {
+        Self {
+            attempts: Mutex::new(Vec::new()),
+            inflight: Mutex::new(None),
+        }
+    }
+}
+
 /// Settles the pre-created "in progress" row when the request future is
 /// dropped before any code path got to log the result.
 ///
@@ -852,16 +884,22 @@ const CLIENT_CLOSED_STATUS: i64 = 499;
 /// the hourly sweep deletes it. The guard's own Drop runs in that case, so it
 /// can settle the row as an abort.
 ///
+/// It also carries the relay's [`RelayBreadcrumbs`] so the aborted row still
+/// gets its `log_attempts` chain: the hops that had already failed plus the one
+/// that was in flight when the socket closed.
+///
 /// `disarm` is called by every path that *does* write the settled row (the
 /// synchronous `log_request` calls and the streaming response that will log on
-/// its body Drop). The spawned UPDATE is additionally fenced by
+/// its body Drop). The spawned transaction is additionally fenced by
 /// `WHERE status_code = 0`, so even a mis-armed guard can only touch a row
-/// that is still genuinely pending — it can never clobber a real result.
+/// that is still genuinely pending — it can never clobber a real result, and
+/// it only writes the attempt chain when it actually claimed the row.
 struct PendingLogGuard {
     state: Arc<AppState>,
     log_id: Option<i64>,
     start: Instant,
     armed: bool,
+    breadcrumbs: Arc<RelayBreadcrumbs>,
 }
 
 impl PendingLogGuard {
@@ -880,19 +918,216 @@ impl Drop for PendingLogGuard {
         };
         let state = self.state.clone();
         let latency_ms = self.start.elapsed().as_millis() as i64;
+        // Snapshot synchronously: the future that owns these is being torn down
+        // right now, and the spawned task below outlives it.
+        let mut rows = self.breadcrumbs.attempts.lock().unwrap().clone();
+        // A client hang-up is not a hop failure (see `LogEntry::client_aborted`),
+        // so the aborted hop below is deliberately excluded from `failed_count`.
+        let failed_count = rows.iter().filter(|a| !a.ok && !a.skipped).count() as i64;
+        let inflight = self.breadcrumbs.inflight.lock().unwrap().take();
+        // Label and append the hop that was cut off, so the detail page's relay
+        // chain shows what the client abandoned instead of an empty list.
+        let (model, upstream_model, channel) = match inflight {
+            Some(hop) => {
+                let target = hop.upstream_model.clone();
+                let channel = hop.channel_name.clone();
+                rows.push(Attempt {
+                    status: CLIENT_CLOSED_STATUS,
+                    error: CLIENT_DISCONNECTED.to_string(),
+                    latency_ms,
+                    ok: false,
+                    ..hop
+                });
+                (target.clone(), target, channel)
+            }
+            None => (String::new(), String::new(), String::new()),
+        };
         tokio::spawn(async move {
-            let _ = sqlx::query(
-                "UPDATE logs SET status_code = ?, client_aborted = 1, error = ?, latency_ms = ? \
+            let Ok(mut tx) = state.pool.begin().await else {
+                return;
+            };
+            // `WHERE status_code = 0` fences a row a real result already
+            // settled, and — because it shares the transaction — suppresses the
+            // attempt insert below too, so an abort can never grow a second
+            // chain onto a row that already has one.
+            let updated = sqlx::query(
+                "UPDATE logs SET status_code = ?, client_aborted = 1, error = ?, latency_ms = ?, \
+                 failed_count = ?, model = ?, upstream_model = ?, channel_name = ? \
                  WHERE id = ? AND status_code = 0",
             )
             .bind(CLIENT_CLOSED_STATUS)
-            .bind("client disconnected")
+            .bind(CLIENT_DISCONNECTED)
             .bind(latency_ms)
+            .bind(failed_count)
+            .bind(&model)
+            .bind(&upstream_model)
+            .bind(&channel)
             .bind(log_id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await;
+            match updated {
+                Ok(r) if r.rows_affected() > 0 => {}
+                _ => return,
+            }
+            // Drop the provisional rows the relay persisted at each hop start
+            // (see `insert_attempt_row`): the snapshot above is the complete
+            // chain, and re-inserting it below would otherwise double the hops
+            // that already reached disk. Same reasoning as `log_request`.
+            let _ = sqlx::query("DELETE FROM log_attempts WHERE log_id = ?")
+                .bind(log_id)
+                .execute(&mut *tx)
+                .await;
+            for (seq, a) in rows.iter().enumerate() {
+                let _ = sqlx::query(
+                    "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(log_id)
+                .bind(seq as i64)
+                .bind(&a.upstream_model)
+                .bind(&a.channel_name)
+                .bind(a.status)
+                .bind(&a.error)
+                .bind(a.latency_ms)
+                .bind(convert_label(a.convert))
+                .bind(a.ok as i64)
+                .bind(a.skipped as i64)
+                .bind(a.ttft_ms)
+                .execute(&mut *tx)
+                .await;
+            }
+            let _ = tx.commit().await;
         });
     }
+}
+
+/// The in-memory chain as an SSE-ready list. `seq` is assigned by position, so
+/// the settled hops and the in-flight one (appended last) come out in order.
+fn attempt_events(attempts: &[Attempt]) -> Vec<LogAttemptEvent> {
+    attempts
+        .iter()
+        .enumerate()
+        .map(|(seq, a)| LogAttemptEvent {
+            seq: seq as i64,
+            upstream_model: a.upstream_model.clone(),
+            channel_name: a.channel_name.clone(),
+            status_code: a.status,
+            error: a.error.clone(),
+            latency_ms: a.latency_ms,
+            convert: convert_label(a.convert).to_string(),
+            ok: a.ok,
+            skipped: a.skipped,
+            ttft_ms: a.ttft_ms,
+        })
+        .collect()
+}
+
+/// The chain as it stands: the hops that have settled, plus the one in flight
+/// (if any). Locks are taken one at a time — never nested — matching the guard,
+/// so the two can't deadlock.
+fn snapshot_attempts(bc: &RelayBreadcrumbs) -> Vec<Attempt> {
+    let mut attempts = bc.attempts.lock().unwrap().clone();
+    if let Some(hop) = bc.inflight.lock().unwrap().clone() {
+        attempts.push(hop);
+    }
+    attempts
+}
+
+/// Broadcast a `pending` event carrying the chain as it stands. Sent once when
+/// the request arrives and again on every hop transition, so a detail page
+/// watching the stream sees each hop go in flight and settle. `status_code`
+/// stays 0 — the *request* hasn't settled — and `id` is the real `logs.id`.
+#[allow(clippy::too_many_arguments)]
+fn broadcast_pending_chain(
+    state: &AppState,
+    log_id: Option<i64>,
+    request_id: &str,
+    token_name: &str,
+    request_model: &str,
+    protocol: &str,
+    streaming: bool,
+    client_info: &ClientInfo,
+    created_at: i64,
+    breadcrumbs: &RelayBreadcrumbs,
+) {
+    let attempts = snapshot_attempts(breadcrumbs);
+    // Settled real failures only: a breaker skip isn't a failure, and the hop
+    // still in flight (status 0) hasn't failed yet.
+    let failed_count = attempts
+        .iter()
+        .filter(|a| !a.ok && !a.skipped && a.status != 0)
+        .count() as i64;
+    let last = attempts.last();
+    let event = LogEvent {
+        id: log_id.unwrap_or(0),
+        token_name: token_name.to_string(),
+        request_model: request_model.to_string(),
+        upstream_model: last.map(|a| a.upstream_model.clone()).unwrap_or_default(),
+        channel_name: last.map(|a| a.channel_name.clone()).unwrap_or_default(),
+        status_code: 0,
+        latency_ms: 0,
+        total_tokens: 0,
+        created_at,
+        failed_count,
+        client_ip: client_info.ip.clone(),
+        user_agent: client_info.user_agent.clone(),
+        client_aborted: false,
+        streaming,
+        protocol: protocol.to_string(),
+        request_id: request_id.to_string(),
+        pending: true,
+        attempts: attempt_events(&attempts),
+    };
+    let _ = state.log_sender.send(event);
+}
+
+/// Persist one hop's start as a provisional `log_attempts` row, so a request
+/// that is still running already shows its chain to the detail page (which
+/// reads this table). Returns the row id for `update_attempt_row`, or `None`
+/// when nothing was written — `log_id` is `None` (the pending row insert
+/// failed) or the write itself failed. Best-effort: whatever is missed here is
+/// rewritten in full by `log_request` when the request settles.
+async fn insert_attempt_row(
+    pool: &SqlitePool,
+    log_id: Option<i64>,
+    seq: usize,
+    a: &Attempt,
+) -> Option<i64> {
+    let log_id = log_id?;
+    let res = sqlx::query(
+        "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(log_id)
+    .bind(seq as i64)
+    .bind(&a.upstream_model)
+    .bind(&a.channel_name)
+    .bind(a.status)
+    .bind(&a.error)
+    .bind(a.latency_ms)
+    .bind(convert_label(a.convert))
+    .bind(a.ok as i64)
+    .bind(a.skipped as i64)
+    .bind(a.ttft_ms)
+    .execute(pool)
+    .await
+    .ok()?;
+    Some(res.last_insert_rowid())
+}
+
+/// Settle the provisional row `insert_attempt_row` wrote, so the detail page
+/// stops showing the hop as in flight. Best-effort, like its counterpart.
+async fn update_attempt_row(pool: &SqlitePool, row_id: i64, a: &Attempt) {
+    let _ = sqlx::query(
+        "UPDATE log_attempts SET status_code = ?, error = ?, latency_ms = ?, ok = ?, skipped = ?, ttft_ms = ? WHERE id = ?",
+    )
+    .bind(a.status)
+    .bind(&a.error)
+    .bind(a.latency_ms)
+    .bind(a.ok as i64)
+    .bind(a.skipped as i64)
+    .bind(a.ttft_ms)
+    .bind(row_id)
+    .execute(pool)
+    .await;
 }
 
 /// The result of a client request, in the shape the `logs` row needs. Written
@@ -1035,6 +1270,14 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         }
     };
 
+    // Clear rows a racing `PendingLogGuard` may have written for this pending
+    // id before it lost the `status_code = 0` fence (its transaction can
+    // interleave with this one). A no-op in the normal case, where the pending
+    // row has no attempt chain yet.
+    let _ = sqlx::query("DELETE FROM log_attempts WHERE log_id = ?")
+        .bind(log_id)
+        .execute(&mut *tx)
+        .await;
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
             "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1076,6 +1319,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         protocol: e.protocol.clone(),
         request_id: e.request_id.clone(),
         pending: false,
+        attempts: attempt_events(&e.attempts),
     };
     let _ = state.log_sender.send(event.clone());
 
@@ -2809,36 +3053,33 @@ async fn relay(
 
     // Settles the pending row if the client hangs up while we're still waiting
     // on an upstream (which drops this future and skips every `log_request`
-    // below). Disarmed by each path that writes the real result.
+    // below). Disarmed by each path that writes the real result. The
+    // breadcrumbs let that settle still record the attempt chain the future
+    // would otherwise take to the grave.
+    let breadcrumbs = Arc::new(RelayBreadcrumbs::new());
     let mut pending_guard = PendingLogGuard {
         state: state_arc.clone(),
         log_id,
         start: relay_start,
         armed: true,
+        breadcrumbs: Arc::clone(&breadcrumbs),
     };
 
     // Broadcast pending event so the log page shows "in progress" immediately.
     // The id is the real `logs.id` unless the pending insert failed (then 0).
-    let pending_event = LogEvent {
-        id: log_id.unwrap_or(0),
-        token_name: token_name.clone(),
-        request_model: model.clone(),
-        upstream_model: String::new(),
-        channel_name: String::new(),
-        status_code: 0,
-        latency_ms: 0,
-        total_tokens: 0,
+    // Further pending broadcasts follow as each hop goes in flight and settles.
+    broadcast_pending_chain(
+        state,
+        log_id,
+        &request_id,
+        &token_name,
+        &model,
+        protocol,
+        is_streaming,
+        &client_info,
         created_at,
-        failed_count: 0,
-        client_ip: client_info.ip.clone(),
-        user_agent: client_info.user_agent.clone(),
-        client_aborted: false,
-        streaming: is_streaming,
-        protocol: protocol.to_string(),
-        request_id: request_id.clone(),
-        pending: true,
-    };
-    let _ = state.log_sender.send(pending_event);
+        &breadcrumbs,
+    );
 
     // 3+4. walk the ordered target list; for each (channel, model) target,
     // rewrite the request body's model field and try it — pinned targets go
@@ -2862,11 +3103,13 @@ async fn relay(
     let mut upstream_attempts = 0usize;
     let mut retriable_429_count = 0usize;
     let mut transport_err_count = 0usize;
-    // Every upstream attempt so far, in order. Recorded as child rows of the
-    // single `logs` row this request produces. The winning attempt — the
-    // 2xx response that gets returned to the client — is pushed by
-    // `respond_from_upstream`; failed hops are pushed inline below.
-    let mut attempts: Vec<Attempt> = Vec::new();
+    // Every upstream attempt so far, in order, recorded as child rows of the
+    // single `logs` row this request produces. Kept in `breadcrumbs` (shared
+    // with `pending_guard`) rather than a local so a client that hangs up
+    // mid-relay still leaves its chain behind. The winning attempt — the 2xx
+    // response returned to the client — is pushed by `respond_from_upstream`;
+    // failed hops are pushed inline below.
+    //
     // The upstream body from the most recent unusable-2xx hop, if any. Held
     // rather than written immediately so only the final failure is persisted.
     let mut last_capture: Option<DebugCapture> = None;
@@ -2932,22 +3175,65 @@ async fn relay(
             let breaker_key = breaker::breaker_key(&cand.name, target_model);
             if !state.breaker.allow(&breaker_key).await {
                 attempted += 1;
-                attempts.push(
-                    Attempt::new(
-                        target_model,
-                        cand,
-                        0,
-                        "circuit breaker open",
-                        relay_start.elapsed().as_millis() as i64,
-                        false,
-                    )
-                    .skipped(),
+                // A skip is decided here and now — no await can cut it off — so
+                // it is persisted and broadcast as a settled hop in one step,
+                // not provisional-then-update.
+                let skipped = Attempt::new(
+                    target_model,
+                    cand,
+                    0,
+                    "circuit breaker open",
+                    relay_start.elapsed().as_millis() as i64,
+                    false,
+                )
+                .skipped();
+                let seq = breadcrumbs.attempts.lock().unwrap().len();
+                breadcrumbs.attempts.lock().unwrap().push(skipped.clone());
+                insert_attempt_row(&state.pool, log_id, seq, &skipped).await;
+                broadcast_pending_chain(
+                    state,
+                    log_id,
+                    &request_id,
+                    &token_name,
+                    &model,
+                    protocol,
+                    is_streaming,
+                    &client_info,
+                    created_at,
+                    &breadcrumbs,
                 );
                 continue;
             }
             attempted += 1;
             upstream_attempts += 1;
             let client = state.client_for_channel(cand.use_proxy);
+            // Mark the hop in flight *before* awaiting the upstream, so a client
+            // hang-up during the await is recorded as "this channel was mid-flight"
+            // instead of vanishing with the future. Failure arms below clear it
+            // once their outcome (and its settled `Attempt`) is recorded; the
+            // success arm leaves it set through `respond_from_upstream`, where an
+            // abort is still possible, and `disarm` makes it inert afterwards.
+            let inflight = Attempt::new(target_model, cand, 0, "", 0, false);
+            *breadcrumbs.inflight.lock().unwrap() = Some(inflight.clone());
+            // Persist the just-started hop and push it, so the detail page's
+            // chain shows it as in flight while we wait on the upstream. The
+            // row is settled by the matching outcome arm below; if either the
+            // client aborts or `log_request` races us, the whole chain is
+            // rewritten from the snapshot and this provisional row dropped.
+            let seq = breadcrumbs.attempts.lock().unwrap().len();
+            let provisional_id = insert_attempt_row(&state.pool, log_id, seq, &inflight).await;
+            broadcast_pending_chain(
+                state,
+                log_id,
+                &request_id,
+                &token_name,
+                &model,
+                protocol,
+                is_streaming,
+                &client_info,
+                created_at,
+                &breadcrumbs,
+            );
             let outcome = try_upstream(
                 &client,
                 cand,
@@ -2967,6 +3253,11 @@ async fn relay(
                     // the result is in. Only after it returns do we hand the row
                     // off — to the inline log (buffered) or to the stream's body
                     // `Drop` (which will write it later).
+                    //
+                    // Snapshot into a binding: a `MutexGuard` temporary that
+                    // lives into the `.await` below would make the whole relay
+                    // future `!Send`, which the handler bound rejects.
+                    let attempts_snapshot = breadcrumbs.attempts.lock().unwrap().clone();
                     let (resp, _attempt) = respond_from_upstream(
                         &RelayCtx {
                             state,
@@ -2984,7 +3275,7 @@ async fn relay(
                         target_model,
                         cand,
                         body,
-                        attempts,
+                        attempts_snapshot,
                     )
                     .await;
                     pending_guard.disarm();
@@ -3001,14 +3292,25 @@ async fn relay(
                     // sees. The richer upstream wording goes to the breaker
                     // panel only — see `record_outcome_in_breaker`.
                     let err_msg = format!("HTTP {code}");
-                    attempts.push(Attempt::new(
-                        target_model,
-                        cand,
-                        code as i64,
-                        &err_msg,
-                        elapsed,
-                        false,
-                    ));
+                    let settled =
+                        Attempt::new(target_model, cand, code as i64, &err_msg, elapsed, false);
+                    breadcrumbs.attempts.lock().unwrap().push(settled.clone());
+                    *breadcrumbs.inflight.lock().unwrap() = None;
+                    if let Some(row_id) = provisional_id {
+                        update_attempt_row(&state.pool, row_id, &settled).await;
+                    }
+                    broadcast_pending_chain(
+                        state,
+                        log_id,
+                        &request_id,
+                        &token_name,
+                        &model,
+                        protocol,
+                        is_streaming,
+                        &client_info,
+                        created_at,
+                        &breadcrumbs,
+                    );
                     all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, err_msg));
                     // First non-empty Retry-After wins for the client
                     // pass-through on the eventual 429 response.
@@ -3032,14 +3334,25 @@ async fn relay(
                     body,
                 } => {
                     let elapsed = relay_start.elapsed().as_millis() as i64;
-                    attempts.push(Attempt::new(
-                        target_model,
-                        cand,
-                        code as i64,
-                        detail,
-                        elapsed,
-                        false,
-                    ));
+                    let settled =
+                        Attempt::new(target_model, cand, code as i64, detail, elapsed, false);
+                    breadcrumbs.attempts.lock().unwrap().push(settled.clone());
+                    *breadcrumbs.inflight.lock().unwrap() = None;
+                    if let Some(row_id) = provisional_id {
+                        update_attempt_row(&state.pool, row_id, &settled).await;
+                    }
+                    broadcast_pending_chain(
+                        state,
+                        log_id,
+                        &request_id,
+                        &token_name,
+                        &model,
+                        protocol,
+                        is_streaming,
+                        &client_info,
+                        created_at,
+                        &breadcrumbs,
+                    );
                     all_errors.push(format!("{} ({}) -> {}", cand.name, target_model, detail));
                     // Not a 429 and not a transport error, so neither counter
                     // moves: the final-status decision lands on 502, which is
@@ -3059,14 +3372,24 @@ async fn relay(
                 }
                 UpstreamOutcome::Transport(err_msg) => {
                     let elapsed = relay_start.elapsed().as_millis() as i64;
-                    attempts.push(Attempt::new(
-                        target_model,
-                        cand,
-                        -1,
-                        &err_msg,
-                        elapsed,
-                        false,
-                    ));
+                    let settled = Attempt::new(target_model, cand, -1, &err_msg, elapsed, false);
+                    breadcrumbs.attempts.lock().unwrap().push(settled.clone());
+                    *breadcrumbs.inflight.lock().unwrap() = None;
+                    if let Some(row_id) = provisional_id {
+                        update_attempt_row(&state.pool, row_id, &settled).await;
+                    }
+                    broadcast_pending_chain(
+                        state,
+                        log_id,
+                        &request_id,
+                        &token_name,
+                        &model,
+                        protocol,
+                        is_streaming,
+                        &client_info,
+                        created_at,
+                        &breadcrumbs,
+                    );
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, err_msg));
                     transport_err_count += 1;
                     state
@@ -3161,12 +3484,16 @@ async fn relay(
         attempted,
         all_errors.join("\n  - ")
     );
+    // The relay exhausted every candidate; nothing is in flight anymore. Snapshot
+    // the chain now — the entry below owns it, and the guard is about to be
+    // disarmed before `log_request` writes the real (failed) result.
+    let all_attempts = breadcrumbs.attempts.lock().unwrap().clone();
     // Every attempt failed. Create a synthetic "all-failed" winner with an
     // empty channel_name so the parent row shows "—" for the channel rather
     // than misleadingly naming the last failed channel. The actual failure
-    // chain is preserved in `attempts` for the detail page.
+    // chain is preserved in `all_attempts` for the detail page.
     let all_failed = Attempt {
-        upstream_model: attempts
+        upstream_model: all_attempts
             .last()
             .map(|a| a.upstream_model.clone())
             .unwrap_or_default(),
@@ -3192,7 +3519,7 @@ async fn relay(
         protocol: protocol.to_string(),
         streaming: is_streaming,
         winner: Some(all_failed),
-        attempts,
+        attempts: all_attempts,
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
         client_aborted: false,

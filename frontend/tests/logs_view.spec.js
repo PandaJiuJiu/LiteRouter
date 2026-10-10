@@ -298,4 +298,26 @@ describe('in-progress rows', () => {
 
     expect(w.findAll('.el-table__row')).toHaveLength(0)
   })
+
+  it('refreshes the failed badge from the live chain while pending', async () => {
+    const w = await mountLogs()
+    await pick(w, 4, zhCN.logs.pending)
+
+    // r1's first hop failed (500) and the second is still in flight. The later
+    // pending event carries the settled hop, so the badge must appear without
+    // waiting for the request to settle — and the still-running hop must not
+    // count as a failure.
+    onLog(event(1, 'r1', {
+      failed_count: 1,
+      attempts: [
+        { seq: 0, upstream_model: 'gpt-4o', channel_name: 'ch-a', status_code: 500, error: 'HTTP 500', latency_ms: 50, ok: false, skipped: false },
+        { seq: 1, upstream_model: 'gpt-4o', channel_name: 'ch-b', status_code: 0, error: '', latency_ms: 0, ok: false, skipped: false },
+      ],
+    }))
+    await flushPromises()
+
+    const badge = w.find('.fail-badge')
+    expect(badge.exists()).toBe(true)
+    expect(badge.text()).toContain('1')
+  })
 })

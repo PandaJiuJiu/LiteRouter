@@ -731,6 +731,42 @@ async fn failed_attempts_are_joined_in_without_inflating_the_total() {
 }
 
 #[tokio::test]
+async fn an_aborted_hop_is_not_counted_in_the_failed_badge() {
+    // The guard records the hop that was in flight when the client hung up as
+    // `status_code = 499` / `ok = 0`. A hang-up is not an upstream failure, so
+    // the "failed N times" badge must treat it like a breaker skip — excluded.
+    let h = Harness::with_admin().await;
+    let (admin, _) = two_users(&h).await;
+    let log_id = insert_log(h.pool(), "bob-token", literouter::db::now(), 1).await;
+    for (seq, status, ok) in [(0, 500, 0), (1, 499, 0)] {
+        sqlx::query(
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, ok, skipped)
+             VALUES (?,?,?,?,?,?,?,0)",
+        )
+        .bind(log_id)
+        .bind(seq)
+        .bind("gpt-4o")
+        .bind(format!("ch{seq}"))
+        .bind(status)
+        .bind("client disconnected")
+        .bind(ok)
+        .execute(h.pool())
+        .await
+        .unwrap();
+    }
+
+    let (_, body) = support::call_json(&h.router, "GET", "/api/logs", None, Some(&admin)).await;
+    let row = &body["logs"][0];
+    let failed = row["failed_attempts"].as_array().unwrap();
+    assert_eq!(
+        failed.len(),
+        1,
+        "the real 500 counts, the client-aborted 499 does not"
+    );
+    assert_eq!(failed[0]["status_code"], 500);
+}
+
+#[tokio::test]
 async fn breaker_skipped_hops_are_not_counted_as_failures() {
     // `skipped=1` means no HTTP request was made at all; folding those into the
     // "failed N times" badge would misrepresent upstream health.

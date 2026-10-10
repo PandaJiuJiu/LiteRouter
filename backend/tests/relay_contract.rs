@@ -1525,13 +1525,16 @@ async fn a_stream_containing_an_error_event_is_not_logged_as_a_success() {
 
     // The log row is written by LogOnEnd::drop, so poll for it. The stream's
     // own verdict lives on `log_attempts` (the winning row); `logs.error`
-    // carries the fixed wording.
+    // carries the fixed wording. The relay persists each hop the moment it
+    // starts, so require the parent row to have *settled* too — otherwise the
+    // still-in-flight provisional row (ok=0, error='') looks like the verdict.
     let mut winner: Option<(i64, String)> = None;
     for _ in 0..100 {
         if let Ok(r) = sqlx::query(
             "SELECT a.ok, l.error FROM log_attempts a \
              JOIN logs l ON l.id = a.log_id \
-             ORDER BY a.id DESC LIMIT 1",
+             WHERE l.status_code <> 0 \
+             ORDER BY a.seq ASC LIMIT 1",
         )
         .fetch_one(h.pool())
         .await
@@ -1623,12 +1626,25 @@ async fn a_converted_stream_error_is_read_before_the_converter_drops_it() {
     to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
 
     for _ in 0..100 {
-        if let Ok(r) = sqlx::query("SELECT a.ok FROM log_attempts a ORDER BY a.id DESC LIMIT 1")
+        let settled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE status_code <> 0")
             .fetch_one(h.pool())
             .await
-        {
-            assert_eq!(r.get::<i64, _>("ok"), 0);
-            return;
+            .unwrap_or(0);
+        if settled > 0 {
+            // Wait for the parent to settle before reading the verdict: the
+            // relay persists each hop as an in-flight (ok=0) row the moment it
+            // starts, which would otherwise satisfy the assertion before the
+            // stream ever errored.
+            if let Ok(r) = sqlx::query(
+                "SELECT a.ok FROM log_attempts a JOIN logs l ON l.id = a.log_id \
+                 WHERE l.status_code <> 0 ORDER BY a.seq ASC LIMIT 1",
+            )
+            .fetch_one(h.pool())
+            .await
+            {
+                assert_eq!(r.get::<i64, _>("ok"), 0);
+                return;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -2019,18 +2035,30 @@ async fn the_pre_commit_peek_records_the_first_channel_as_invalid_body_in_the_lo
 
     // The failed hop is recorded inline in relay(), but the winning hop's
     // log_attempts row is written by LogOnEnd::drop, which only fires after
-    // the body is dropped (here, at end of the test). Poll until both rows
-    // exist.
+    // the body is dropped (here, at end of the test). The relay also persists
+    // each hop the moment it starts, so the chain length reaches two while the
+    // second hop is still in flight — wait for the parent row to settle before
+    // reading the verdicts.
     let mut rows: Vec<(String, String, i64)> = Vec::new();
     for _ in 0..100 {
-        if let Ok(r) =
-            sqlx::query_as("SELECT channel_name, error, ok FROM log_attempts ORDER BY id ASC")
-                .fetch_all(h.pool())
-                .await
-        {
-            if r.len() == 2 {
-                rows = r;
-                break;
+        let settled: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM logs WHERE status_code <> 0 ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(h.pool())
+        .await
+        .unwrap_or(None);
+        if let Some(log_id) = settled {
+            if let Ok(r) = sqlx::query_as(
+                "SELECT channel_name, error, ok FROM log_attempts WHERE log_id = ? ORDER BY seq ASC",
+            )
+            .bind(log_id)
+            .fetch_all(h.pool())
+            .await
+            {
+                if r.len() == 2 {
+                    rows = r;
+                    break;
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2572,16 +2600,22 @@ async fn a_client_that_disconnects_before_the_response_settles_the_log_as_aborte
         let _ = router.oneshot(req).await;
     });
 
-    // Wait until the relay has persisted its pending row, so aborting here
-    // reproduces the real ordering (row exists, response does not) rather than
-    // racing the spawn.
+    // Wait until the relay has persisted its pending row AND the upstream has
+    // actually received the request. The row alone can appear before the relay
+    // marks the hop as in-flight (it is inserted at request entry), and aborting
+    // in that gap would correctly settle a chain that legitimately has no hop
+    // yet — not what this test is exercising. A received request proves we are
+    // parked inside the upstream `await` with the hop recorded.
     let mut pending = false;
     for _ in 0..200 {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM logs WHERE status_code = 0")
-            .fetch_one(h.pool())
-            .await
-            .unwrap();
-        if n > 0 {
+        let (n, received) = (
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE status_code = 0")
+                .fetch_one(h.pool())
+                .await
+                .unwrap(),
+            server.received_requests().await.unwrap().len(),
+        );
+        if n > 0 && received > 0 {
             pending = true;
             break;
         }
@@ -2614,4 +2648,273 @@ async fn a_client_that_disconnects_before_the_response_settles_the_log_as_aborte
         settled,
         "the pending row was never settled after disconnect"
     );
+
+    // The row now answers the question an admin has about a 499: the hop that
+    // was still in flight when the socket closed. Without the guard's
+    // breadcrumbs the relay's attempt chain went to the grave with the dropped
+    // future and this table stayed empty.
+    let hops = sqlx::query(
+        "SELECT channel_name, upstream_model, status_code, ok, error FROM log_attempts ORDER BY seq",
+    )
+    .fetch_all(h.pool())
+    .await
+    .unwrap();
+    assert_eq!(hops.len(), 1, "the in-flight hop must still be recorded");
+    assert_eq!(hops[0].get::<String, _>("channel_name"), "ch");
+    assert_eq!(hops[0].get::<String, _>("upstream_model"), "gpt-4o");
+    assert_eq!(hops[0].get::<i64, _>("status_code"), 499);
+    assert_eq!(hops[0].get::<i64, _>("ok"), 0);
+    assert_eq!(
+        hops[0].get::<String, _>("error"),
+        "client disconnected",
+        "the hop was cut off, not answered"
+    );
+
+    // A hang-up is not a hop failure, so it must not inflate `failed_count`
+    // (which the detail page renders as "失败 N 次"), and the parent row should
+    // name the channel the request was forwarded to.
+    let row = sqlx::query(
+        "SELECT failed_count, channel_name, upstream_model FROM logs WHERE status_code <> 0",
+    )
+    .fetch_one(h.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.get::<i64, _>("failed_count"),
+        0,
+        "the aborted hop is a client hang-up, not an upstream failure"
+    );
+    assert_eq!(row.get::<String, _>("channel_name"), "ch");
+    assert_eq!(row.get::<String, _>("upstream_model"), "gpt-4o");
+}
+
+/// A failover chain the client abandoned mid-flight. The first hop had already
+/// failed (and its outcome was recorded locally, not yet on disk), the second
+/// was still being awaited — so the aborted row must carry *both*, in order:
+/// the real failure and the channel that never got to answer.
+#[tokio::test]
+async fn an_abort_mid_chain_keeps_the_earlier_failures_and_the_in_flight_hop() {
+    let a = MockServer::start().await;
+    upstream_status(&a, 500).await;
+    let b = MockServer::start().await;
+    // Slow enough that the client is guaranteed to hang up while this hop is
+    // in flight.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let router = h.router.clone();
+    let task = tokio::spawn(async move {
+        let _ = router.oneshot(req).await;
+    });
+
+    // Wait for the pending row, then for `second` to have received the request
+    // — which proves the first hop already failed and the relay is now parked
+    // inside the second hop's await.
+    let mut ready = false;
+    for _ in 0..200 {
+        let (pending, sent) = (
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE status_code = 0")
+                .fetch_one(h.pool())
+                .await
+                .unwrap(),
+            b.received_requests().await.unwrap().len(),
+        );
+        if pending > 0 && sent > 0 {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(ready, "the relay never reached the second hop");
+
+    task.abort();
+    let _ = task.await;
+
+    let mut settled = false;
+    for _ in 0..200 {
+        if let Some(row) = sqlx::query(
+            "SELECT status_code, failed_count, channel_name FROM logs WHERE status_code <> 0",
+        )
+        .fetch_optional(h.pool())
+        .await
+        .unwrap()
+        {
+            assert_eq!(row.get::<i64, _>("status_code"), 499);
+            assert_eq!(row.get::<String, _>("channel_name"), "second");
+            // Only the first hop really failed; the aborted one is a hang-up.
+            assert_eq!(row.get::<i64, _>("failed_count"), 1);
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        settled,
+        "the pending row was never settled after disconnect"
+    );
+
+    let hops =
+        sqlx::query("SELECT channel_name, status_code, ok, error FROM log_attempts ORDER BY seq")
+            .fetch_all(h.pool())
+            .await
+            .unwrap();
+    assert_eq!(hops.len(), 2, "the failed hop and the in-flight one");
+    assert_eq!(hops[0].get::<String, _>("channel_name"), "first");
+    assert_eq!(hops[0].get::<i64, _>("status_code"), 500);
+    assert_eq!(hops[0].get::<i64, _>("ok"), 0);
+    assert_eq!(hops[1].get::<String, _>("channel_name"), "second");
+    assert_eq!(hops[1].get::<i64, _>("status_code"), 499);
+    assert_eq!(hops[1].get::<i64, _>("ok"), 0);
+    assert_eq!(hops[1].get::<String, _>("error"), "client disconnected");
+}
+
+/// The relay persists each hop the moment it *starts*, not only when it
+/// settles — that's what lets the detail page show a live chain for a request
+/// that is still running. While hop B is awaiting its upstream and hop A has
+/// already failed, `log_attempts` must already carry both rows (B as
+/// `status_code = 0`), and `GET /api/logs/:id` must render them.
+#[tokio::test]
+async fn an_in_flight_hop_is_persisted_and_served_before_it_settles() {
+    let a = MockServer::start().await;
+    upstream_status(&a, 500).await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&b)
+        .await;
+    let (h, key) = two_channels(&a.uri(), &b.uri()).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o", "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let router = h.router.clone();
+    let task = tokio::spawn(async move {
+        let _ = router.oneshot(req).await;
+    });
+
+    // Wait until `second` received the request — by then hop A has failed and
+    // hop B is parked in its await, with its provisional row already on disk.
+    let mut ready = false;
+    for _ in 0..200 {
+        let (n_pending, sent, rows) = (
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM logs WHERE status_code = 0")
+                .fetch_one(h.pool())
+                .await
+                .unwrap(),
+            b.received_requests().await.unwrap().len(),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM log_attempts")
+                .fetch_one(h.pool())
+                .await
+                .unwrap(),
+        );
+        if n_pending > 0 && sent > 0 && rows == 2 {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(ready, "the relay never persisted the in-flight chain");
+
+    let rows =
+        sqlx::query("SELECT channel_name, status_code, ok, skipped FROM log_attempts ORDER BY seq")
+            .fetch_all(h.pool())
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<String, _>("channel_name"), "first");
+    assert_eq!(rows[0].get::<i64, _>("status_code"), 500);
+    assert_eq!(rows[1].get::<String, _>("channel_name"), "second");
+    assert_eq!(
+        rows[1].get::<i64, _>("status_code"),
+        0,
+        "the in-flight hop is persisted as status 0"
+    );
+
+    // The detail page — the surface this whole feature is for — already shows
+    // the chain: pending request, two hops, the second still in flight.
+    let admin = support::login(&h.router, "admin").await;
+    let log_id: i64 = sqlx::query_scalar("SELECT id FROM logs WHERE status_code = 0")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let (status, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{log_id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let log = &body["log"];
+    assert_eq!(log["pending"], true);
+    let attempts = log["attempts"].as_array().expect("attempts array");
+    assert_eq!(
+        attempts.len(),
+        2,
+        "both hops served while the request is pending"
+    );
+    assert_eq!(attempts[0]["status_code"], 500);
+    assert_eq!(attempts[1]["status_code"], 0);
+    assert_eq!(attempts[1]["channel_name"], "second");
+
+    // Abort, then the guard settles the row with the same two-hop chain — the
+    // provisional rows must have been replaced, not duplicated.
+    task.abort();
+    let _ = task.await;
+    let mut settled = false;
+    for _ in 0..200 {
+        if let Some(row) = sqlx::query("SELECT status_code FROM logs WHERE status_code <> 0")
+            .fetch_optional(h.pool())
+            .await
+            .unwrap()
+        {
+            assert_eq!(row.get::<i64, _>("status_code"), 499);
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        settled,
+        "the pending row was never settled after disconnect"
+    );
+
+    let final_rows = sqlx::query("SELECT channel_name, status_code FROM log_attempts ORDER BY seq")
+        .fetch_all(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(final_rows.len(), 2, "no duplicate chain after settling");
+    assert_eq!(final_rows[0].get::<String, _>("channel_name"), "first");
+    assert_eq!(final_rows[0].get::<i64, _>("status_code"), 500);
+    assert_eq!(final_rows[1].get::<String, _>("channel_name"), "second");
+    assert_eq!(final_rows[1].get::<i64, _>("status_code"), 499);
 }

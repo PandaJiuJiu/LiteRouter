@@ -71,6 +71,10 @@
           <el-table-column :label="t('logDetail.col.result')" width="110">
             <template #default="{ row }">
               <el-tag v-if="row.skipped" type="info" size="small" effect="plain">{{ t('logDetail.skipped') }}</el-tag>
+              <el-tag v-else-if="row.status_code === 0" type="info" size="small">
+                <i class="el-icon-loading" style="margin-right: 4px;" />
+                {{ t('logDetail.inProgress') }}
+              </el-tag>
               <el-tag v-else :type="row.ok ? 'success' : 'danger'" size="small">
                 {{ row.ok ? t('logDetail.ok') : row.status_code === -1 ? t('logDetail.connFailed') : row.status_code }}
               </el-tag>
@@ -126,11 +130,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { i18n } from '../i18n'
-import { getLog } from '../api'
+import { getLog, openLogStream } from '../api'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -138,15 +142,39 @@ const router = useRouter()
 const log = ref(null)
 const loading = ref(false)
 const ok = ref(false)
+let stream = null
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     log.value = await getLog(route.params.id)
     ok.value = log.value?.pending ? null : (log.value && log.value.status_code >= 200 && log.value.status_code < 300)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
+}
+
+// A relay request emits a growing series of pending events (one hop goes in
+// flight, one settles) and one final event. Replay the chain live: while the
+// request is in flight, only the list-level fields + attempts change, so merge
+// them into what `getLog` returned; once it settles, re-read the full row so
+// error / protocol-conversion / token breakdown land too (the event only
+// carries the list subset).
+function applyEvent(ev) {
+  if (!log.value || String(ev.id) !== String(route.params.id)) return
+  log.value.pending = ev.pending
+  log.value.status_code = ev.status_code
+  log.value.latency_ms = ev.latency_ms
+  log.value.total_tokens = ev.total_tokens
+  log.value.failed_count = ev.failed_count
+  if (ev.upstream_model) log.value.upstream_model = ev.upstream_model
+  if (ev.channel_name) log.value.channel_name = ev.channel_name
+  log.value.client_aborted = ev.client_aborted
+  if (ev.attempts) log.value.attempts = ev.attempts.map((a) => ({ ...a }))
+  ok.value = ev.pending
+    ? null
+    : ev.status_code >= 200 && ev.status_code < 300
+  if (!ev.pending) load(true)
 }
 
 function formatTime(ts) {
@@ -174,7 +202,17 @@ function back() {
   router.push('/logs')
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  // Follow the relay chain while the request is still in flight, and pick up
+  // the settled row as soon as the final event arrives.
+  stream = openLogStream(applyEvent)
+})
+
+onUnmounted(() => {
+  stream?.close()
+  stream = null
+})
 </script>
 
 <style scoped>

@@ -5,19 +5,40 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
+/// One upstream hop as carried on the SSE stream. Mirrors the shape
+/// `GET /api/logs/:id` returns in its `attempts` array so the list page and the
+/// detail page can render the same chain. `status_code == 0` means the hop is
+/// still in flight — the relay manages to broadcast it the moment it is sent
+/// upstream, before any answer arrives.
+#[derive(Clone, serde::Serialize)]
+pub struct LogAttemptEvent {
+    pub seq: i64,
+    pub upstream_model: String,
+    pub channel_name: String,
+    pub status_code: i64,
+    pub error: String,
+    pub latency_ms: i64,
+    pub convert: String,
+    pub ok: bool,
+    pub skipped: bool,
+    pub ttft_ms: i64,
+}
+
 /// Event emitted for a client request's lifecycle on the log page.
 ///
-/// Emitted **twice** per request:
-/// - `pending == true`: the request has just arrived and is being relayed.
-///   A `logs` row with `status_code = 0` is already committed at this point
-///   (`id` is its real primary key), so the in-progress request survives a
-///   page refresh. If the pending row insert fails, `id` falls back to `0`.
+/// Emitted **at least twice** per request:
+/// - `pending == true`: the request is in flight. Emitted once when it arrives
+///   and then again on every hop transition (a hop goes in flight, a hop
+///   settles) so the detail page can follow the failover chain live. A `logs`
+///   row with `status_code = 0` is committed before the first one, so the
+///   in-progress request survives a page refresh. If the pending row insert
+///   fails, `id` falls back to `0`.
 /// - `pending == false`: the request has completed (success, failure, or
 ///   stream end) and the same `logs` row has been updated in place. `id` is
 ///   unchanged — it was assigned when the pending row was written.
 ///
-/// Both events share the same `request_id`, which the frontend uses to match
-/// the "in progress" row to its final result.
+/// All events share the same `request_id`, which the frontend uses to match
+/// the "in progress" row to its final result and to merge the growing chain.
 #[derive(Clone, serde::Serialize)]
 pub struct LogEvent {
     /// Real `logs.id` — assigned when the pending row is inserted, and kept
@@ -44,6 +65,11 @@ pub struct LogEvent {
     /// `true` = request in flight (a `status_code = 0` row in `logs`);
     /// `false` = request settled and the same row has been updated.
     pub pending: bool,
+    /// The failover chain as it stands: settled hops plus the one currently in
+    /// flight. Carried on every event so the detail page shows a live chain
+    /// without re-fetching, and the list page can update its failed badge
+    /// while the request is still running.
+    pub attempts: Vec<LogAttemptEvent>,
 }
 
 /// One issued session. Carries enough info to authorize requests without
@@ -94,9 +120,10 @@ pub struct AppState {
     pub breaker: Arc<Breaker>,
     /// Broadcast channel for SSE log stream. Large capacity to handle burst
     /// of requests. Dropping the sender stops the stream.
-    /// Capacity 1000: each request emits two events (pending + final), so the
-    /// effective per-request headroom is 500 concurrent in-flight requests
-    /// without losing events.
+    /// Capacity 1000: a request emits an initial pending event, then up to two
+    /// more per hop (in-flight, settled), then a final event. Failover is
+    /// rare, so the common request is still just two events — headroom stays
+    /// in the hundreds of concurrent in-flight requests.
     pub log_sender: broadcast::Sender<LogEvent>,
 }
 
