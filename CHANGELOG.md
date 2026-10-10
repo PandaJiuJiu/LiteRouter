@@ -6,6 +6,34 @@
 
 ---
 
+## [0.0.9] - 2026-10-10
+
+自 v0.0.8 起共 10 个提交，聚焦流式中继的正确性与日志实时性。
+
+### 新增
+
+- **日志详情实时跟随调用链**：每个 hop 一开始就写入 `log_attempts`（`status_code=0`），落定后更新同一行，并通过 SSE 广播不断增长的调用链。请求开始时推送 `pending` 事件，每次 hop 状态迁移再推一次，详情页可渲染仍在飞行中的 hop，请求结束后自动重新拉取完整行
+- **日志列表标识「进行中」**：待办行（`status_code=0`）使用暖色背景一眼可辨，状态下拉将 0 标为「进行中」而非裸的 0
+- **用量页柱状图**：在表格旁用 SVG 绘制当前维度的柱状图，带指标选择器（默认总 token）与紧凑纵轴；数据直接取自现有 `/api/usage`，切换 tab / 指标无需重新请求
+- **设置页显示系统版本**：`/api/setup-status` 返回 `CARGO_PKG_VERSION`，设置页卡片底部以只读行展示
+
+### 修复
+
+- **流式中继保真转发**（4 处缺陷）：
+  - `OpenAiToAnthropicStream` 在前一个 block 尚未关闭时就发出新的 `content_block_start`，违反 Anthropic 一次只开一个 block 的约束。修复：开 tool block 前先关 text/thinking block，开 text 前先关 thinking，结束时按升序关闭所有仍打开的 block；`ToolSlot` 增加 `closed` 标记，已关闭的 block 不会被重新打开或重复关闭
+  - Anthropic 的 `thinking` 内容在 OpenAI 侧被丢弃。修复：流式 `thinking_delta` 转发为 `reasoning_content`，非流式的 thinking block 也映射为 `reasoning_content`
+  - 上游在终止符前关闭的流，客户端看起来却像正常结束。修复：新增 `SseConverter::mark_truncated`，EOF 时若未收到终止事件，`OpenAiToAnthropicStream` 以 `event: error` 收尾而非 `message_stop`，`AnthropicToOpenAiStream` 在正常尾部与 `[DONE]` 前插入 error chunk
+  - `passthrough_stream` 的扫描从按行改为按帧，只在 SSE 空行处派发；原实现只剥离行尾 `\r`，留下的 `\n` 让空行派发永不触发，usage / 终止 / error 检测全部静默失效
+- **响应前被取消的请求得到结算**：客户端在任何响应体存在前挂断时，hyper 会在上游 await 处丢弃 handler future，缓冲路径的内联 `log_request` 与流体的 Drop 都不会执行，预建的待办行一直停在 `status_code=0`。修复：`PendingLogGuard` 在 `insert_pending_log` 之后创建，靠自身 Drop 以 `499` / `client_aborted = 1` 结算，并由 `WHERE status_code = 0` 兜底，绝不覆盖真实结果；任何写入真实行的路径都会解除它
+- **日志列表 SSE 状态过滤**：`if (fp.status)` 会让状态 0 直接跳过过滤，且字符串与数字用 `!==` 比较。修复：按分支逐项检查，并在过滤期间已落定、不再匹配的行会从列表移除
+
+### 其他
+
+- `run.sh` 新增 `restart` 子命令：停止两个 dev 进程，等待端口释放后重启（等价于手动 `stop && start`）
+- 停止跟踪 `tmp/` 并加入 `.gitignore`
+
+---
+
 ## [0.0.8] - 2026-10-09
 
 自 v0.0.7 起共 3 个提交，专注于日志系统增强。
