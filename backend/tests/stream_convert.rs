@@ -473,6 +473,79 @@ fn text_after_a_tool_call_gets_its_own_later_block_index() {
 }
 
 #[test]
+fn a_text_block_closes_before_the_tool_block_that_follows_it() {
+    // Anthropic streams one block at a time: a `content_block_start` must not
+    // appear while an earlier block is still open. A model that writes a
+    // sentence and then calls a tool is the ordinary case that used to emit
+    // the tool block's start before the text block's stop.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(&oai_text("Let me check."));
+    events.extend(
+        c.on_data(
+            &json!({"id":"c","choices":[{"delta":{"tool_calls":[
+        {"index":0,"id":"a","function":{"name":"get_weather","arguments":"{\"city\":\"x\"}"}}]}}]})
+            .to_string(),
+        ),
+    );
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    let text_stop = d
+        .iter()
+        .position(|x| x["type"] == "content_block_stop" && x["index"] == 0)
+        .expect("text block stops");
+    let tool_start = d
+        .iter()
+        .position(|x| {
+            x["type"] == "content_block_start" && x["content_block"]["type"] == "tool_use"
+        })
+        .expect("tool block starts");
+    assert!(
+        text_stop < tool_start,
+        "text block must close before the tool block opens: {d:?}"
+    );
+}
+
+#[test]
+fn a_thinking_block_closes_before_the_text_that_follows_it() {
+    let mut c = OpenAiToAnthropicStream::new("m");
+    let mut events = c.on_data(&oai_reasoning("hmm"));
+    events.extend(c.on_data(&oai_text("hi")));
+    events.extend(c.finish());
+
+    let d = datas(&events);
+    let thinking_stop = d
+        .iter()
+        .position(|x| x["type"] == "content_block_stop" && x["index"] == 0)
+        .expect("thinking block stops");
+    let text_start = d
+        .iter()
+        .position(|x| x["type"] == "content_block_start" && x["content_block"]["type"] == "text")
+        .expect("text block starts");
+    assert!(
+        thinking_stop < text_start,
+        "reasoning must close first: {d:?}"
+    );
+}
+
+#[test]
+fn a_truncated_openai_stream_ends_with_an_anthropic_error_event() {
+    // The upstream closed before `[DONE]`. The relay marks the converter so
+    // the client sees a terminal `error` event instead of a clean
+    // `message_stop` that would read as a complete answer.
+    let mut c = OpenAiToAnthropicStream::new("m");
+    c.on_data(&oai_text("partial"));
+    c.mark_truncated();
+    let events = c.finish();
+    let joined = events.concat();
+    assert!(joined.contains("\"type\":\"error\""), "{joined}");
+    assert!(
+        !joined.contains("\"type\":\"message_stop\""),
+        "a truncated stream must not look complete: {joined}"
+    );
+}
+
+#[test]
 fn usage_in_a_final_chunk_is_captured_and_reported() {
     let mut c = OpenAiToAnthropicStream::new("m");
     c.on_data(&oai_text("hi"));
@@ -702,6 +775,35 @@ fn a_truncated_stream_defaults_to_stop() {
     );
     let d = datas(&c.finish());
     assert_eq!(d[0]["choices"][0]["finish_reason"], "stop");
+}
+
+#[test]
+fn anthropic_thinking_becomes_openai_reasoning_content() {
+    let mut c = AnthropicToOpenAiStream::new("m");
+    let events = c.on_data(
+        &json!({"type":"content_block_delta","index":0,
+                "delta":{"type":"thinking_delta","thinking":"ponder"}})
+        .to_string(),
+    );
+    let d = datas(&events);
+    assert_eq!(d[0]["choices"][0]["delta"]["reasoning_content"], "ponder");
+}
+
+#[test]
+fn a_truncated_anthropic_stream_reports_an_openai_error_chunk() {
+    // No `message_stop` arrived. The client should be able to tell the stream
+    // was cut off; the `[DONE]` sentinel still terminates it.
+    let mut c = AnthropicToOpenAiStream::new("m");
+    c.on_data(
+        &json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}).to_string(),
+    );
+    c.mark_truncated();
+    let events = c.finish();
+    assert!(
+        events.iter().any(|e| e.contains("\"error\"")),
+        "an error chunk must precede the tail: {events:?}"
+    );
+    assert!(events.last().unwrap().contains("[DONE]"));
 }
 
 #[test]

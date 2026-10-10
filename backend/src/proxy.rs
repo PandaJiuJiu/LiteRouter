@@ -2429,26 +2429,142 @@ fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Is this SSE line the end-of-stream marker its protocol defines?
+/// Byte-oriented line buffer for the protocol-translating stream.
 ///
-/// Anthropic closes with `message_stop` and OpenAI with a literal `[DONE]`.
-/// Both are matched structurally — on the event name or the payload's own
-/// `type`, never on a substring — because a model whose text happens to
-/// contain "message_stop" arrives as ordinary content and must not be read as
-/// an ending. The payload form is checked as well as the `event:` form since
-/// relays that forward only `data:` lines are common.
-///
-/// Erring toward false negatives is deliberate: missing a terminator costs one
-/// mislabelled hop, while mistaking live output for the end would fail a
-/// healthy provider and trip the breaker on it.
-fn sse_line_is_terminal(line: &str) -> bool {
-    let trimmed = line.trim_end_matches('\r');
-    if trimmed.strip_prefix("event:").map(str::trim) == Some("message_stop") {
-        return true;
+/// The buffer must hold *raw bytes*, not a `String`. Decoding each network
+/// chunk on arrival with `String::from_utf8_lossy` (the previous behaviour)
+/// turns one multibyte UTF-8 character split across two chunks into two
+/// U+FFFD replacement characters. The event's JSON then fails to parse and
+/// the converter silently drops it — losing content for any non-ASCII text
+/// (Chinese, accented letters, emoji, and the u2 tool-call tokens alike).
+/// Decoding only complete lines, once their bytes have all arrived, avoids
+/// the split entirely.
+#[derive(Default)]
+struct LineBuffer(Vec<u8>);
+
+impl LineBuffer {
+    fn push(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
     }
-    let Some(payload) = trimmed.strip_prefix("data:").map(str::trim) else {
-        return false;
+
+    /// Remove and return the next complete line's bytes, without the trailing
+    /// `\n` (and a preceding `\r`). Returns `None` when no complete line has
+    /// arrived yet.
+    ///
+    /// Raw bytes, not a decoded `String`: a lossy decode here would turn a
+    /// corrupt line into an empty one, and the frame parser reads an empty
+    /// line as the blank dispatch that ends an event. The caller decodes and
+    /// decides what to do with undecodable bytes.
+    fn next_line(&mut self) -> Option<Vec<u8>> {
+        let pos = self.0.iter().position(|&b| b == b'\n')?;
+        let mut line: Vec<u8> = self.0.drain(..=pos).collect();
+        line.pop(); // trailing '\n'
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(line)
+    }
+
+    /// Take whatever bytes are left (an upstream that closed without a final
+    /// newline leaves the last line here).
+    fn take_remainder(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// One SSE event under construction, per the WHATWG event-stream grammar.
+///
+/// Fields accumulate until an empty line dispatches the frame. `data` values
+/// are joined with `\n` (the spec's own rule), so a JSON payload spread over
+/// several `data:` lines is reassembled before the converter sees it — the
+/// previous code treated every `data:` line as a complete event, which both
+/// mis-split spec-compliant multi-line payloads and could feed the converter
+/// JSON fragments.
+#[derive(Default)]
+struct SseFrame {
+    event: Option<String>,
+    data: String,
+}
+
+impl SseFrame {
+    /// Absorb one line (without its trailing newline). Empty and comment
+    /// lines are the caller's dispatcher/skip concern, not fields.
+    fn push_line(&mut self, line: &str) {
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => {
+                self.data.push_str(value);
+                self.data.push('\n');
+            }
+            // `id`, `retry` and unknown fields are not needed downstream.
+            _ => {}
+        }
+    }
+
+    /// The dispatched payload: the data buffer with its final newline
+    /// stripped. `None` when the frame carried no `data` field (per spec such
+    /// a frame dispatches no event).
+    fn payload(&self) -> Option<&str> {
+        if self.data.is_empty() {
+            None
+        } else {
+            Some(&self.data[..self.data.len() - 1])
+        }
+    }
+
+    fn reset(&mut self) {
+        self.event = None;
+        self.data.clear();
+    }
+}
+
+/// Dispatch one finished SSE frame to the converter: record its
+/// terminal/error status on the raw values first, then translate. Returns the
+/// events to emit and whether the stream ended. The raw check happens before
+/// the converter because the converter drops frames it doesn't model, so an
+/// error frame would otherwise leave no trace and this hop would log as a
+/// clean success.
+fn dispatch_frame(
+    frame: &SseFrame,
+    conv: &Arc<Mutex<Box<dyn SseConverter>>>,
+    finish: &Arc<Mutex<StreamFinish>>,
+    err: &Arc<Mutex<Option<String>>>,
+) -> (Vec<String>, bool) {
+    if frame.event.as_deref() == Some("message_stop") {
+        finish.lock().unwrap().saw_terminal = true;
+    }
+    if frame.event.as_deref() == Some("error") {
+        note_stream_error(err, STREAM_ERROR_DETAIL.to_string());
+    }
+    let Some(payload) = frame.payload() else {
+        return (Vec::new(), false);
     };
+    if payload_is_terminal(payload) {
+        finish.lock().unwrap().saw_terminal = true;
+    }
+    if let Some(reason) = payload_error(payload) {
+        note_stream_error(err, reason);
+    }
+    if payload == "[DONE]" {
+        return (conv.lock().unwrap().finish(), true);
+    }
+    (conv.lock().unwrap().on_data(payload), false)
+}
+
+/// The payload half of terminal detection: an assembled `data` value is
+/// terminal when it is the OpenAI `[DONE]` sentinel or carries Anthropic's
+/// `"type":"message_stop"`.
+///
+/// The structural check matters: a model whose text happens to contain
+/// "message_stop" arrives as ordinary content and must not be read as an
+/// ending. Erring toward false negatives is deliberate — missing a terminator
+/// costs one mislabelled hop, while mistaking live output for the end would
+/// fail a healthy provider and trip the breaker on it.
+fn payload_is_terminal(payload: &str) -> bool {
     if payload == "[DONE]" {
         return true;
     }
@@ -2485,6 +2601,12 @@ fn sse_line_error(line: &str) -> Option<String> {
         return Some(STREAM_ERROR_DETAIL.to_string());
     }
     let payload = trimmed.strip_prefix("data:")?.trim();
+    payload_error(payload)
+}
+
+/// The payload half of [`sse_line_error`]: an assembled `data` value is an
+/// error when its top level carries `"type":"error"` or an `error` key.
+fn payload_error(payload: &str) -> Option<String> {
     let v: Value = serde_json::from_str(payload).ok()?;
     let is_error = v.get("type").and_then(|t| t.as_str()) == Some("error")
         || v.get("error").is_some_and(|e| !e.is_null());
@@ -2498,6 +2620,65 @@ fn sse_line_error(line: &str) -> Option<String> {
             .map(str::to_string)
             .unwrap_or_else(|| STREAM_ERROR_DETAIL.to_string()),
     )
+}
+
+/// Dispatch one assembled passthrough frame, recording the hop's
+/// terminal/error/usage state. Mirrors the raw checks in [`dispatch_frame`],
+/// but without a converter: passthrough forwards the upstream's own protocol,
+/// so there is nothing to translate. Matching on whole frames (rather than
+/// individual lines) is what makes this agree with the converted path — a
+/// multi-line `data:` payload is one event, not several.
+fn note_passthrough_frame(
+    frame: &SseFrame,
+    finish: &Arc<Mutex<StreamFinish>>,
+    err: &Arc<Mutex<Option<String>>>,
+    usage: &Arc<Mutex<(convert::Usage, bool)>>,
+) {
+    if frame.event.as_deref() == Some("message_stop") {
+        finish.lock().unwrap().saw_terminal = true;
+    }
+    if frame.event.as_deref() == Some("error") {
+        note_stream_error(err, STREAM_ERROR_DETAIL.to_string());
+    }
+    let Some(payload) = frame.payload() else {
+        return;
+    };
+    if payload_is_terminal(payload) {
+        finish.lock().unwrap().saw_terminal = true;
+    }
+    if let Some(reason) = payload_error(payload) {
+        note_stream_error(err, reason);
+    }
+    if let Some(u) = usage_from_sse_payload(payload) {
+        let mut slot = usage.lock().unwrap();
+        slot.0.merge(u);
+        slot.1 = true;
+    }
+}
+
+/// Drain the complete lines already in `buf` through the frame parser,
+/// dispatching every finished frame and leaving any trailing partial line in
+/// `buf`. `buf` is never forwarded — the caller forwards the raw bytes.
+fn drain_passthrough_lines(
+    buf: &mut Vec<u8>,
+    frame: &mut SseFrame,
+    finish: &Arc<Mutex<StreamFinish>>,
+    err: &Arc<Mutex<Option<String>>>,
+    usage: &Arc<Mutex<(convert::Usage, bool)>>,
+) {
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        let trimmed = std::str::from_utf8(&line)
+            .unwrap_or("")
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
+        if trimmed.is_empty() {
+            note_passthrough_frame(frame, finish, err, usage);
+            frame.reset();
+        } else {
+            frame.push_line(trimmed);
+        }
+    }
 }
 
 /// Forward an upstream SSE byte stream to the client verbatim, but parse
@@ -2524,83 +2705,61 @@ fn passthrough_stream(
     // tests where the upstream serves the whole body in a single chunk, the
     // client would see an empty stream). After the prefix is flushed, the
     // loop falls into the normal chunk-by-chunk path.
+    let pending_prefix = !prefix.is_empty();
     let body_stream = stream::unfold(
         (
             resp,
             prefix,
+            SseFrame::default(),
+            pending_prefix,
             Arc::clone(&usage),
             capture.clone(),
             err_for_pump,
             Arc::clone(&finish),
         ),
         |mut st| async move {
-            let (resp, buf, usage_ref, capture, err_ref, finish_ref) =
-                (&mut st.0, &mut st.1, &mut st.2, &st.3, &st.4, &st.5);
-            if !buf.is_empty() {
-                let prefix_bytes = std::mem::take(buf);
-                // The caller already pushed these bytes into `capture` (see
-                // `respond_from_upstream`), so pushing again here duplicated
-                // the peeked prefix in every passthrough debug capture — the
-                // file then showed `message_start` twice and jumped straight
-                // from `ping` to `content_block_start`, an artifact that reads
-                // exactly like a misbehaving upstream. Only the *scan* below
-                // is this branch's job: the peek consumed these bytes, so the
-                // normal chunk loop will never see them again.
-                let mut scan = prefix_bytes.clone();
-                while let Some(pos) = scan.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = scan.drain(..=pos).collect();
-                    let trimmed = std::str::from_utf8(&line)
-                        .unwrap_or("")
-                        .trim_end_matches('\r');
-                    if sse_line_is_terminal(trimmed) {
-                        finish_ref.lock().unwrap().saw_terminal = true;
-                    }
-                    if let Some(reason) = sse_line_error(trimmed) {
-                        note_stream_error(err_ref, reason);
-                    }
-                    if let Some(payload) = trimmed.strip_prefix("data:") {
-                        if let Some(u) = usage_from_sse_payload(payload.trim()) {
-                            let mut slot = usage_ref.lock().unwrap();
-                            slot.0.merge(u);
-                            slot.1 = true;
-                        }
-                    }
-                }
+            let (resp, buf, frame, pending_prefix, usage_ref, capture, err_ref, finish_ref) = (
+                &mut st.0, &mut st.1, &mut st.2, &mut st.3, &st.4, &st.5, &st.6, &st.7,
+            );
+            if *pending_prefix {
+                *pending_prefix = false;
+                // `buf` holds the peeked prefix. Scan its complete frames, but
+                // keep any trailing partial line for the next chunk so a frame
+                // split across the peek boundary is not lost, then forward the
+                // prefix bytes verbatim. The caller already pushed these bytes
+                // into `capture` (see `respond_from_upstream`), so they are not
+                // pushed again here — the old code duplicated the peeked prefix
+                // in every debug capture, which read exactly like a misbehaving
+                // upstream.
+                let prefix_bytes = buf.clone();
+                drain_passthrough_lines(buf, frame, finish_ref, err_ref, usage_ref);
                 return Some((Ok::<Bytes, reqwest::Error>(Bytes::from(prefix_bytes)), st));
             }
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
                     // Capture the raw upstream bytes for the debug log, then
-                    // copy into buf for side-effect usage extraction before
-                    // forwarding the original chunk to the client untouched.
-                    // Copying (not moving) lets us hand `bytes` straight to
-                    // axum while keeping the parse buffer authoritative for
-                    // line scanning.
+                    // copy into buf for side-effect scanning before forwarding
+                    // the original chunk to the client untouched. Copying (not
+                    // moving) lets us hand `bytes` straight to axum while
+                    // keeping the parse buffer authoritative for line scanning.
                     capture.push(&bytes);
                     buf.extend_from_slice(&bytes);
-                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=pos).collect();
-                        let line_str = std::str::from_utf8(&line).unwrap_or("");
-                        let trimmed = line_str.trim_end_matches('\r');
-                        if sse_line_is_terminal(trimmed) {
-                            finish_ref.lock().unwrap().saw_terminal = true;
-                        }
-                        if let Some(reason) = sse_line_error(trimmed) {
-                            note_stream_error(err_ref, reason);
-                        }
-                        if let Some(payload) = trimmed.strip_prefix("data:") {
-                            if let Some(u) = usage_from_sse_payload(payload.trim()) {
-                                let mut slot = usage_ref.lock().unwrap();
-                                slot.0.merge(u);
-                                slot.1 = true;
-                            }
-                        }
-                    }
+                    drain_passthrough_lines(buf, frame, finish_ref, err_ref, usage_ref);
                     Some((Ok::<Bytes, reqwest::Error>(bytes), st))
                 }
                 // The upstream closed on its own. Whether that's clean is
                 // decided at Drop, once we know whether a terminator arrived.
                 Ok(None) => {
+                    // Flush a final line that arrived without its newline, then
+                    // dispatch whatever frame is still pending: a `[DONE]` with
+                    // no trailing blank line is still a terminator.
+                    let leftover = std::mem::take(buf);
+                    if !leftover.is_empty() {
+                        if let Ok(text) = std::str::from_utf8(&leftover) {
+                            frame.push_line(text.trim_end_matches('\r'));
+                        }
+                    }
+                    note_passthrough_frame(frame, finish_ref, err_ref, usage_ref);
                     finish_ref.lock().unwrap().upstream_eof = true;
                     None
                 }
@@ -2653,7 +2812,8 @@ fn converted_stream(
     }
     let state = (
         resp,
-        String::from_utf8_lossy(&prefix).into_owned(),
+        LineBuffer(prefix),
+        SseFrame::default(),
         Arc::clone(&conv),
         false,
         capture.clone(),
@@ -2661,34 +2821,26 @@ fn converted_stream(
         Arc::clone(&finish),
     );
     let body_stream = stream::unfold(state, |mut st| async move {
-        let (resp, buf, conv_ref, done, capture, err_ref, finish_ref) = (
-            &mut st.0, &mut st.1, &mut st.2, &mut st.3, &st.4, &st.5, &st.6,
+        let (resp, buf, frame, conv_ref, done, capture, err_ref, finish_ref) = (
+            &mut st.0, &mut st.1, &mut st.2, &mut st.3, &mut st.4, &st.5, &st.6, &st.7,
         );
         loop {
             if *done {
                 return None;
             }
-            if let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf.drain(..=pos);
-                // Read the error off the *raw upstream* line, before the
-                // converter sees it. The converter drops event types it
-                // doesn't model, so an error frame would otherwise leave no
-                // trace anywhere and this hop would log as a clean success.
-                if sse_line_is_terminal(&line) {
-                    finish_ref.lock().unwrap().saw_terminal = true;
-                }
-                if let Some(reason) = sse_line_error(&line) {
-                    note_stream_error(err_ref, reason);
-                }
-                if let Some(payload) = line.strip_prefix("data:") {
-                    let payload = payload.trim();
-                    let events = if payload == "[DONE]" {
+            if let Some(raw) = buf.next_line() {
+                // An undecodable line is corrupt; skip it rather than let the
+                // lossy text it would become masquerade as a blank dispatch
+                // line. A genuinely empty line dispatches the frame.
+                let Ok(text) = std::str::from_utf8(&raw) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    let (events, saw_done) = dispatch_frame(frame, conv_ref, finish_ref, err_ref);
+                    frame.reset();
+                    if saw_done {
                         *done = true;
-                        conv_ref.lock().unwrap().finish()
-                    } else {
-                        conv_ref.lock().unwrap().on_data(payload)
-                    };
+                    }
                     if !events.is_empty() {
                         return Some((
                             Ok::<Bytes, reqwest::Error>(Bytes::from(events.concat())),
@@ -2698,8 +2850,9 @@ fn converted_stream(
                     if *done {
                         return None; // finish() produced nothing
                     }
+                } else {
+                    frame.push_line(text);
                 }
-                // non-data lines (event:, comments, blanks) are dropped
                 continue;
             }
             match resp.chunk().await {
@@ -2707,17 +2860,45 @@ fn converted_stream(
                     // Capture what the *upstream* sent, not the translated
                     // events — the same thing both stream paths record, so
                     // `resp.json` always answers "what did the provider
-                    // actually reply" regardless of translation.
+                    // actually reply" regardless of translation. Buffer the
+                    // raw bytes: decoding per chunk would corrupt a multibyte
+                    // character straddling a chunk boundary.
                     capture.push(&bytes);
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    buf.push(&bytes);
                 }
                 Ok(None) => {
                     // Upstream closed on its own. Whether that was clean is
                     // settled at Drop, once a terminator would have shown up.
                     finish_ref.lock().unwrap().upstream_eof = true;
-                    // flush converter's remaining events once
                     *done = true;
-                    let events = conv_ref.lock().unwrap().finish();
+                    let mut events = Vec::new();
+                    // A server that closed without a trailing blank line
+                    // leaves its last line(s) here; finish the frame rather
+                    // than drop it.
+                    let leftover = buf.take_remainder();
+                    if !leftover.is_empty() {
+                        if let Ok(text) = std::str::from_utf8(&leftover) {
+                            frame.push_line(text.trim_end_matches('\r'));
+                        }
+                    }
+                    let (pending, saw_done) = dispatch_frame(frame, conv_ref, finish_ref, err_ref);
+                    events.extend(pending);
+                    // `dispatch_frame` already called `finish()` when the last
+                    // frame was `[DONE]`; calling it again would emit a second
+                    // terminator (message_stop / [DONE]) and a duplicate final
+                    // chunk.
+                    if !saw_done {
+                        // No terminator arrived: the upstream truncated. Tell
+                        // the converter so `finish()` reports it to the client
+                        // instead of synthesizing a clean end. (The gateway's
+                        // own log/breaker side is handled separately at Drop,
+                        // off `StreamFinish`.)
+                        let terminal = finish_ref.lock().unwrap().saw_terminal;
+                        if !terminal {
+                            conv_ref.lock().unwrap().mark_truncated();
+                        }
+                        events.extend(conv_ref.lock().unwrap().finish());
+                    }
                     if events.is_empty() {
                         return None;
                     }
@@ -4157,5 +4338,116 @@ mod tests {
         assert_eq!(find_subsequence(b"", b"x"), None);
         assert_eq!(find_subsequence(b"ab", b"abc"), None);
         assert_eq!(find_subsequence(b"abcabc", b"bc"), Some(1));
+    }
+
+    // ---------- LineBuffer ----------
+
+    #[test]
+    fn a_multibyte_character_split_across_chunks_is_not_corrupted() {
+        // Regression: the converted stream used to call
+        // `String::from_utf8_lossy` on each network chunk before buffering,
+        // so a UTF-8 character straddling two chunks became two U+FFFD
+        // replacement chars and the whole event failed to parse. "你" is
+        // E4 BD A0 — split it after the first byte and after the second.
+        let line = "data: {\"content\":\"你\"}\n".to_string();
+        let bytes = line.as_bytes();
+        let idx = line.find('你').unwrap();
+        for cut in [idx + 1, idx + 2] {
+            let mut lb = LineBuffer::default();
+            lb.push(&bytes[..cut]);
+            assert_eq!(lb.next_line(), None, "no complete line before the newline");
+            lb.push(&bytes[cut..]);
+            assert_eq!(
+                lb.next_line().as_deref(),
+                Some(line.trim_end_matches('\n').as_bytes()),
+                "the character must survive a split at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_buffer_strips_crlf_and_returns_lines_in_order() {
+        let mut lb = LineBuffer::default();
+        lb.push(b"event: message_start\r\ndata: x\npartial");
+        assert_eq!(
+            lb.next_line().as_deref(),
+            Some(b"event: message_start".as_slice())
+        );
+        assert_eq!(lb.next_line().as_deref(), Some(b"data: x".as_slice()));
+        assert_eq!(lb.next_line(), None);
+        assert_eq!(lb.take_remainder(), b"partial");
+    }
+
+    #[test]
+    fn line_buffer_returns_undecodable_bytes_verbatim_for_the_caller_to_skip() {
+        // A corrupt line must not come back as an empty string: the frame
+        // parser treats "" as the blank dispatch line, so a lossy decode would
+        // silently end the pending event early. Raw bytes let the caller skip.
+        let mut lb = LineBuffer::default();
+        lb.push(&[0xff, 0xfe, b'\n']);
+        let raw = lb.next_line().expect("a complete line");
+        assert!(std::str::from_utf8(&raw).is_err());
+    }
+
+    // ---------- SseFrame ----------
+
+    #[test]
+    fn an_sse_frame_joins_multiple_data_lines_per_the_spec() {
+        let mut f = SseFrame::default();
+        f.push_line("event: content_block_delta");
+        f.push_line("data: {\"type\":\"content_block_delta\",");
+        f.push_line("data: \"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}");
+        assert_eq!(f.event.as_deref(), Some("content_block_delta"));
+        // Per the WHATWG grammar the data lines are joined with \n and a
+        // trailing newline removed before dispatch; JSON tolerates the inner
+        // newline, so the payload parses whole instead of arriving as two
+        // invalid fragments.
+        let payload = f.payload().unwrap();
+        let v: Value = serde_json::from_str(payload).expect("joined payload is valid JSON");
+        assert_eq!(v["delta"]["text"], "hi");
+    }
+
+    #[test]
+    fn an_sse_frame_without_a_data_field_dispatches_nothing() {
+        let mut f = SseFrame::default();
+        f.push_line("event: ping");
+        f.push_line(": this is a comment");
+        assert_eq!(f.payload(), None);
+        f.reset();
+        assert_eq!(f.event, None);
+        assert_eq!(f.payload(), None);
+    }
+
+    #[test]
+    fn a_field_value_keeps_its_leading_content_but_drops_one_space() {
+        let mut f = SseFrame::default();
+        f.push_line("data:no-space");
+        assert_eq!(f.payload(), Some("no-space"));
+        let mut g = SseFrame::default();
+        g.push_line("data:  two leading");
+        assert_eq!(g.payload(), Some(" two leading"));
+        let mut h = SseFrame::default();
+        // A bare field name with no colon is a field with an empty value.
+        h.push_line("data");
+        assert_eq!(h.payload(), Some(""));
+    }
+
+    #[test]
+    fn payload_detectors_cover_the_sentinels_and_error_shapes() {
+        assert!(payload_is_terminal("[DONE]"));
+        assert!(payload_is_terminal("{\"type\":\"message_stop\"}"));
+        assert!(!payload_is_terminal("{\"type\":\"content_block_delta\"}"));
+        assert!(!payload_is_terminal("not json"));
+
+        assert_eq!(
+            payload_error("{\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}"),
+            Some("overloaded".to_string())
+        );
+        // An error value that is a bare string (common on relay stations).
+        assert_eq!(
+            payload_error("{\"error\":\"overloaded\"}"),
+            Some(STREAM_ERROR_DETAIL.to_string())
+        );
+        assert_eq!(payload_error("{\"content\":\"error: nope\"}"), None);
     }
 }

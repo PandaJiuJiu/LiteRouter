@@ -1368,6 +1368,87 @@ async fn a_stream_conversion_succeeds_in_translating_the_event_shapes() {
     );
 }
 
+#[tokio::test]
+async fn a_converted_stream_joins_multi_line_data_fields() {
+    // SSE allows one event's payload to be split across several `data:` lines;
+    // the spec joins them with `\n` before dispatch. The converted stream must
+    // reassemble the JSON rather than feed each fragment to the converter
+    // (which would parse neither half and silently drop the content).
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":\n",
+        "data: {\"content\":\"multi-line\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "gpt-4o", "max_tokens": 10, "stream": true, "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("multi-line"),
+        "the joined multi-line payload must reach the client: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_done_sentinel_without_a_trailing_blank_line_ends_the_stream_once() {
+    // Regression: when the last frame (`data: [DONE]`) arrives without the
+    // blank dispatch line, it is flushed at upstream EOF. That flush already
+    // calls the converter's `finish()`; the EOF handler must not call it a
+    // second time, or the client sees two terminators.
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "gpt-4o", "max_tokens": 10, "stream": true, "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("hi"), "{text}");
+    assert_eq!(
+        text.matches("event: message_stop").count(),
+        1,
+        "exactly one terminator: {text}"
+    );
+}
+
 /// Poll for the log row a streaming request writes when its body is dropped.
 /// The row is finalized by a task spawned from `Drop`, so it lands shortly
 /// after the body is exhausted rather than synchronously with the response.
@@ -1423,6 +1504,48 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
     // The final usage chunk is only visible after the whole stream is read.
     let row = await_log_row(h.pool()).await;
     assert_eq!(row.get::<i64, _>("stream"), 1);
+    assert_eq!(row.get::<i64, _>("total_tokens"), 15);
+}
+
+#[tokio::test]
+async fn a_passthrough_multi_line_data_event_is_read_as_one_payload() {
+    // A usage object split across several `data:` lines is a single SSE event
+    // whose values join with `\n`. The passthrough scan must assemble the
+    // frame (not treat each line as its own event) to find the numbers. The
+    // body is still forwarded to the client verbatim.
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\n",
+        "data: \"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": "gpt-4o", "stream": true, "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        sse,
+        "passthrough relays the bytes untouched"
+    );
+
+    let row = await_log_row(h.pool()).await;
     assert_eq!(row.get::<i64, _>("total_tokens"), 15);
 }
 
@@ -1903,6 +2026,89 @@ async fn a_truncated_stream_trips_the_breaker() {
             .allow(&literouter::breaker::breaker_key("ch", "gpt-4o"))
             .await,
         "a truncated stream must open the breaker so the next request goes elsewhere"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_converted_stream_reports_an_error_event_to_the_client() {
+    // Same cutoff as above, but the client speaks Anthropic and the channel
+    // speaks OpenAI, so the relay is translating frames. A converted stream
+    // that dies mid-flight must end with an `error` event rather than a clean
+    // `message_stop`, or the client cannot tell it was cut off.
+    let server = MockServer::start().await;
+    let sse = "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "gpt-4o", "max_tokens": 32, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("partial"),
+        "bytes that did arrive still relay: {text}"
+    );
+    assert!(
+        text.contains("event: error"),
+        "truncation must be visible to the client: {text}"
+    );
+    assert!(
+        !text.contains("message_stop"),
+        "a truncated stream must not look complete: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_anthropic_upstream_reports_an_error_chunk_to_an_openai_client() {
+    // Mirror of the test above: the client speaks OpenAI, the channel speaks
+    // Anthropic. The cutoff is the same, but the visible signal is an OpenAI
+    // error chunk before the `[DONE]` sentinel.
+    let server = MockServer::start().await;
+    upstream_truncated_stream(&server).await;
+    let (h, key) = relay_ready_anthropic(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "gpt-4o", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("partial"),
+        "bytes that did arrive still relay: {text}"
+    );
+    assert!(
+        text.contains("\"error\""),
+        "truncation must be visible to the client: {text}"
+    );
+    assert!(
+        text.trim_end().ends_with("[DONE]"),
+        "the sentinel still terminates the stream: {text}"
     );
 }
 

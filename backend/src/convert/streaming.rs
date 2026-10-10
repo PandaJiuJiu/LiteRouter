@@ -113,6 +113,10 @@ pub trait SseConverter: Send {
     fn on_data(&mut self, payload: &str) -> Vec<String>;
     /// Emit any remaining events when the upstream stream ends.
     fn finish(&mut self) -> Vec<String>;
+    /// Tell the converter the upstream ended without its protocol terminator,
+    /// so `finish()` can report a truncated stream to the client rather than
+    /// synthesizing a clean ending. Default: no information.
+    fn mark_truncated(&mut self) {}
     /// Final token breakdown the converter captured from upstream chunks.
     /// None means no usage was reported in the stream — the log row will
     /// record 0 tokens in that case.
@@ -123,6 +127,14 @@ pub trait SseConverter: Send {
 
 fn sse_event(name: &str, data: &Value) -> String {
     format!("event: {}\ndata: {}\n\n", name, data)
+}
+
+/// One `content_block_stop` SSE block.
+fn content_block_stop(index: usize) -> String {
+    sse_event(
+        "content_block_stop",
+        &json!({ "type": "content_block_stop", "index": index }),
+    )
 }
 
 fn openai_chunk(id: &str, created: i64, model: &str, delta: Value, finish_reason: Value) -> String {
@@ -162,6 +174,10 @@ struct ToolSlot {
     name: String,
     /// Argument fragments held back until the block is open.
     pending: String,
+    /// Set once the block has been closed by `content_block_stop`. A tool
+    /// block closes when a later text/thinking block opens, or at `finish()`
+    /// — whichever comes first — and must never be closed twice.
+    closed: bool,
 }
 
 /// OpenAI chunk SSE -> Anthropic event stream.
@@ -179,6 +195,10 @@ pub struct OpenAiToAnthropicStream {
     /// final chunk when the caller asked for `stream_options.include_usage`.
     usage: Usage,
     id: String,
+    /// Set by [`OpenAiToAnthropicStream::mark_truncated`] when the upstream
+    /// ended without its `[DONE]` sentinel. `finish()` then reports the
+    /// truncation to the client instead of a clean `message_stop`.
+    truncated: bool,
 }
 
 impl OpenAiToAnthropicStream {
@@ -193,6 +213,7 @@ impl OpenAiToAnthropicStream {
             finish_reason: None,
             usage: Usage::default(),
             id: format!("stream-{}", db::now()),
+            truncated: false,
         }
     }
 }
@@ -216,6 +237,42 @@ impl OpenAiToAnthropicStream {
         )
     }
 
+    /// Close the open text block, if any. Anthropic streams one block at a
+    /// time — a `content_block_start` for the next block must not follow an
+    /// open one without its `content_block_stop` in between — so every path
+    /// that opens a block calls the relevant close helper first.
+    fn close_text_block(&mut self, out: &mut Vec<String>) {
+        if let Some(idx) = self.text_block.take() {
+            out.push(content_block_stop(idx));
+        }
+    }
+
+    /// Close the open `thinking` block, if any. See [`Self::close_text_block`].
+    fn close_thinking_block(&mut self, out: &mut Vec<String>) {
+        if let Some(idx) = self.thinking_block.take() {
+            out.push(content_block_stop(idx));
+        }
+    }
+
+    /// Close every still-open tool block, in ascending index order. See
+    /// [`Self::close_text_block`] for why ordering matters. A closed block is
+    /// marked so `finish()` does not close it a second time.
+    fn close_tool_blocks(&mut self, out: &mut Vec<String>) {
+        let mut open: Vec<usize> = Vec::new();
+        for slot in self.tools.iter_mut() {
+            if let Some(idx) = slot.block_index {
+                if !slot.closed {
+                    slot.closed = true;
+                    open.push(idx);
+                }
+            }
+        }
+        open.sort_unstable();
+        for idx in open {
+            out.push(content_block_stop(idx));
+        }
+    }
+
     /// Emit `content_block_start` for tool call `idx` if it isn't open yet.
     /// Returns the block index once the block is open.
     ///
@@ -233,6 +290,11 @@ impl OpenAiToAnthropicStream {
             if self.tools[idx].name.is_empty() && !allow_unnamed {
                 return None;
             }
+            // A tool block is a new block: close whatever text/thinking block
+            // is still open first. Tool blocks are not closed here — parallel
+            // tool calls are opened together and closed at `finish()`.
+            self.close_text_block(out);
+            self.close_thinking_block(out);
             let block_index = self.next_block;
             self.next_block += 1;
             let id = if self.tools[idx].id.is_empty() {
@@ -281,6 +343,11 @@ impl OpenAiToAnthropicStream {
             return;
         }
         if self.thinking_block.is_none() {
+            // A thinking block opens at most once and leads the message; if a
+            // text or tool block somehow got there first, close it so the new
+            // block starts cleanly.
+            self.close_text_block(out);
+            self.close_tool_blocks(out);
             let block_index = self.next_block;
             self.next_block += 1;
             out.push(sse_event(
@@ -307,6 +374,14 @@ impl OpenAiToAnthropicStream {
     /// block they belong to is open.
     fn flush_tool_args(&mut self, idx: usize, out: &mut Vec<String>) {
         if let Some(block_index) = self.tools[idx].block_index {
+            // A closed block can no longer receive deltas. This only happens
+            // if a fragment arrives after a later block closed the tool, which
+            // a well-behaved stream never does — dropping it is the only
+            // protocol-legal choice, since the block index is already spent.
+            if self.tools[idx].closed {
+                self.tools[idx].pending.clear();
+                return;
+            }
             let pending = std::mem::take(&mut self.tools[idx].pending);
             if !pending.is_empty() {
                 out.push(sse_event(
@@ -398,6 +473,11 @@ impl SseConverter for OpenAiToAnthropicStream {
         {
             if !text.is_empty() {
                 if self.text_block.is_none() {
+                    // A text block is a new block: close an open thinking block
+                    // (reasoning precedes the answer) and any open tool block
+                    // (a tool call, if it came first, is complete by now).
+                    self.close_thinking_block(&mut out);
+                    self.close_tool_blocks(&mut out);
                     let block_index = self.next_block;
                     self.next_block += 1;
                     out.push(sse_event(
@@ -441,23 +521,42 @@ impl SseConverter for OpenAiToAnthropicStream {
             self.flush_tool_args(idx, &mut out);
         }
         // close open blocks in ascending block order
-        let mut open: Vec<usize> = self
-            .tools
-            .iter()
-            .filter_map(|slot| slot.block_index)
-            .collect();
-        if let Some(t) = self.text_block {
+        let mut open: Vec<usize> = Vec::new();
+        for slot in self.tools.iter_mut() {
+            if let Some(idx) = slot.block_index {
+                if !slot.closed {
+                    slot.closed = true;
+                    open.push(idx);
+                }
+            }
+        }
+        if let Some(t) = self.text_block.take() {
             open.push(t);
         }
-        if let Some(t) = self.thinking_block {
+        if let Some(t) = self.thinking_block.take() {
             open.push(t);
         }
         open.sort_unstable();
         for idx in open {
+            out.push(content_block_stop(idx));
+        }
+        if self.truncated {
+            // The upstream died before sending `[DONE]`. Anthropic defines an
+            // `error` event as a terminal failure, so send one instead of a
+            // clean `message_delta`/`message_stop` — the client can then tell
+            // a truncated answer from a complete one rather than reading a
+            // half message as the whole thing.
             out.push(sse_event(
-                "content_block_stop",
-                &json!({ "type": "content_block_stop", "index": idx }),
+                "error",
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "upstream closed the stream without a terminator"
+                    }
+                }),
             ));
+            return out;
         }
         let reason = self
             .finish_reason
@@ -486,6 +585,10 @@ impl SseConverter for OpenAiToAnthropicStream {
             Some(self.usage)
         }
     }
+
+    fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
 }
 
 /// Anthropic event SSE -> OpenAI chunk stream.
@@ -504,6 +607,10 @@ pub struct AnthropicToOpenAiStream {
     /// carries the input counts, `message_delta` the final output count, so
     /// each update only overwrites the fields it actually reports.
     usage: Usage,
+    /// Set by [`AnthropicToOpenAiStream::mark_truncated`] when the upstream
+    /// ended without its `message_stop`. `finish()` then prepends an error
+    /// chunk so the client can tell a truncated stream from a complete one.
+    truncated: bool,
 }
 
 impl AnthropicToOpenAiStream {
@@ -516,6 +623,7 @@ impl AnthropicToOpenAiStream {
             tool_count: 0,
             finish_reason: None,
             usage: Usage::default(),
+            truncated: false,
         }
     }
 }
@@ -610,6 +718,21 @@ impl SseConverter for AnthropicToOpenAiStream {
                             Value::Null,
                         ));
                     }
+                    // Anthropic's reasoning, surfaced to OpenAI clients the
+                    // way OpenAI-compatible chips report it. Dropped, it would
+                    // make a reply that is entirely `thinking` arrive as an
+                    // empty message.
+                    "thinking_delta" => {
+                        out.push(openai_chunk(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            json!({
+                                "reasoning_content": delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("")
+                            }),
+                            Value::Null,
+                        ));
+                    }
                     _ => {}
                 }
             }
@@ -642,13 +765,30 @@ impl SseConverter for AnthropicToOpenAiStream {
             .as_deref()
             .map(finish_anthropic_to_openai)
             .unwrap_or("stop");
-        let mut out = vec![openai_chunk(
+        let mut out = Vec::new();
+        if self.truncated {
+            // The upstream closed before `message_stop`. OpenAI has no
+            // `finish_reason` for this, so emit an error chunk ahead of the
+            // normal tail: a client that understands error envelopes sees the
+            // truncation, while the `[DONE]` still terminates the stream
+            // cleanly for those that don't.
+            out.push(format!(
+                "data: {}\n\n",
+                json!({
+                    "error": {
+                        "message": "upstream closed the stream without a terminator",
+                        "type": "upstream_error"
+                    }
+                })
+            ));
+        }
+        out.push(openai_chunk(
             &self.id,
             self.created,
             &self.model,
             json!({}),
             json!(reason),
-        )];
+        ));
         // final usage chunk (mirrors openai's include_usage stream tail)
         out.push(format!(
             "data: {}\n\n",
@@ -675,5 +815,9 @@ impl SseConverter for AnthropicToOpenAiStream {
         } else {
             Some(self.usage)
         }
+    }
+
+    fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 }

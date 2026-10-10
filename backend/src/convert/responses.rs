@@ -102,6 +102,7 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
 /// Anthropic non-streaming `message` -> OpenAI TextResponse shape.
 pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in body
         .get("content")
@@ -111,6 +112,12 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
     {
         match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "text" => text.push_str(b.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+            // Anthropic's reasoning has no native OpenAI field; expose it the
+            // way OpenAI-compatible chips do, so Anthropic->OpenAI clients
+            // don't lose a reply that is entirely `thinking`.
+            "thinking" => {
+                reasoning.push_str(b.get("thinking").and_then(|t| t.as_str()).unwrap_or(""))
+            }
             "tool_use" => {
                 tool_calls.push(json!({
                     "id": b.get("id").cloned().unwrap_or(Value::Null),
@@ -129,11 +136,14 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
         .and_then(|r| r.as_str())
         .map(finish_anthropic_to_openai)
         .unwrap_or("stop");
-    let message = if tool_calls.is_empty() {
+    let mut message = if tool_calls.is_empty() {
         json!({ "role": "assistant", "content": text })
     } else {
         json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }, "tool_calls": tool_calls })
     };
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
     let input = body
         .get("usage")
         .and_then(|u| u.get("input_tokens"))

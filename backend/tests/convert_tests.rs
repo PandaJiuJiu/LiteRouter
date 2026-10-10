@@ -539,6 +539,20 @@ fn a_tool_call_only_response_reports_null_content_not_empty_string() {
 }
 
 #[test]
+fn anthropic_thinking_becomes_openai_reasoning_content() {
+    let out = anthropic_resp_to_openai(
+        &v(r#"{"id":"msg_1","content":[
+                 {"type":"thinking","thinking":"let me think","signature":"sig"},
+                 {"type":"text","text":"done"}],
+             "stop_reason":"end_turn"}"#),
+        "m",
+    );
+    let msg = &out["choices"][0]["message"];
+    assert_eq!(msg["reasoning_content"], "let me think");
+    assert_eq!(msg["content"], "done");
+}
+
+#[test]
 fn anthropic_stop_reason_mapping_is_total() {
     let cases = [
         ("end_turn", "stop"),
