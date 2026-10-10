@@ -185,4 +185,8 @@ Admin UI (Bearer session):
 
 ---
 
+## License
+
+[MIT](LICENSE) · Copyright © 2026 Qi Hangkong
+
 [Changelog](CHANGELOG.md) · [Releases](https://github.com/PandaJiuJiu/LiteRouter/releases)

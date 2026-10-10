@@ -186,4 +186,8 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 
 ---
 
+## 许可证
+
+[MIT](LICENSE) · Copyright © 2026 Qi Hangkong
+
 [更新日志](CHANGELOG.md) · [Releases](https://github.com/PandaJiuJiu/LiteRouter/releases)
