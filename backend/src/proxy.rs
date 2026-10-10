@@ -37,20 +37,6 @@ use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Relay lifecycle breadcrumbs, written to the backend log **only when debug
-/// logging is on**. Deliberately `eprintln!` and not the `logs`/`log_attempts`
-/// tables: those rows (and the on-disk captures) are written once a request
-/// *settles*, so a request the client aborts mid-flight leaves no trace of how
-/// far it got. These lines are printed as the relay advances, which is the only
-/// way to answer "did we forward this before the client hung up?".
-macro_rules! relay_trace {
-    ($state:expr, $($arg:tt)*) => {
-        if state_debug_logging($state) {
-            eprintln!("relay: {}", format_args!($($arg)*));
-        }
-    };
-}
-
 /// Peer address, or `None` when the server wasn't built with
 /// `into_make_service_with_connect_info`.
 ///
@@ -895,10 +881,6 @@ impl Drop for PendingLogGuard {
         let state = self.state.clone();
         let latency_ms = self.start.elapsed().as_millis() as i64;
         tokio::spawn(async move {
-            relay_trace!(
-                &state,
-                "client disconnected log_id={log_id} elapsed={latency_ms}ms"
-            );
             let _ = sqlx::query(
                 "UPDATE logs SET status_code = ?, client_aborted = 1, error = ?, latency_ms = ? \
                  WHERE id = ? AND status_code = 0",
@@ -2835,17 +2817,6 @@ async fn relay(
         armed: true,
     };
 
-    relay_trace!(
-        state,
-        "received log_id={:?} request_id={} token={} model={} protocol={} streaming={}",
-        log_id,
-        request_id,
-        token_name,
-        model,
-        protocol,
-        is_streaming
-    );
-
     // Broadcast pending event so the log page shows "in progress" immediately.
     // The id is the real `logs.id` unless the pending insert failed (then 0).
     let pending_event = LogEvent {
@@ -2977,15 +2948,6 @@ async fn relay(
             attempted += 1;
             upstream_attempts += 1;
             let client = state.client_for_channel(cand.use_proxy);
-            relay_trace!(
-                state,
-                "forward log_id={:?} channel={} model={} protocol={} attempt={}",
-                log_id,
-                cand.name,
-                target_model,
-                upstream_protocol,
-                attempted
-            );
             let outcome = try_upstream(
                 &client,
                 cand,
