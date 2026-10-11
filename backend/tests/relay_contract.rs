@@ -3124,3 +3124,256 @@ async fn an_in_flight_hop_is_persisted_and_served_before_it_settles() {
     assert_eq!(final_rows[1].get::<String, _>("channel_name"), "second");
     assert_eq!(final_rows[1].get::<i64, _>("status_code"), 499);
 }
+
+// ==================== correlation IDs ====================
+//
+// The upstream's own request IDs, and the client's `x-request-id`, are the
+// only evidence a cross-account mix-up can be argued with. These assert the
+// whole round trip: outbound headers, the hop rows, and the response echo.
+
+/// An upstream that stamps the vendor IDs we look for on its responses.
+///
+/// One mock only: wiremock answers the first matching one, so a plain
+/// `upstream_ok` plus this would serve the header-less body.
+async fn upstream_with_ids(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "id": "chatcmpl-up",
+                    "model": "upstream-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+                }))
+                .insert_header("request-id", "req_up_abc123")
+                .insert_header("cf-ray", "8e0f1a2b3c4d-SJC")
+                .insert_header("x-generation-id", "gen_9f8e7d"),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The vendor IDs on a 2xx response land on the hop, visible in the log
+/// detail JSON. Without them the only handle on "what did the upstream
+/// answer" is the body, which is exactly what isn't trustworthy.
+#[tokio::test]
+async fn the_upstreams_own_ids_are_recorded_on_the_hop() {
+    let server = MockServer::start().await;
+    upstream_with_ids(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let admin = support::login(&h.router, "admin").await;
+    let log_id: i64 = sqlx::query_scalar("SELECT id FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let (status, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{log_id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hops = body["log"]["attempts"].as_array().expect("attempts array");
+    assert_eq!(hops.len(), 1);
+    assert_eq!(hops[0]["upstream_request_id"], "req_up_abc123");
+    assert_eq!(hops[0]["upstream_cf_ray"], "8e0f1a2b3c4d-SJC");
+    assert_eq!(hops[0]["upstream_generation_id"], "gen_9f8e7d");
+}
+
+/// A hop that failed still carries the IDs of the upstream that refused it —
+/// the provider is asked about that ID, not about a status code.
+#[tokio::test]
+async fn a_failed_hop_carries_its_upstream_ids_too() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_json(json!({"error": {"message": "slow down"}}))
+                .insert_header("request-id", "req_up_refused"),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    let admin = support::login(&h.router, "admin").await;
+    let log_id: i64 = sqlx::query_scalar("SELECT id FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let (status, body) = support::call_json(
+        &h.router,
+        "GET",
+        &format!("/api/logs/{log_id}"),
+        None,
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hops = body["log"]["attempts"].as_array().expect("attempts array");
+    assert_eq!(hops.len(), 1);
+    assert_eq!(hops[0]["status_code"], 429);
+    assert_eq!(hops[0]["upstream_request_id"], "req_up_refused");
+}
+
+/// Both correlation IDs ride along: the client's `x-request-id` is forwarded
+/// (so the upstream can log it) and the gateway's own is added next to it, so
+/// the upstream's request ID and our `logs.request_id` share a key.
+#[tokio::test]
+async fn the_client_request_id_is_forwarded_and_the_gateway_id_added() {
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let (status, _) = support::call_json(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    let forwarded = sent[0]
+        .headers
+        .get("x-litrouter-request-id")
+        .expect("the gateway ID reaches the upstream");
+    assert!(
+        !forwarded.is_empty(),
+        "the gateway ID must not be an empty header"
+    );
+
+    let row = sqlx::query("SELECT request_id, client_request_id FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    // The two IDs are different values: ours is the one the DB also carries,
+    // so the upstream can be asked about the same request we logged.
+    assert_eq!(
+        row.try_get::<String, _>("request_id").unwrap(),
+        *forwarded,
+        "the echoed header value is the one the log row carries"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("client_request_id").unwrap(),
+        "",
+        "a client that sends no x-request-id leaves the column empty"
+    );
+}
+
+/// Every response the relay produces — success included — carries the
+/// correlation header, and the client's own ID round-trips into the log row.
+#[tokio::test]
+async fn the_response_echoes_the_correlation_id_the_client_sent() {
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})),
+        Some(&key),
+        &[("x-request-id", "client-ticket-42")],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let echoed = resp
+        .headers()
+        .get("x-litrouter-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("the response carries the correlation ID");
+    assert!(
+        !echoed.contains("client-ticket-42"),
+        "the echoed value is the gateway's own ID, not the client's — they are different columns"
+    );
+
+    // The upstream saw the client's ID verbatim, and the log row records it.
+    let sent = server.received_requests().await.unwrap();
+    assert_eq!(
+        sent[0]
+            .headers
+            .get("x-request-id")
+            .and_then(|h| h.to_str().ok()),
+        Some("client-ticket-42"),
+        "the client's own ID is passed through, not replaced"
+    );
+    let row = sqlx::query("SELECT request_id, client_request_id FROM logs")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("client_request_id").unwrap(),
+        "client-ticket-42"
+    );
+    // The echo is the gateway's ID, which is the row's `request_id`.
+    assert_eq!(
+        row.try_get::<String, _>("request_id").unwrap(),
+        echoed,
+        "the echoed value is the key the log row is filed under"
+    );
+}
+
+/// The streaming path records the same IDs. It matters most there: a stream
+/// is the one case where a hop's response is never buffered, so the IDs have
+/// to be carried alongside the live body instead of being read from it.
+#[tokio::test]
+async fn a_streaming_hop_carries_the_upstream_ids_too() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("request-id", "req_up_stream")
+                .insert_header("cf-ray", "8e0f1a2b3c4d-LAX")
+                .set_body_string(
+                    "data: {\"id\":\"chatcmpl-up\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                     data: [DONE]\n\n",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+    let (status, _) = chat(&h, &key, "gpt-4o", json!({"stream": true})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The stream's log write happens in a spawned task off the body's Drop,
+    // so poll the way the other streaming tests here do.
+    let mut ids = (String::new(), String::new());
+    for _ in 0..200 {
+        let row = sqlx::query("SELECT upstream_request_id, upstream_cf_ray FROM log_attempts")
+            .fetch_optional(h.pool())
+            .await
+            .unwrap();
+        if let Some(row) = row {
+            let rid = row
+                .try_get::<String, _>("upstream_request_id")
+                .unwrap_or_default();
+            if !rid.is_empty() {
+                ids = (
+                    rid,
+                    row.try_get::<String, _>("upstream_cf_ray")
+                        .unwrap_or_default(),
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(ids.0, "req_up_stream");
+    assert_eq!(ids.1, "8e0f1a2b3c4d-LAX");
+}

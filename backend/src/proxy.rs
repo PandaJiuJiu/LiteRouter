@@ -710,6 +710,10 @@ struct Attempt {
     /// Time to First Token in milliseconds. Only meaningful for streaming
     /// requests; 0 for non-streaming.
     ttft_ms: i64,
+    /// The upstream's own IDs for this hop. Empty when no upstream answered
+    /// (breaker skip, routing failure), also empty when the provider sends
+    /// no ID header at all.
+    refs: UpstreamRefs,
 }
 
 impl Attempt {
@@ -732,6 +736,7 @@ impl Attempt {
             skipped: false,
             usage: None,
             ttft_ms: 0, // Set later for streaming requests
+            refs: UpstreamRefs::default(),
         }
     }
 
@@ -749,6 +754,13 @@ impl Attempt {
         self
     }
 
+    /// Attach the upstream IDs this hop answered with. Only meaningful for a
+    /// hop that actually reached an upstream.
+    fn with_refs(mut self, refs: UpstreamRefs) -> Self {
+        self.refs = refs;
+        self
+    }
+
     fn usage_or_zero(&self) -> convert::Usage {
         self.usage.unwrap_or_default()
     }
@@ -762,7 +774,17 @@ impl Attempt {
 struct ClientInfo {
     ip: String,
     user_agent: String,
+    /// The client's own correlation ID, from `x-request-id`. Empty when the
+    /// caller didn't send one (Claude Code doesn't). Echoed back on the
+    /// response and forwarded upstream so a support ticket quoting it can be
+    /// traced to the exact `logs` row *and* the exact upstream hop.
+    request_id: String,
 }
+
+/// Longest client-supplied `x-request-id` worth persisting. It is echoed on
+/// the response and stored in a column, not used for routing, so a hostile
+/// one-megabyte value buys its sender nothing.
+const CLIENT_REQUEST_ID_MAX: usize = 200;
 
 fn extract_client_info(headers: &HeaderMap, direct_ip: Option<std::net::SocketAddr>) -> ClientInfo {
     let ip = headers
@@ -779,7 +801,112 @@ fn extract_client_info(headers: &HeaderMap, direct_ip: Option<std::net::SocketAd
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    ClientInfo { ip, user_agent }
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(CLIENT_REQUEST_ID_MAX).collect())
+        .unwrap_or_default();
+    ClientInfo {
+        ip,
+        user_agent,
+        request_id,
+    }
+}
+
+/// `x-litrouter-request-id`: the response header that echoes the gateway's
+/// per-request correlation ID back to the client. A client that can read its
+/// own response headers can quote it when asking what went wrong; the value
+/// it sees here is the one `logs.request_id` carries.
+const LITREQUESTER_ID_HEADER: &str = "x-litrouter-request-id";
+
+/// Stamp the gateway's correlation ID onto an outgoing response.
+///
+/// Skipped for an empty id (auth and parse failures happen before a request
+/// id exists — see `relay`) rather than echoing a blank header, and for a
+/// value that isn't a legal header value at all: `new_request_id` embeds the
+/// requested model name, which comes straight from the request body and can
+/// contain arbitrary bytes.
+fn set_correlation_header(resp: &mut axum::http::Response<axum::body::Body>, request_id: &str) {
+    if request_id.is_empty() {
+        return;
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
+        resp.headers_mut().insert(LITREQUESTER_ID_HEADER, v);
+    }
+}
+
+/// The two correlation IDs a hop carries to the upstream.
+///
+/// Why they exist: a relay station that serves two concurrent conversations
+/// from one account has no other way to tell the requests apart, and neither
+/// do we. Stamping the gateway's own ID on the wire gives the upstream's log
+/// line and our `logs.request_id` a shared key, so the day one of them hands
+/// us the wrong reply the mismatch can be proven instead of guessed at.
+struct UpstreamHeaders<'a> {
+    /// The client's own `x-request-id`, forwarded only when it sent one.
+    client_request_id: &'a str,
+    /// The gateway's correlation ID for this request (`new_request_id`).
+    gateway_request_id: &'a str,
+}
+
+/// Header names that providers use for the ID of the request they served,
+/// in the order we look at them. Only the first non-empty one is recorded:
+/// a relay station typically emits several, and the point of the column is
+/// one stable value to hand back to the provider, not a full inventory.
+const UPSTREAM_REQUEST_ID_HEADERS: [&str; 6] = [
+    "request-id",
+    "x-request-id",
+    "x-amzn-requestid",
+    "x-ms-request-id",
+    "x-goog-request-id",
+    "apigw-requestid",
+];
+
+/// The vendor's identifiers for one upstream hop, read off its response
+/// headers. All three are stored per hop in `log_attempts` (see migration
+/// 0037): they are the only handle the upstream has for looking up its own
+/// copy of this exact request.
+///
+/// They are *not* redundant with each other. `request_id` is the provider's
+/// primary ID under whatever header name it uses. `cf_ray` identifies the
+/// Cloudflare edge that answered — several relay stations sit behind one,
+/// and two of our requests landing on different rays went to different
+/// backend processes. `generation_id` is the per-generation billing ID from
+/// OpenRouter-style relays, which does not match their `request_id`.
+#[derive(Clone, Default, PartialEq)]
+struct UpstreamRefs {
+    request_id: String,
+    cf_ray: String,
+    generation_id: String,
+}
+
+impl UpstreamRefs {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        // A header value is untrusted: it can be long or non-UTF8. Truncate
+        // rather than drop it — a truncated ID still narrows a vendor's log
+        // search, and a non-UTF8 one says nothing either way.
+        let one = |name: &str| -> String {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(CLIENT_REQUEST_ID_MAX).collect())
+                .unwrap_or_default()
+        };
+        let request_id = UPSTREAM_REQUEST_ID_HEADERS
+            .iter()
+            .map(|name| one(name))
+            .find(|v| !v.is_empty())
+            .unwrap_or_default();
+        Self {
+            request_id,
+            cf_ray: one("cf-ray"),
+            generation_id: one("x-generation-id"),
+        }
+    }
 }
 
 /// Generate a per-request correlation ID.
@@ -815,8 +942,8 @@ async fn insert_pending_log(
          (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, \
           total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, \
           upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, \
-          failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id) \
-         VALUES (?, ?, '', 0, 0, 0, 0, ?, ?, 0, ?, ?, '', '', '', 0, 0, 0, 0, ?, ?, 0, 0, ?)",
+          failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id) \
+         VALUES (?, ?, '', 0, 0, 0, 0, ?, ?, 0, ?, ?, '', '', '', 0, 0, 0, 0, ?, ?, 0, 0, ?, ?)",
     )
     .bind(token_name)
     .bind(request_model) // `model` — overwritten on finalize; keeps list fallback sane
@@ -827,6 +954,7 @@ async fn insert_pending_log(
     .bind(&client_info.ip)
     .bind(&client_info.user_agent)
     .bind(request_id)
+    .bind(&client_info.request_id)
     .execute(pool)
     .await
     .ok()?;
@@ -979,7 +1107,7 @@ impl Drop for PendingLogGuard {
                 .await;
             for (seq, a) in rows.iter().enumerate() {
                 let _ = sqlx::query(
-                    "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms, upstream_request_id, upstream_cf_ray, upstream_generation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(log_id)
                 .bind(seq as i64)
@@ -992,6 +1120,9 @@ impl Drop for PendingLogGuard {
                 .bind(a.ok as i64)
                 .bind(a.skipped as i64)
                 .bind(a.ttft_ms)
+                .bind(&a.refs.request_id)
+                .bind(&a.refs.cf_ray)
+                .bind(&a.refs.generation_id)
                 .execute(&mut *tx)
                 .await;
             }
@@ -1017,6 +1148,9 @@ fn attempt_events(attempts: &[Attempt]) -> Vec<LogAttemptEvent> {
             ok: a.ok,
             skipped: a.skipped,
             ttft_ms: a.ttft_ms,
+            upstream_request_id: a.refs.request_id.clone(),
+            upstream_cf_ray: a.refs.cf_ray.clone(),
+            upstream_generation_id: a.refs.generation_id.clone(),
         })
         .collect()
 }
@@ -1070,6 +1204,7 @@ fn broadcast_pending_chain(
         failed_count,
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
+        client_request_id: client_info.request_id.clone(),
         client_aborted: false,
         streaming,
         protocol: protocol.to_string(),
@@ -1094,7 +1229,7 @@ async fn insert_attempt_row(
 ) -> Option<i64> {
     let log_id = log_id?;
     let res = sqlx::query(
-        "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms, upstream_request_id, upstream_cf_ray, upstream_generation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log_id)
     .bind(seq as i64)
@@ -1107,6 +1242,9 @@ async fn insert_attempt_row(
     .bind(a.ok as i64)
     .bind(a.skipped as i64)
     .bind(a.ttft_ms)
+    .bind(&a.refs.request_id)
+    .bind(&a.refs.cf_ray)
+    .bind(&a.refs.generation_id)
     .execute(pool)
     .await
     .ok()?;
@@ -1117,7 +1255,7 @@ async fn insert_attempt_row(
 /// stops showing the hop as in flight. Best-effort, like its counterpart.
 async fn update_attempt_row(pool: &SqlitePool, row_id: i64, a: &Attempt) {
     let _ = sqlx::query(
-        "UPDATE log_attempts SET status_code = ?, error = ?, latency_ms = ?, ok = ?, skipped = ?, ttft_ms = ? WHERE id = ?",
+        "UPDATE log_attempts SET status_code = ?, error = ?, latency_ms = ?, ok = ?, skipped = ?, ttft_ms = ?, upstream_request_id = ?, upstream_cf_ray = ?, upstream_generation_id = ? WHERE id = ?",
     )
     .bind(a.status)
     .bind(&a.error)
@@ -1125,6 +1263,9 @@ async fn update_attempt_row(pool: &SqlitePool, row_id: i64, a: &Attempt) {
     .bind(a.ok as i64)
     .bind(a.skipped as i64)
     .bind(a.ttft_ms)
+    .bind(&a.refs.request_id)
+    .bind(&a.refs.cf_ray)
+    .bind(&a.refs.generation_id)
     .bind(row_id)
     .execute(pool)
     .await;
@@ -1149,6 +1290,9 @@ struct LogEntry {
     attempts: Vec<Attempt>,
     client_ip: String,
     user_agent: String,
+    /// The client's own `x-request-id`, echoed back on the response. Empty
+    /// when the client didn't send one.
+    client_request_id: String,
     /// The stream was dropped before its protocol terminator because the
     /// **client** hung up — no upstream fault observed. Recorded on its own
     /// column rather than in `error`: every failure affordance in the UI
@@ -1200,7 +1344,8 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
                  prompt_tokens=?, completion_tokens=?, total_tokens=?, request_model=?, \
                  latency_ms=?, stream=?, protocol=?, convert=?, upstream_model=?, error=?, \
                  cache_read_tokens=?, cache_creation_tokens=?, reasoning_tokens=?, \
-                 failed_count=?, client_ip=?, user_agent=?, client_aborted=?, ttft_ms=? \
+                 failed_count=?, client_ip=?, user_agent=?, client_aborted=?, ttft_ms=?, \
+                 client_request_id=? \
                  WHERE id=?",
             )
             .bind(&e.token_name)
@@ -1225,6 +1370,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(&e.user_agent)
             .bind(e.client_aborted as i64)
             .bind(e.ttft_ms)
+            .bind(&e.client_request_id)
             .bind(id)
             .execute(&mut *tx)
             .await;
@@ -1235,7 +1381,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         }
         None => {
             let res = sqlx::query(
-                "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&e.token_name)
             .bind(&winner.upstream_model)
@@ -1261,6 +1407,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(e.client_aborted as i64)
             .bind(e.ttft_ms)
             .bind(&e.request_id)
+            .bind(&e.client_request_id)
             .execute(&mut *tx)
             .await;
             match res {
@@ -1280,7 +1427,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         .await;
     for (seq, a) in e.attempts.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms, upstream_request_id, upstream_cf_ray, upstream_generation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(log_id)
         .bind(seq as i64)
@@ -1293,6 +1440,9 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         .bind(a.ok as i64)
         .bind(a.skipped as i64)
         .bind(a.ttft_ms)
+        .bind(&a.refs.request_id)
+        .bind(&a.refs.cf_ray)
+        .bind(&a.refs.generation_id)
         .execute(&mut *tx)
         .await;
     }
@@ -1314,6 +1464,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         failed_count,
         client_ip: e.client_ip.clone(),
         user_agent: e.user_agent.clone(),
+        client_request_id: e.client_request_id.clone(),
         client_aborted: e.client_aborted,
         streaming: e.streaming,
         protocol: e.protocol.clone(),
@@ -1374,6 +1525,7 @@ fn error_response(
     status: StatusCode,
     message: &str,
     retry_after: Option<&str>,
+    request_id: &str,
 ) -> Response {
     let body = if protocol == "anthropic" {
         json!({
@@ -1396,6 +1548,9 @@ fn error_response(
             }
         }
     }
+    // Even a failure gets the correlation ID: "which request failed" is the
+    // question this header answers, and a 401 never produced a `logs` row.
+    set_correlation_header(&mut resp, request_id);
     resp
 }
 
@@ -1445,14 +1600,22 @@ fn disable_upstream_thinking(body: &mut Value, upstream_protocol: &str) {
 /// caller still owns the body, so this is just a header recipe.
 /// `upstream_protocol` is the protocol the upstream actually speaks (which
 /// may differ from the client's when converting).
+///
+/// Note what is *not* here: the client's own headers (`anthropic-beta`,
+/// `user-agent`, SDK plumbing) are deliberately dropped. The only things that
+/// cross are the two correlation IDs in [`UpstreamHeaders`], which is what
+/// keeps the request shape upstream sees identical for the two concurrent
+/// sessions of one account — everything that could tell them apart stays on
+/// our side of the wire.
 fn build_request(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     upstream_protocol: &str,
     headers: &HeaderMap,
+    ids: &UpstreamHeaders<'_>,
 ) -> reqwest::RequestBuilder {
-    let req = if upstream_protocol == "anthropic" {
+    let mut req = if upstream_protocol == "anthropic" {
         let version = headers
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
@@ -1466,7 +1629,34 @@ fn build_request(
             .post(format!("{}/chat/completions", base_url))
             .header("Authorization", format!("Bearer {}", api_key))
     };
+    // A `RequestBuilder` latches a bad header value as a builder error the
+    // `.send()` reports as a transport failure, so a value we can't prove is
+    // legal has to be dropped rather than forwarded — otherwise one weird
+    // model name would fail the whole hop.
+    req = with_header_if_valid(req, LITREQUESTER_ID_HEADER, ids.gateway_request_id);
+    if !ids.client_request_id.is_empty() {
+        req = with_header_if_valid(req, "x-request-id", ids.client_request_id);
+    }
     req.header("Content-Type", "application/json")
+}
+
+/// Set an outbound header only when the value is a legal header value.
+///
+/// Values that reach here are either ours (the correlation ID, which embeds
+/// the requested model name — attacker-controlled bytes) or the client's
+/// (`x-request-id`, unbounded). A `HeaderValue` that can't be built must be
+/// dropped, never forwarded: reqwest latches it as a builder error that the
+/// `.send()` reports as a transport failure, which would burn a real failover
+/// hop on garbage.
+fn with_header_if_valid(
+    builder: reqwest::RequestBuilder,
+    name: &'static str,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    match axum::http::HeaderValue::from_str(value) {
+        Ok(v) => builder.header(name, v),
+        Err(_) => builder,
+    }
 }
 
 /// Outcome of one upstream attempt, classified into four buckets so the
@@ -1489,6 +1679,9 @@ enum UpstreamOutcome {
         /// error body, e.g. `"Rate limit exceeded"`. `None` when the body
         /// was empty or unreadable.
         detail: Option<String>,
+        /// The upstream's IDs for this hop, so even a failed candidate can
+        /// be traced in its logs. Empty when it never got to respond.
+        refs: UpstreamRefs,
     },
     /// 2xx whose body is **not** the response the client asked for — the
     /// relay-station failure mode where an upstream answers `200
@@ -1501,6 +1694,7 @@ enum UpstreamOutcome {
         /// body itself goes to the debug capture instead.
         detail: &'static str,
         body: DebugCapture,
+        refs: UpstreamRefs,
     },
     /// Connection / DNS / TLS / timeout failure — no HTTP status received.
     Transport(String),
@@ -1514,6 +1708,7 @@ enum UpstreamBody {
         content_type: Option<axum::http::HeaderValue>,
         bytes: Bytes,
         capture: DebugCapture,
+        refs: UpstreamRefs,
     },
     /// Streaming: untouched from where `peek` left off, so the SSE pump can
     /// forward it without buffering. `prefix` holds whatever bytes the peek
@@ -1525,6 +1720,7 @@ enum UpstreamBody {
         resp: reqwest::Response,
         prefix: Vec<u8>,
         capture: DebugCapture,
+        refs: UpstreamRefs,
     },
 }
 
@@ -1581,6 +1777,7 @@ async fn try_upstream(
     body: Vec<u8>,
     headers: &HeaderMap,
     is_streaming: bool,
+    ids: &UpstreamHeaders<'_>,
 ) -> UpstreamOutcome {
     let url = if upstream_protocol == "anthropic" {
         format!("{}/v1/messages", cand.base_url)
@@ -1595,6 +1792,7 @@ async fn try_upstream(
         &cand.api_key,
         upstream_protocol,
         headers,
+        ids,
     )
     .body(body.clone());
 
@@ -1602,6 +1800,10 @@ async fn try_upstream(
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
+                // Read the vendor IDs before the response moves into the
+                // peek / buffered paths, both of which need them for the hop
+                // they return.
+                let refs = UpstreamRefs::from_headers(resp.headers());
                 if is_streaming {
                     return upstream_2xx_streaming_peek(
                         resp,
@@ -1610,6 +1812,7 @@ async fn try_upstream(
                         &url,
                         &body,
                         start_time,
+                        refs,
                     )
                     .await;
                 }
@@ -1620,6 +1823,7 @@ async fn try_upstream(
                     &url,
                     &body,
                     start_time,
+                    refs,
                 )
                 .await;
             }
@@ -1628,10 +1832,15 @@ async fn try_upstream(
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.trim().parse::<u64>().ok());
+            // Before `read_error_detail` consumes the response: a failed hop
+            // still has IDs, and they are how the provider is confronted with
+            // the request it refused.
+            let refs = UpstreamRefs::from_headers(resp.headers());
             UpstreamOutcome::Http {
                 status,
                 retry_after_secs,
                 detail: read_error_detail(resp).await,
+                refs,
             }
         }
         Err(e) => UpstreamOutcome::Transport(describe_transport_error(&e)),
@@ -1669,6 +1878,7 @@ async fn upstream_2xx_streaming_peek(
     url: &str,
     request_body: &[u8],
     start_time: tokio::time::Instant,
+    refs: UpstreamRefs,
 ) -> UpstreamOutcome {
     if resp
         .headers()
@@ -1684,6 +1894,7 @@ async fn upstream_2xx_streaming_peek(
             status,
             detail: "HTTP 200 but a streaming request got a JSON response, not an event stream",
             body: DebugCapture::new(),
+            refs,
         };
     }
     let mut buf: Vec<u8> = Vec::new();
@@ -1754,6 +1965,7 @@ async fn upstream_2xx_streaming_peek(
                             // the capture and the breaker reason.
                             detail: "HTTP 200 but stream opened with an upstream error event",
                             body: capture,
+                            refs,
                         };
                     }
                     break;
@@ -1766,6 +1978,7 @@ async fn upstream_2xx_streaming_peek(
         resp,
         prefix: buf,
         capture,
+        refs,
     })
 }
 
@@ -1778,6 +1991,7 @@ async fn upstream_2xx_buffered(
     url: &str,
     request_body: &[u8],
     start_time: tokio::time::Instant,
+    refs: UpstreamRefs,
 ) -> UpstreamOutcome {
     let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).cloned();
     let capture = DebugCapture::new();
@@ -1830,6 +2044,7 @@ async fn upstream_2xx_buffered(
             status,
             detail: invalid_body_detail(upstream_protocol),
             body: capture,
+            refs,
         };
     }
     UpstreamOutcome::Ok(UpstreamBody::Buffered {
@@ -1837,6 +2052,7 @@ async fn upstream_2xx_buffered(
         content_type,
         bytes,
         capture,
+        refs,
     })
 }
 
@@ -2691,6 +2907,7 @@ fn passthrough_stream(
     content_type: Option<axum::http::HeaderValue>,
     log: StreamLog,
     capture: DebugCapture,
+    request_id: &str,
 ) -> Response {
     let usage: Arc<Mutex<(convert::Usage, bool)>> =
         Arc::new(Mutex::new((convert::Usage::default(), false)));
@@ -2783,7 +3000,13 @@ fn passthrough_stream(
             finish_for_drop,
         )))
         .unwrap_or_else(|_| {
-            error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+            error_response(
+                "openai",
+                StatusCode::BAD_GATEWAY,
+                "body build failed",
+                None,
+                request_id,
+            )
         })
 }
 
@@ -2799,6 +3022,7 @@ fn converted_stream(
     conv: Box<dyn SseConverter>,
     log: StreamLog,
     capture: DebugCapture,
+    request_id: &str,
 ) -> Response {
     let conv: Arc<Mutex<Box<dyn SseConverter>>> = Arc::new(Mutex::new(conv));
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2921,7 +3145,13 @@ fn converted_stream(
             finish,
         )))
         .unwrap_or_else(|_| {
-            error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+            error_response(
+                "openai",
+                StatusCode::BAD_GATEWAY,
+                "body build failed",
+                None,
+                request_id,
+            )
         })
 }
 
@@ -2984,6 +3214,7 @@ async fn respond_from_upstream(
         attempts: push(attempts, winner),
         client_ip: ctx.client_info.ip.clone(),
         user_agent: ctx.client_info.user_agent.clone(),
+        client_request_id: ctx.client_info.request_id.clone(),
         // Only a stream's Drop can observe a client hang-up; the buffered
         // path has no stream to hang up on. `spawn_inline` sets this for the
         // streaming row.
@@ -2996,24 +3227,27 @@ async fn respond_from_upstream(
         created_at: ctx.created_at,
     };
 
-    let (status, content_type, bytes, capture) = match body {
+    let (status, content_type, bytes, capture, refs) = match body {
         UpstreamBody::Buffered {
             status,
             content_type,
             bytes,
             capture,
-        } => (status, content_type, bytes, capture),
+            refs,
+        } => (status, content_type, bytes, capture, refs),
         UpstreamBody::Live {
             resp,
             prefix,
             capture,
+            refs,
         } => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let content_type = resp.headers().get("content-type").cloned();
             // This hop ends the request either way — the client gets its
             // response here, whether it succeeded or not.
-            let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true);
+            let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true)
+                .with_refs(refs);
             // Clone attempts for entry creation since we need the original for metadata
             let attempts_for_entry = attempts.clone();
             let entry = entry_of(attempt.clone(), attempts_for_entry);
@@ -3055,25 +3289,50 @@ async fn respond_from_upstream(
                     current_backoff_secs: backoff,
                 });
             }
-            let response = match cand.convert {
-                ConvertMode::None => {
-                    passthrough_stream(prefix, resp, status, content_type, log, capture.clone())
-                }
+            let mut response = match cand.convert {
+                ConvertMode::None => passthrough_stream(
+                    prefix,
+                    resp,
+                    status,
+                    content_type,
+                    log,
+                    capture.clone(),
+                    ctx.request_id,
+                ),
                 ConvertMode::ToOpenAI => {
                     let conv = convert::OpenAiToAnthropicStream::new(model);
-                    converted_stream(prefix, resp, Box::new(conv), log, capture.clone())
+                    converted_stream(
+                        prefix,
+                        resp,
+                        Box::new(conv),
+                        log,
+                        capture.clone(),
+                        ctx.request_id,
+                    )
                 }
                 ConvertMode::ToAnthropic => {
                     let conv = convert::AnthropicToOpenAiStream::new(model);
-                    converted_stream(prefix, resp, Box::new(conv), log, capture.clone())
+                    converted_stream(
+                        prefix,
+                        resp,
+                        Box::new(conv),
+                        log,
+                        capture.clone(),
+                        ctx.request_id,
+                    )
                 }
             };
+            // Before anything is flushed: the client can quote this value, and
+            // the value is the key both the `logs` row and the upstream hop
+            // carry (see `UpstreamHeaders`).
+            set_correlation_header(&mut response, ctx.request_id);
             return (response, attempt);
         }
     };
 
     let attempt = Attempt::new(model, cand, status.as_u16() as i64, "", latency_ms, true)
-        .with_usage(parse_usage(&bytes));
+        .with_usage(parse_usage(&bytes))
+        .with_refs(refs);
     // Translate the buffered body when this hop crosses protocols. The body
     // has already been validated against the *upstream's* protocol, so a
     // parse failure here is only reachable if a provider returns something
@@ -3146,9 +3405,16 @@ async fn respond_from_upstream(
             h.insert(axum::http::header::CONTENT_TYPE, ct);
         }
     }
-    let resp = builder.body(Body::from(out_bytes)).unwrap_or_else(|_| {
-        error_response("openai", StatusCode::BAD_GATEWAY, "body build failed", None)
+    let mut resp = builder.body(Body::from(out_bytes)).unwrap_or_else(|_| {
+        error_response(
+            "openai",
+            StatusCode::BAD_GATEWAY,
+            "body build failed",
+            None,
+            ctx.request_id,
+        )
     });
+    set_correlation_header(&mut resp, ctx.request_id);
     (resp, attempt)
 }
 
@@ -3168,7 +3434,9 @@ async fn relay(
     direct_ip: Option<std::net::SocketAddr>,
 ) -> Response {
     let state = &*state_arc;
-    // 1. internal token auth
+    // 1. internal token auth. These three failures happen before a request id
+    // exists (there is no `logs` row for them either), so they carry no
+    // correlation header — `set_correlation_header` skips the empty id.
     let key = match extract_token(headers) {
         Some(k) => k,
         None => {
@@ -3177,12 +3445,13 @@ async fn relay(
                 StatusCode::UNAUTHORIZED,
                 "missing bearer token",
                 None,
+                "",
             )
         }
     };
     let token_name = match auth_token(state, &key).await {
         Ok(n) => n,
-        Err((s, msg)) => return error_response(protocol, s, msg, None),
+        Err((s, msg)) => return error_response(protocol, s, msg, None, ""),
     };
     let client_info = extract_client_info(headers, direct_ip);
 
@@ -3190,7 +3459,13 @@ async fn relay(
     let req_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
-            return error_response(protocol, StatusCode::BAD_REQUEST, "invalid JSON body", None)
+            return error_response(
+                protocol,
+                StatusCode::BAD_REQUEST,
+                "invalid JSON body",
+                None,
+                "",
+            )
         }
     };
     let model = match req_json.get("model").and_then(|m| m.as_str()) {
@@ -3201,6 +3476,7 @@ async fn relay(
                 StatusCode::BAD_REQUEST,
                 "missing model in request",
                 None,
+                "",
             )
         }
     };
@@ -3213,7 +3489,9 @@ async fn relay(
     // latency reflects only the upstream work.
     let relay_start = Instant::now();
 
-    // Per-request correlation ID: used to match pending/final events.
+    // Per-request correlation ID: used to match pending/final events, stamped
+    // on every response this request produces, carried to each upstream hop,
+    // and persisted as `logs.request_id`.
     let request_id = new_request_id(&token_name, &model);
     let created_at = now();
 
@@ -3302,7 +3580,7 @@ async fn relay(
                     // A real (if rare) gateway-side failure, not a client
                     // disconnect — disarm so the guard doesn't mislabel it.
                     pending_guard.disarm();
-                    return error_response(protocol, s, "internal error", None);
+                    return error_response(protocol, s, "internal error", None, &request_id);
                 }
             }
         } else {
@@ -3422,6 +3700,10 @@ async fn relay(
                 target_body,
                 headers,
                 is_streaming,
+                &UpstreamHeaders {
+                    client_request_id: &client_info.request_id,
+                    gateway_request_id: &request_id,
+                },
             )
             .await;
             match outcome {
@@ -3466,6 +3748,7 @@ async fn relay(
                     status: code,
                     retry_after_secs,
                     detail,
+                    refs,
                 } => {
                     let elapsed = relay_start.elapsed().as_millis() as i64;
                     // Stays a bare status code: this string is both the log
@@ -3474,7 +3757,8 @@ async fn relay(
                     // panel only — see `record_outcome_in_breaker`.
                     let err_msg = format!("HTTP {code}");
                     let settled =
-                        Attempt::new(target_model, cand, code as i64, &err_msg, elapsed, false);
+                        Attempt::new(target_model, cand, code as i64, &err_msg, elapsed, false)
+                            .with_refs(refs);
                     breadcrumbs.attempts.lock().unwrap().push(settled.clone());
                     *breadcrumbs.inflight.lock().unwrap() = None;
                     if let Some(row_id) = provisional_id {
@@ -3513,10 +3797,12 @@ async fn relay(
                     status: code,
                     detail,
                     body,
+                    refs,
                 } => {
                     let elapsed = relay_start.elapsed().as_millis() as i64;
                     let settled =
-                        Attempt::new(target_model, cand, code as i64, detail, elapsed, false);
+                        Attempt::new(target_model, cand, code as i64, detail, elapsed, false)
+                            .with_refs(refs);
                     breadcrumbs.attempts.lock().unwrap().push(settled.clone());
                     *breadcrumbs.inflight.lock().unwrap() = None;
                     if let Some(row_id) = provisional_id {
@@ -3622,10 +3908,12 @@ async fn relay(
                 skipped: false,
                 usage: None,
                 ttft_ms: 0,
+                refs: UpstreamRefs::default(),
             }),
             attempts: Vec::new(),
             client_ip: client_info.ip.clone(),
             user_agent: client_info.user_agent.clone(),
+            client_request_id: client_info.request_id.clone(),
             client_aborted: false,
             ttft_ms: 0, // No upstream contacted for routing failures
             request_id: request_id.clone(),
@@ -3635,7 +3923,7 @@ async fn relay(
         // Synchronous log write so tests and admin UI see it immediately.
         pending_guard.disarm();
         let _ = log_request(state, &entry).await;
-        return error_response(protocol, StatusCode::NOT_FOUND, &err, None);
+        return error_response(protocol, StatusCode::NOT_FOUND, &err, None, &request_id);
     }
     // Pick the most informative status code:
     //   - nothing reached an upstream (every hop was a breaker skip) -> 502;
@@ -3687,6 +3975,7 @@ async fn relay(
         skipped: false,
         usage: None,
         ttft_ms: 0,
+        refs: UpstreamRefs::default(),
     };
     // Clone values needed for the async log task before moving into entry
     let token_name_for_log = token_name.clone();
@@ -3703,6 +3992,7 @@ async fn relay(
         attempts: all_attempts,
         client_ip: client_info.ip.clone(),
         user_agent: client_info.user_agent.clone(),
+        client_request_id: client_info.request_id.clone(),
         client_aborted: false,
         ttft_ms: 0, // All candidates failed, no meaningful TTFT
         request_id: request_id.clone(),
@@ -3757,7 +4047,13 @@ async fn relay(
             });
         }
     }
-    error_response(protocol, final_status, &err, relay_retry_after.as_deref())
+    error_response(
+        protocol,
+        final_status,
+        &err,
+        relay_retry_after.as_deref(),
+        &request_id,
+    )
 }
 
 /// POST /v1/chat/completions — OpenAI-compatible relay.
@@ -3783,6 +4079,9 @@ pub async fn anthropic_messages(
 /// GET /v1/models — list downstream model aliases (from model_mappings) if any,
 /// otherwise fall back to union of all enabled channel models.
 pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // No correlation header here on purpose: `/v1/models` is a routing query,
+    // not a relayed request — there is no `logs` row and no per-request ID to
+    // echo back. An auth failure on it has nothing to point at.
     let key = match extract_token(&headers) {
         Some(k) => k,
         None => {
@@ -3791,11 +4090,12 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
                 StatusCode::UNAUTHORIZED,
                 "missing bearer token",
                 None,
+                "",
             )
         }
     };
     if let Err((s, msg)) = auth_token(&state, &key).await {
-        return error_response("openai", s, msg, None);
+        return error_response("openai", s, msg, None, "");
     }
 
     // First, try to get model mappings (downstream aliases)
@@ -3810,6 +4110,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "db error",
                 None,
+                "",
             )
         }
     };
@@ -3833,6 +4134,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>, headers: HeaderMap)
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "db error",
                     None,
+                    "",
                 )
             }
         };
@@ -4135,6 +4437,7 @@ mod tests {
                     skipped: false,
                     usage: None,
                     ttft_ms: 0,
+                    refs: UpstreamRefs::default(),
                 },
             );
         }

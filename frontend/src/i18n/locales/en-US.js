@@ -295,6 +295,9 @@ export default {
       cacheWrite: 'Cache write (cache_creation)',
       reasoning: 'Reasoning (reasoning)',
       ttft: 'Time to First Token (TTFT)',
+      // Shown only when the client sent one.
+      clientRequestId: 'Client request-ID (x-request-id)',
+      gatewayRequestId: 'Gateway request-ID (x-litrouter-request-id)',
     },
     cacheReadHint: '— billed at ~0.1×',
     cacheWriteHint: '— billed at ~1.25×',
@@ -309,6 +312,7 @@ export default {
       result: 'Result',
       latency: 'Duration',
       error: 'Error',
+      upstreamRefs: 'Upstream IDs',
     },
     skipped: 'Skipped',
     ok: 'OK',
@@ -316,6 +320,10 @@ export default {
     inProgress: 'In flight',
     latencyNote:
       'Duration is cumulative from the moment the request entered the gateway until that attempt finished, so later attempts show larger values.',
+    upstreamRefsNote:
+      'The upstream’s own IDs for each attempt. Quote these when a reply looks like it belongs to another conversation: they are what the provider uses to find this exact request in its logs.',
+    idsNone:
+      'This upstream sent no request IDs, so there is nothing to quote back to it.',
   },
   breakerHistory: {
     title: 'Breaker history',

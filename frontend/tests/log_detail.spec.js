@@ -175,4 +175,68 @@ describe('LogDetail', () => {
 
     expect(getLog).toHaveBeenCalledTimes(2)
   })
+
+  it('shows both correlation IDs and the upstream hop IDs', async () => {
+    getLog.mockResolvedValue({
+      ...LOG,
+      request_id: 'relay|gpt-4o|123',
+      client_request_id: 'ticket-42',
+      attempts: [
+        {
+          seq: 0,
+          upstream_model: 'gpt-4o',
+          channel_name: 'ch',
+          status_code: 200,
+          error: '',
+          latency_ms: 42,
+          convert: 'none',
+          ok: true,
+          skipped: false,
+          upstream_request_id: 'req_up_abc',
+          upstream_cf_ray: '8e0f1a2b3c4d-SJC',
+          upstream_generation_id: 'gen_9',
+        },
+      ],
+    })
+    const w = await mountDetail()
+    await flushPromises()
+
+    expect(w.text()).toContain('ticket-42')
+    expect(w.text()).toContain('relay|gpt-4o|123')
+    expect(w.text()).toContain('req_up_abc')
+    expect(w.text()).toContain('8e0f1a2b3c4d-SJC')
+    expect(w.text()).toContain('gen_9')
+    // With at least one hop carrying IDs, the note is the one that says what
+    // the IDs are for.
+    expect(w.text()).toContain('The upstream’s own IDs for each attempt')
+  })
+
+  it('does not offer quoting advice when no hop carries any upstream ID', async () => {
+    getLog.mockResolvedValue({
+      ...LOG,
+      attempts: [
+        {
+          seq: 0,
+          upstream_model: 'gpt-4o',
+          channel_name: 'ch',
+          status_code: 200,
+          error: '',
+          latency_ms: 42,
+          convert: 'none',
+          ok: true,
+          skipped: false,
+          upstream_request_id: '',
+          upstream_cf_ray: '',
+          upstream_generation_id: '',
+        },
+      ],
+    })
+    const w = await mountDetail()
+    await flushPromises()
+
+    // A client that sent no x-request-id gets no such row at all, and the
+    // chain note flips to the "nothing to quote" variant.
+    expect(w.text()).not.toContain('Client request-ID')
+    expect(w.text()).toContain('This upstream sent no request IDs')
+  })
 })

@@ -1195,7 +1195,7 @@ pub async fn get_log(
     // The relay chain behind this request. One row per upstream attempt, in
     // the order they happened — empty for logs written before 0015.
     let attempt_rows = sqlx::query(
-        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms \
+        "SELECT seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms, upstream_request_id, upstream_cf_ray, upstream_generation_id \
          FROM log_attempts WHERE log_id=? ORDER BY seq ASC",
     )
     .bind(id)
@@ -1216,6 +1216,13 @@ pub async fn get_log(
                 "ok": a.get::<i64, _>("ok") != 0,
                 "skipped": a.get::<i64, _>("skipped") != 0,
                 "ttft_ms": a.get::<i64, _>("ttft_ms"),
+                // The upstream's own IDs for this hop, so a reply that
+                // doesn't match the request can be traced in *its* logs too.
+                // `try_get` because attempts written before 0037 predate
+                // them (and a hop the breaker skipped never had any).
+                "upstream_request_id": a.try_get::<String, _>("upstream_request_id").unwrap_or_default(),
+                "upstream_cf_ray": a.try_get::<String, _>("upstream_cf_ray").unwrap_or_default(),
+                "upstream_generation_id": a.try_get::<String, _>("upstream_generation_id").unwrap_or_default(),
             })
         })
         .collect();
@@ -1253,6 +1260,9 @@ pub async fn get_log(
             // page renders it as "in progress" rather than a failed 0.
             "pending": row.get::<i64, _>("status_code") == 0,
             "request_id": row.try_get::<String, _>("request_id").unwrap_or_default(),
+            // The client's own `x-request-id`, echoed back on the response.
+            // What a client quotes when it can't reproduce the problem itself.
+            "client_request_id": row.try_get::<String, _>("client_request_id").unwrap_or_default(),
         }
     })))
 }

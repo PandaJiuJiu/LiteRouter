@@ -45,6 +45,15 @@
           <el-descriptions-item :label="t('logDetail.field.modelRoute')">
             {{ log.request_model || '—' }} → {{ log.upstream_model || log.request_model || '—' }}
           </el-descriptions-item>
+          <!-- The two correlation IDs. Shown only when they exist: a client
+               that sends no x-request-id leaves the first row out, and the
+               gateway's is what `x-litrouter-request-id` echoed back. -->
+          <el-descriptions-item v-if="log.client_request_id" :label="t('logDetail.field.clientRequestId')">
+            <span class="mono">{{ log.client_request_id }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="log.request_id" :label="t('logDetail.field.gatewayRequestId')">
+            <span class="mono">{{ log.request_id }}</span>
+          </el-descriptions-item>
           <el-descriptions-item label="User-Agent">
             <span v-if="log.user_agent" class="ua-full">{{ log.user_agent }}</span>
             <span v-else class="hint">—</span>
@@ -93,9 +102,26 @@
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
+          <!-- The upstream's own IDs for the hop. The whole point of the
+               column: a provider is asked about these, not about a status
+               code, when the reply it sent doesn't match the request. -->
+          <el-table-column :label="t('logDetail.col.upstreamRefs')" min-width="130">
+            <template #default="{ row }">
+              <span v-if="row.upstream_request_id" class="mono">{{ row.upstream_request_id }}</span>
+              <div v-if="row.upstream_cf_ray" class="mono sub">{{ row.upstream_cf_ray }}</div>
+              <div v-if="row.upstream_generation_id" class="mono sub">{{ row.upstream_generation_id }}</div>
+              <span
+                v-if="!row.upstream_request_id && !row.upstream_cf_ray && !row.upstream_generation_id"
+                class="hint"
+              >—</span>
+            </template>
+          </el-table-column>
         </el-table>
         <p class="hint note">
           {{ t('logDetail.latencyNote') }}
+        </p>
+        <p class="hint note">
+          {{ anyUpstreamRefs ? t('logDetail.upstreamRefsNote') : t('logDetail.idsNone') }}
         </p>
       </section>
 
@@ -194,10 +220,18 @@ const attemptSummary = computed(() => {
   return parts.join(i18n.global.locale.value === 'en-US' ? ', ' : '，')
 })
 
+// Whether any hop carried upstream IDs at all. When none did, the note under
+// the chain says so rather than repeating "quote these to the provider"
+// advice about a column full of dashes.
+const anyUpstreamRefs = computed(() =>
+  (log.value?.attempts ?? []).some(
+    (a) => a.upstream_request_id || a.upstream_cf_ray || a.upstream_generation_id
+  )
+)
+
 function attemptRowClass({ row }) {
   return row.skipped ? 'is-skipped' : ''
 }
-
 function back() {
   router.push('/logs')
 }
@@ -244,6 +278,17 @@ onUnmounted(() => {
   font-size: 12px;
   color: #606266;
   word-break: break-all;
+}
+/* Request IDs are meant to be copy-pasted verbatim, so no ellipsis on the
+   result of a wide click — except in the sub-lines, where the extra CF ray
+   and generation ID are supporting detail rather than the headline value. */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.mono.sub {
+  color: #909399;
 }
 /* Fix the label column so the long "请求模型 → 转发模型" label doesn't
    stretch it and leave a canyon of whitespace before each value. */

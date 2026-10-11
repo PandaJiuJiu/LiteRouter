@@ -288,6 +288,37 @@ pub async fn call(
         .expect("router call")
 }
 
+/// Same as [`call`] but with arbitrary request headers, for the correlation
+/// ID tests: `x-request-id` has to arrive from a client that is not us.
+pub async fn call_with_headers(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut b = Body::empty();
+    if let Some(v) = body {
+        b = Body::from(serde_json::to_vec(&v).unwrap());
+    }
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    router
+        .clone()
+        .oneshot(req.body(b).unwrap())
+        .await
+        .expect("router call")
+}
+
 /// Same as [`call`] but with an explicit peer address, so
 /// `X-Forwarded-For`-less client-IP logging can be exercised.
 pub async fn call_from(

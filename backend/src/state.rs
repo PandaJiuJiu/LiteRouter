@@ -22,6 +22,16 @@ pub struct LogAttemptEvent {
     pub ok: bool,
     pub skipped: bool,
     pub ttft_ms: i64,
+    /// The upstream's own request ID for this hop, when it sent one. The only
+    /// handle the upstream has for finding this exact attempt in its own logs
+    /// — carried on the event for the same reason as the detail page's copy.
+    pub upstream_request_id: String,
+    /// Cloudflare ray of the edge that answered this hop. Two concurrent
+    /// requests from one account landing on different rays went to different
+    /// backend processes, which is the question this column exists to answer.
+    pub upstream_cf_ray: String,
+    /// OpenRouter-style per-generation ID, when the provider sends one.
+    pub upstream_generation_id: String,
 }
 
 /// Event emitted for a client request's lifecycle on the log page.
@@ -59,6 +69,10 @@ pub struct LogEvent {
     pub failed_count: i64,
     pub client_ip: String,
     pub user_agent: String,
+    /// The `x-request-id` the client sent with the request, if any. Echoed
+    /// back on the response, so a client quoting it can be traced to this
+    /// exact `logs` row — and from there to the upstream hop that answered.
+    pub client_request_id: String,
     pub client_aborted: bool,
     pub streaming: bool,
     pub protocol: String,

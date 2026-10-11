@@ -286,6 +286,9 @@ export default {
       cacheWrite: '缓存写入（cache_creation）',
       reasoning: '推理（reasoning）',
       ttft: '首 Token 响应（TTFT）',
+      // 仅当客户端自己带了 x-request-id 时才出现。
+      clientRequestId: '客户端请求 ID（x-request-id）',
+      gatewayRequestId: '网关请求 ID（x-litrouter-request-id）',
     },
     cacheReadHint: '—— 按 ~0.1 倍计费',
     cacheWriteHint: '—— 按 ~1.25 倍计费',
@@ -300,12 +303,16 @@ export default {
       result: '结果',
       latency: '耗时',
       error: '错误',
+      upstreamRefs: '上游标识',
     },
     skipped: '跳过',
     ok: '成功',
     connFailed: '连接失败',
     inProgress: '进行中',
     latencyNote: '耗时为从请求进入网关到该次尝试结束的累计值，因此后面的尝试会更大。',
+    upstreamRefsNote:
+      '上游为每次尝试分配的自己的 ID。当某次回复看起来像是别的会话串过来时，拿这组 ID 找上游对质——上游就是靠它找到自己服务过的那一次请求的。',
+    idsNone: '该上游没有返回请求 ID，因此没有可以拿去对质的标识。',
   },
   breakerHistory: {
     title: '熔断器历史',
