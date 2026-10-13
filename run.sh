@@ -5,8 +5,11 @@
 #   ./run.sh restart [port] 重启（stop 后 start）
 #   ./run.sh status         查看运行状态
 #   ./run.sh logs [be|fe]   查看后端/前端日志（默认全部）
-# port 默认 3000；前端 dev server 固定 5173，/api 与 /v1 自动代理到后端。
-# 可选环境变量：LITEROUTER_DB（数据库路径，默认 dev.db）。
+# port 默认 12000；前端 dev server 默认 12001，/api 与 /v1 自动代理到后端。
+# 都是高位端口，避免和机器上别的服务（3000/5173/8080 之类）抢。
+# 可选环境变量：
+#   LITEROUTER_DB             数据库路径，默认 data/literouter.db
+#   LITEROUTER_FRONTEND_PORT  覆盖前端端口（默认 12001）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,8 +17,9 @@ LOG_DIR="$ROOT/.run/logs"
 PID_DIR="$ROOT/.run"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-PORT="${2:-3000}"
+PORT="${2:-12000}"
 DB="${LITEROUTER_DB:-$ROOT/data/literouter.db}"
+FRONTEND_PORT="${LITEROUTER_FRONTEND_PORT:-12001}"
 
 is_running() { # $1 = pidfile
     [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
@@ -40,13 +44,13 @@ cmd_start() {
         echo "已有开发进程在运行，先执行 ./run.sh stop" >&2
         exit 1
     fi
-    echo "端口: 后端 $PORT, 前端 5173"
+    echo "端口: 后端 $PORT, 前端 $FRONTEND_PORT"
     start_one backend "$PID_DIR/backend.pid" "$ROOT/backend" \
         env PORT="$PORT" LITEROUTER_DB="$DB" cargo run
     start_one frontend "$PID_DIR/frontend.pid" "$ROOT/frontend" \
-        env LITEROUTER_PORT="$PORT" npm run dev
+        env LITEROUTER_PORT="$PORT" LITEROUTER_FRONTEND_PORT="$FRONTEND_PORT" npm run dev
     echo
-    echo "前端(带后台): http://localhost:5173"
+    echo "前端(带后台): http://localhost:$FRONTEND_PORT"
     echo "后端 API:     http://localhost:$PORT/v1"
 }
 

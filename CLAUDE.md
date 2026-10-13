@@ -20,17 +20,19 @@ Single repo, two deployable surfaces:
 **Always use `./run.sh` for dev.** Do NOT start the backend and frontend in separate shells — the proxy in `vite.config.js` and the CORS setup assume they're co-launched by the same script.
 
 ```bash
-./run.sh start [port]    # port defaults to 3000; frontend dev server is fixed at 5173
+./run.sh start [port]    # backend port arg (default $PORT below); frontend port comes from $FRONTEND_PORT
 ./run.sh stop
 ./run.sh status
 ./run.sh logs [be|fe|all]
 ```
 
-- Backend listens on the chosen `port` (default 3000)
-- Frontend dev server listens on **5173** with `/api` and `/v1` proxied to the backend — open **http://localhost:5173**, not :3000, in dev
+- Backend port: `PORT`, default **12000** (`./run.sh start 3000` overrides for one run). High port on purpose — 3000/5173/8080 are all taken by other things on the dev box.
+- Frontend dev server port: `LITEROUTER_FRONTEND_PORT`, default **12001**. It proxies `/api` and `/v1` to `$LITEROUTER_PORT` (run.sh passes the same backend port), so open **http://localhost:12001**, not the backend, in dev.
 - Logs: `.run/logs/backend.log`, `.run/logs/frontend.log`
 - PIDs: `.run/backend.pid`, `.run/frontend.pid`
 - DB: `data/literouter.db` (override with `LITEROUTER_DB=/some/path`)
+
+Never quote the numbers above as a fact about a running box — read the listening ports off `./run.sh status` + `ss -ltn`, or off `vite.config.js` and the `run.sh` defaults, which are the source of truth.
 
 If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(cat .run/backend.pid)` then `cd backend && env PORT=$PORT LITEROUTER_DB=$DB cargo run &` works, but for a clean reset prefer `./run.sh stop && ./run.sh start`.
 
@@ -69,7 +71,7 @@ If you only need to bounce the backend (e.g. after a `db.rs` change), `kill $(ca
 │       ├── proxy.rs             # /v1/chat/completions, /v1/messages — the actual relay
 │       └── convert.rs           # OpenAI ⇄ Anthropic protocol conversion
 ├── frontend/
-│   ├── vite.config.js           # proxies /api + /v1 → backend, port 5173
+│   ├── vite.config.js           # proxies /api + /v1 → $LITEROUTER_PORT, port $LITEROUTER_FRONTEND_PORT
 │   ├── vitest.config.js         # jsdom env for the unit suites
 │   ├── scripts/check-i18n.mjs   # locale key parity (see Testing)
 │   ├── tests/                   # vitest suites
@@ -233,7 +235,7 @@ There is **no CI** — the GitHub Actions workflow was removed (see TODO.md). `c
 **Reset everything:**
 ```bash
 ./run.sh stop && rm -f data/literouter.db && ./run.sh start
-# then visit http://localhost:5173 — wizard reappears
+# then open http://localhost:$LITEROUTER_FRONTEND_PORT (default 12001) — wizard reappears
 ```
 
 ---
@@ -244,6 +246,6 @@ There is **no CI** — the GitHub Actions workflow was removed (see TODO.md). `c
 - **Don't add `ADMIN_PASSWORD` back.** It was removed; the wizard is the only way to bootstrap.
 - **Don't add `reqwest::Client` per request** in `proxy.rs`. There's one shared client in `AppState` for connection pooling — instantiating per request leaks DNS resolvers and burns sockets.
 - **Don't expose `api_key` from `/api/channels` to non-admins.** Note that `row_channel` in `admin.rs` returns `api_key` **in full** — the protection is the endpoint's `require_admin(...)` gate, not redaction. That's deliberate: the edit form prefills the field, so redacting would make it impossible to save a channel without retyping the key. If you add a new code path that returns channel rows, put it behind `require_admin` too.
-- **Frontend dev URL is `localhost:5173`, not `:3000`.** The proxy is the entire point.
+- **Frontend dev URL is not the backend port.** The proxy is the entire point.
 - **Vite 8 (Rolldown-based), so the build needs Node `^20.19` or `>=22.12`.** `build.rollupOptions` is now `build.rolldownOptions` in any warning text you see. One transitive dep — `nopt`, via `js-beautify` ← `@vue/test-utils` — declares Node `^22.22.2`; npm warns `EBADENGINE` on Node 20 but nothing exercises it.
 - **Don't use `:` or `;` in usernames** — they go into route paths and SQL params; the setup endpoint validates.
