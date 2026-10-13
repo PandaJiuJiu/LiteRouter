@@ -38,8 +38,8 @@ RUN apk add --no-cache ca-certificates
 COPY --from=backend /build/target/release/literouter /app/literouter
 COPY --from=frontend /build/dist /app/dist
 
-ENV PORT=3000
-EXPOSE 3000
+ENV PORT=12000
+EXPOSE 12000
 VOLUME ["/app/data"]
 
 CMD ["/app/literouter"]

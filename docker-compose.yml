@@ -3,7 +3,7 @@ services:
     build: .
     container_name: literouter
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-12000}:12000"
     environment:
       - LITEROUTER_DB=/app/data/literouter.db
     volumes:

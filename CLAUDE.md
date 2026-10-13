@@ -28,6 +28,7 @@ Single repo, two deployable surfaces:
 
 - Backend port: `PORT`, default **12000** (`./run.sh start 3000` overrides for one run). High port on purpose — 3000/5173/8080 are all taken by other things on the dev box.
 - Frontend dev server port: `LITEROUTER_FRONTEND_PORT`, default **12001**. It proxies `/api` and `/v1` to `$LITEROUTER_PORT` (run.sh passes the same backend port), so open **http://localhost:12001**, not the backend, in dev.
+- All of the above (plus `LITEROUTER_DB`) can live in a root `.env` file — `run.sh` sources it automatically, and docker compose reads it natively. Command-line args / explicit env vars still win.
 - Logs: `.run/logs/backend.log`, `.run/logs/frontend.log`
 - PIDs: `.run/backend.pid`, `.run/frontend.pid`
 - DB: `data/literouter.db` (override with `LITEROUTER_DB=/some/path`)

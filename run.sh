@@ -7,9 +7,10 @@
 #   ./run.sh logs [be|fe]   查看后端/前端日志（默认全部）
 # port 默认 12000；前端 dev server 默认 12001，/api 与 /v1 自动代理到后端。
 # 都是高位端口，避免和机器上别的服务（3000/5173/8080 之类）抢。
-# 可选环境变量：
-#   LITEROUTER_DB             数据库路径，默认 data/literouter.db
-#   LITEROUTER_FRONTEND_PORT  覆盖前端端口（默认 12001）
+# 可选环境变量（也可写在根目录 .env 里，run.sh 会自动加载）：
+#   PORT                        后端端口（默认 12000；命令行第二个参数优先）
+#   LITEROUTER_FRONTEND_PORT    前端端口（默认 12001）
+#   LITEROUTER_DB               数据库路径（默认 data/literouter.db）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,15 @@ LOG_DIR="$ROOT/.run/logs"
 PID_DIR="$ROOT/.run"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
-PORT="${2:-12000}"
+# 加载根目录 .env（如果有），让 cargo run / npm run dev 都能继承其中的变量。
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$ROOT/.env"
+    set +a
+fi
+
+PORT="${2:-${PORT:-12000}}"
 DB="${LITEROUTER_DB:-$ROOT/data/literouter.db}"
 FRONTEND_PORT="${LITEROUTER_FRONTEND_PORT:-12001}"
 
