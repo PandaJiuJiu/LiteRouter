@@ -141,6 +141,7 @@ pub struct ExportReq {
 /// POST /api/config/export — admin only. Returns the encrypted file as an
 /// octet-stream attachment. The SPA turns this into a download; nothing is
 /// written to the server.
+#[allow(clippy::result_large_err)]
 pub async fn export_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -288,6 +289,7 @@ fn plan_row(kind: &str, name: &str, incoming: &Value, conflict: bool, detail: Va
 
 /// POST /api/config/import/preview — admin only. Decrypts the file and
 /// reports, per row, whether the name is free or collides. Writes nothing.
+#[allow(clippy::result_large_err)]
 pub async fn preview_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -415,6 +417,7 @@ pub struct ImportCommitReq {
 /// no decision and no conflict are created; a conflicting row with no
 /// decision is an error (the SPA is expected to send a decision for every
 /// conflict it showed).
+#[allow(clippy::result_large_err)]
 pub async fn commit_import(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
