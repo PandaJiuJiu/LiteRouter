@@ -2542,6 +2542,7 @@ async fn the_debug_switch_captures_successful_requests_too() {
         .fetch_one(h.pool())
         .await
         .unwrap();
+    support::wait_for_debug(h.pool(), id, std::time::Duration::from_secs(1)).await;
     let body = std::fs::read_to_string(
         support::debug_log_dir(h.pool())
             .join(id.to_string())
