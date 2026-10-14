@@ -40,7 +40,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features sqlite
+        # --force: the cargo cache above restores the previously installed
+        # sqlx binary into ~/.cargo/bin; without --force, cargo install refuses
+        # to overwrite it and fails in ~2s after restoring the cache.
+        run: cargo install sqlx-cli --no-default-features --features sqlite --force
 
       - name: Prepare database
         run: |
