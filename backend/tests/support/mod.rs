@@ -411,13 +411,17 @@ pub async fn wait_for_logs(pool: &SqlitePool, expected: i64, timeout: Duration) 
 }
 
 /// Poll the DB until a log row with the given id has debug capture on disk.
+/// Waits for both `resp.json` and `resp.meta.json` — the relay writes them in
+/// sequence from a spawned task, so one may appear slightly before the other,
+/// and a test that only waits for `resp.json` can still race `resp.meta.json`.
 pub async fn wait_for_debug(pool: &SqlitePool, log_id: i64, timeout: Duration) {
     let mut ticker = interval(Duration::from_millis(10));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let deadline = tokio::time::Instant::now() + timeout;
     let dir = debug_log_dir(pool);
     loop {
-        if dir.join(log_id.to_string()).join("resp.json").exists() {
+        let dir = dir.join(log_id.to_string());
+        if dir.join("resp.json").exists() && dir.join("resp.meta.json").exists() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
