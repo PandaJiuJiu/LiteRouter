@@ -6,6 +6,32 @@
 
 ---
 
+## [0.0.10] - 2026-10-14
+
+自 v0.0.9 起共 8 个提交，聚焦配置可移植性与工程基建。
+
+### 新增
+
+- **支持根目录 `.env` 统一配置端口**：`run.sh` 自动加载根目录 `.env`，其中的 `PORT`、`LITEROUTER_FRONTEND_PORT`、`LITEROUTER_DB` 同时作用于开发前后端；docker compose 原生读取同一份 `.env`。命令行参数 / 显式环境变量优先级更高
+- **上游请求 ID 记录**：每个 hop 记录上游自己的请求 ID（`x-request-id` 等），失败排查时可跨系统关联
+
+### 变更
+
+- **开发端口迁移到高位**：后端默认 12000、前端默认 12001，避免与机器上常见服务（3000/5173/8080）冲突；`vite.config.js` 与 `Dockerfile` / `docker-compose.yml` 默认值同步对齐
+- **Docker 默认端口同步为 12000**：`ENV PORT`、`EXPOSE` 与 compose 端口映射统一从 3000 改为 12000，并支持 `.env` 的 `PORT` 覆盖
+
+### 修复
+
+- **clippy `result_large_err`**：配置备份的三个 handler 返回 `Result<_, Response>` 触发 lint，补充 `#[allow]`（与文件内既有辅助函数一致）
+
+### 其他
+
+- **恢复 GitHub Actions CI**：新增 `.github/workflows/ci.yml`，三个并行 job（后端 fmt/clippy/test、前端 i18n 检查/单测/构建、Docker 构建+冒烟测试），推送 `main` 与 PR 时触发
+- **添加 MIT 许可证**
+- 修复两个测试与异步 debug 捕获写入之间的竞态
+
+---
+
 ## [0.0.9] - 2026-10-10
 
 自 v0.0.8 起共 10 个提交，聚焦流式中继的正确性与日志实时性。
