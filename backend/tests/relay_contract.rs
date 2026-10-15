@@ -17,7 +17,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sqlx::Row;
-use support::Harness;
+use std::time::Duration;
+use support::{Harness, wait_for_debug};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2758,6 +2759,7 @@ async fn a_converted_stream_captures_the_upstream_bytes_too() {
         .fetch_one(h.pool())
         .await
         .unwrap();
+    support::wait_for_debug(h.pool(), id, Duration::from_secs(5)).await;
     let body = std::fs::read_to_string(
         support::debug_log_dir(h.pool())
             .join(id.to_string())
