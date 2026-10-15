@@ -97,7 +97,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build Docker image
-        run: docker build -t literouter:test .
+        # GH Actions runners reach Docker Hub directly; the Dockerfile's
+        # default registry (docker.m.daocloud.io) is a CN mirror that is
+        # unreliable from US runners, so override it with Docker Hub.
+        run: docker build --build-arg REGISTRY=docker.io/library -t literouter:test .
 
       - name: Test Docker image runs
         run: |
@@ -136,6 +139,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # GH Actions runners reach Docker Hub directly; the Dockerfile's
+          # default registry (docker.m.daocloud.io) is a CN mirror that is
+          # unreliable from US runners, so override it with Docker Hub.
+          build-args: |
+            REGISTRY=docker.io/library
           push: true
           tags: |
             ghcr.io/pandajiujiu/literouter:${{ github.ref_name }}
