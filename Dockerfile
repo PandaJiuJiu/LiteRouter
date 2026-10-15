@@ -38,6 +38,11 @@ RUN apk add --no-cache ca-certificates
 COPY --from=backend /build/target/release/literouter /app/literouter
 COPY --from=frontend /build/dist /app/dist
 
+# GHCR package metadata: link this image to the source repository so the
+# package is owned by (and listed under) PandaJiuJiu/LiteRouter rather than
+# floating as a user-level package with no repo association.
+LABEL org.opencontainers.image.source=https://github.com/PandaJiuJiu/LiteRouter
+
 ENV PORT=12000
 EXPOSE 12000
 VOLUME ["/app/data"]
