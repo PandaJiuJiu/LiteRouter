@@ -10,7 +10,7 @@
 
 ## 功能特性
 
-- **统一接入**：只对外暴露 `http://your-host:3000/v1` 一个地址，同时兼容两种协议：
+- **统一接入**：只对外暴露 `http://your-host:12000/v1` 一个地址，同时兼容两种协议：
   - `POST /v1/chat/completions` — OpenAI 协议（`Authorization: Bearer sk-...`）
   - `POST /v1/messages` — Anthropic Messages 协议（`x-api-key: sk-...`）
   - 均支持流式（SSE）透传
@@ -36,24 +36,20 @@
 预构建镜像发布在 GitHub Container Registry。已发布的标签列表见 <https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>；生产环境建议固定一个标签，想跟随最新版本就用 `latest`：
 
 ```bash
-docker pull ghcr.io/PandaJiuJiu/literouter:latest
+docker pull ghcr.io/pandajiujiu/literouter:latest
 ```
 
-**该包目前为私有**，需要先用一个带 `read:packages` 权限的 GitHub token 登录（classic PAT 勾选该权限，或 fine-grained PAT 授予本包的读权限）：
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
-```
+**镜像为公开**，无需登录即可拉取。包页面（<https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>）列出所有已发布版本，各版本的变更详情见 [CHANGELOG](CHANGELOG.md)。
 
 然后运行。把下面内容存为 `compose.yml`，放在数据目录旁边：
 
 ```yaml
 services:
   literouter:
-    image: ghcr.io/PandaJiuJiu/literouter:latest
+    image: ghcr.io/pandajiujiu/literouter:latest
     container_name: literouter
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-12000}:12000"
     environment:
       # 必须设置，详见下方警告
       - LITEROUTER_DB=/app/data/literouter.db
@@ -66,7 +62,7 @@ services:
 mkdir -p data && docker compose up -d
 ```
 
-启动后访问 `http://your-host:3000`，系统会引导你创建第一个管理员账号。
+启动后访问 `http://your-host:12000`，系统会引导你创建第一个管理员账号。
 
 > **警告：用预构建镜像运行时，`LITEROUTER_DB` 必须显式设置。**
 > 不设置时后端默认取 `literouter.db`，相对于工作目录解析为 `/app/literouter.db`，
@@ -126,7 +122,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
 
 ### 修改端口
 
-宿主端口由你所用 compose 文件的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 3000）：
+宿主端口由你所用 compose 文件的 `ports` 映射决定，已支持用 `PORT` 环境变量覆盖（容器内固定监听 12000）：
 
 ```bash
 PORT=8080 docker compose up -d      # 用 http://your-host:8080 访问
@@ -138,7 +134,7 @@ PORT=8080 docker compose up -d      # 用 http://your-host:8080 访问
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PORT` | `3000` | 监听端口 |
+| `PORT` | `12000` | 监听端口 |
 | `LITEROUTER_DB` | `literouter.db` | SQLite 数据库路径。以容器方式运行时**请设为 `/app/data/literouter.db`**——默认值会解析到挂载卷之外的 `/app/literouter.db` |
 
 ## 使用流程
@@ -155,7 +151,7 @@ PORT=8080 docker compose up -d      # 用 http://your-host:8080 访问
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://your-host:3000/v1",
+    base_url="http://your-host:12000/v1",
     api_key="sk-xxxx",  # 内部令牌
 )
 resp = client.chat.completions.create(model="gpt-4o", messages=[...])

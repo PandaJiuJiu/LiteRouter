@@ -2,7 +2,30 @@
 
 本文件记录 LiteRouter 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-镜像：`ghcr.io/PandaJiuJiu/literouter`
+镜像：`ghcr.io/pandajiujiu/literouter`
+
+---
+
+## [0.0.16] - 2026-10-15
+
+自 v0.0.10 起共 7 个提交，聚焦 CI 发布流水线与 GHCR 自动化。
+
+### 新增
+
+- **CI 自动发布 Docker 镜像到 GHCR**：`.github/workflows/ci.yml` 新增 `release` job，推送 `v*` 格式 tag 时自动构建镜像并推送到 `ghcr.io/pandajiujiu/literouter`（同时打 `latest`）。后端 / 前端 / Docker 冒烟测试全部通过后才会发布
+- **GHCR 包关联仓库**：Dockerfile 新增 `org.opencontainers.image.source` 标签指向 `PandaJiuJiu/LiteRouter`，使镜像包直接关联并显示在仓库的 Packages 页面，而非游离的用户级包
+
+### 修复
+
+- **测试稳定性**：
+  - `a_converted_stream_captures_the_upstream_bytes_too` 在异步 debug 捕获写盘完成前读取 `resp.json`，补齐 `wait_for_debug` 等待
+  - 修正 `relay_contract.rs` import 顺序（cargo fmt）
+  - 修正 `wait_for_debug` 的导入方式（直接导入调用，消除 clippy `unused_imports`）
+
+### 其他
+
+- **GHCR 仓库名统一为小写**：`PandaJiuJiu` 含大写字母，GHCR 要求仓库名全小写，镜像路径统一为 `ghcr.io/pandajiujiu/literouter`
+- 发布流程：打 tag（`git tag v0.0.17 && git push origin v0.0.17`）→ CI 自动测试并发布，无需手动推镜像
 
 ---
 
@@ -304,6 +327,8 @@
 
 ---
 
+[0.0.16]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.16
+[0.0.10]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.10
 [0.0.5]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.5
 [0.0.4]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.4
 [0.0.3]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.3

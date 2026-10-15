@@ -10,7 +10,7 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 
 ## Features
 
-- **Unified access**: one endpoint at `http://your-host:3000/v1`, compatible with both protocols:
+- **Unified access**: one endpoint at `http://your-host:12000/v1`, compatible with both protocols:
   - `POST /v1/chat/completions` — OpenAI protocol (`Authorization: Bearer sk-...`)
   - `POST /v1/messages` — Anthropic Messages protocol (`x-api-key: sk-...`)
   - Both support streaming (SSE) passthrough
@@ -36,24 +36,23 @@ A lightweight LLM API gateway. Aggregates multiple upstream LLM services (OpenAI
 Prebuilt images are published to GitHub Container Registry. The list of published tags lives at <https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>; pin a tag in production, or use `latest` if you'd rather track the most recent release:
 
 ```bash
-docker pull ghcr.io/qihangkong/literouter:latest
+docker pull ghcr.io/pandajiujiu/literouter:latest
 ```
 
-**The package is private**, so log in first with a GitHub token that has the `read:packages` scope (a classic PAT with that scope, or a fine-grained PAT granting read access to this package):
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <your-github-username> --password-stdin
-```
+The image is **public** — no login is required. The package page
+(<https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>)
+lists all published versions and doubles as the changelog entry point
+(see the [CHANGELOG](CHANGELOG.md) for per-version details).
 
 Then run it. Save this as `compose.yml` next to your data directory:
 
 ```yaml
 services:
   literouter:
-    image: ghcr.io/PandaJiuJiu/literouter:latest
+    image: ghcr.io/pandajiujiu/literouter:latest
     container_name: literouter
     ports:
-      - "${PORT:-3000}:3000"
+      - "${PORT:-12000}:12000"
     environment:
       # Required — see the warning below
       - LITEROUTER_DB=/app/data/literouter.db
@@ -66,7 +65,7 @@ services:
 mkdir -p data && docker compose up -d
 ```
 
-Visit `http://your-host:3000` — the system will walk you through creating the first admin account.
+Visit `http://your-host:12000` — the system will walk you through creating the first admin account.
 
 > **Warning: `LITEROUTER_DB` must be set explicitly when running the prebuilt image.**
 > Without it the backend defaults to `literouter.db`, which resolves to `/app/literouter.db`
@@ -125,7 +124,7 @@ docker compose build --build-arg REGISTRY=docker.io/library
 
 ### Changing the port
 
-The host port is determined by the `ports` mapping in your compose file, overridable via the `PORT` environment variable (the container always listens on 3000):
+The host port is determined by the `ports` mapping in your compose file, overridable via the `PORT` environment variable (the container always listens on 12000):
 
 ```bash
 PORT=8080 docker compose up -d      # access at http://your-host:8080
@@ -137,7 +136,7 @@ Note that `PORT` only affects the **host-side** port mapping; the in-container p
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | Listen port |
+| `PORT` | `12000` | Listen port |
 | `LITEROUTER_DB` | `literouter.db` | SQLite database path. **Set this to `/app/data/literouter.db`** when running the container — the default resolves to `/app/literouter.db`, outside the mounted volume |
 
 ## Usage
@@ -154,7 +153,7 @@ Note that `PORT` only affects the **host-side** port mapping; the in-container p
 ```python
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://your-host:3000/v1",
+    base_url="http://your-host:12000/v1",
     api_key="sk-xxxx",  # internal token
 )
 resp = client.chat.completions.create(model="gpt-4o", messages=[...])
