@@ -138,7 +138,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/PandaJiuJiu/literouter:${{ github.ref_name }}
-            ghcr.io/PandaJiuJiu/literouter:latest
+            ghcr.io/pandajiujiu/literouter:${{ github.ref_name }}
+            ghcr.io/pandajiujiu/literouter:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
