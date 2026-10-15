@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::time::Duration;
-use support::{Harness, wait_for_debug};
+use support::{wait_for_debug, Harness};
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
