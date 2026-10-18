@@ -44,6 +44,7 @@
           :value-key="metric"
           :label-key="chartLabelKey"
           :is-day="activeTab === 'day'"
+          :tz-offset="tzOffset"
           :metric-label="metricLabel"
         />
       </div>
@@ -71,7 +72,7 @@
       <el-tab-pane :label="t('usage.tab.day')" name="day">
         <el-table :data="by_day" stripe>
           <el-table-column :label="t('usage.col.date')" min-width="160">
-            <template #default="{ row }">{{ fmtDate(row.day) }}</template>
+            <template #default="{ row }">{{ fmtDate(row.day, tzOffset) }}</template>
           </el-table-column>
           <usage-token-columns />
         </el-table>
@@ -103,6 +104,11 @@ const by_token = ref([])
 const by_model = ref([])
 const by_channel = ref([])
 const by_day = ref([])
+// Seconds east of UTC for the backend's "today" boundary. The backend buckets
+// `by_day` at local midnight in its own timezone and returns this offset; the
+// client shifts the day keys by it so `fmtDate` (which renders in the same
+// fixed offset) shows the same calendar day the backend counted.
+const tzOffset = ref(0)
 
 // The bar chart mirrors whichever table is on screen. `key` is the label field
 // for the three categorical tabs; the day tab keys off its timestamp instead.
@@ -143,7 +149,12 @@ async function load() {
     // backend doesn't validate `name`, and such a row would be unusable here
     // regardless.
     by_channel.value = (data.by_channel || []).filter((r) => r.key)
-    by_day.value = data.by_day || []
+    // The backend buckets `by_day` at its own local midnight and returns the
+    // offset it used. Keep it around so the chart tooltip and the table's
+    // `fmtDate` render the same calendar day; without the shift a UTC bucket
+    // would display as the wrong date for non-UTC deployments.
+    tzOffset.value = data.tz_offset_secs || 0
+    by_day.value = (data.by_day || []).map((r) => ({ ...r, day: r.day + tzOffset.value }))
   } finally {
     loading.value = false
   }

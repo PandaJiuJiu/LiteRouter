@@ -42,10 +42,11 @@ describe('fmtCompact', () => {
 })
 
 describe('fmtDate', () => {
-  // Built from local-midnight `Date` constructors rather than hardcoded unix
-  // constants: fmtDate reads local getters, so a literal that looks like
-  // "2024-01-05 UTC" is 2024-01-04 (or 01-06) in some CI timezones.
-  const at = (y, m, d) => Math.floor(new Date(y, m - 1, d).getTime() / 1000)
+  // Build timestamps from `Date.UTC` so the tests are deterministic in any
+  // CI timezone: `fmtDate` reads UTC getters (the timestamp is interpreted
+  // as a UTC-day boundary), so a literal that looks like "2024-01-05 UTC"
+  // must stay that way regardless of the machine's local time.
+  const at = (y, m, d) => Math.floor(Date.UTC(y, m - 1, d) / 1000)
 
   it('formats a start-of-day unix timestamp as YYYY-MM-DD', () => {
     expect(fmtDate(at(2023, 11, 14))).toBe('2023-11-14')
@@ -57,6 +58,17 @@ describe('fmtDate', () => {
 
   it('returns empty for a missing day', () => {
     for (const v of [0, null, undefined]) expect(fmtDate(v)).toBe('')
+  })
+
+  it('shifts by a timezone offset before reading the date parts', () => {
+    // A UTC-day boundary at 2024-01-05 00:00 UTC is 2024-01-05 08:00 in
+    // Asia/Shanghai — the local calendar day is still the 5th.
+    expect(fmtDate(at(2024, 1, 5), 8 * 3600)).toBe('2024-01-05')
+    // But the same instant is 2024-01-04 16:00 in UTC-8, i.e. the 4th.
+    expect(fmtDate(at(2024, 1, 5), -8 * 3600)).toBe('2024-01-04')
+    // Offset is applied, then date parts are read in UTC: a timestamp that
+    // is the 5th in UTC becomes the 6th when shifted east past midnight.
+    expect(fmtDate(at(2024, 1, 5), 24 * 3600)).toBe('2024-01-06')
   })
 
   it('agrees with the YYYY-MM-DD the backend already stores', () => {

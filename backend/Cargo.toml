@@ -31,6 +31,11 @@ bytes = "1"
 pbkdf2 = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Direct dependency for `localtime_r`/`tm_gmtoff` — already in the tree
+# transitively (tokio, sqlx, …); declaring it lets us read the process
+# timezone offset without pulling in chrono. The project deliberately does
+# calendar math by hand, and this is the smallest surface that works.
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

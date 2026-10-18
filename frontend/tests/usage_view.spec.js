@@ -15,7 +15,10 @@ const ROWS = {
   by_token: [{ key: 'sk-aaaa', requests: 3, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }],
   by_model: [{ key: 'gpt-4o', requests: 3, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }],
   by_channel: [{ key: 'ark', requests: 3, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }],
+  // `day` is a UTC-midnight bucket; `tz_offset_secs` (Asia/Shanghai in this
+  // suite) tells the view how far east of UTC the backend counts days.
   by_day: [{ key: '2026-10-01', day: 1_788_000_000, requests: 3, prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }],
+  tz_offset_secs: 8 * 3600,
 }
 
 async function mountUsage() {
@@ -138,5 +141,33 @@ describe('usage bar chart', () => {
     fetchUsage.mockResolvedValue({ by_token: [], by_model: [], by_channel: [], by_day: [] })
     const w = await mountUsage()
     expect(w.find('.empty').text()).toBe(zhCN.usage.chart.empty)
+  })
+
+  it('shifts the by_day keys by the backend timezone offset', async () => {
+    // The backend buckets at its own local midnight and returns the offset.
+    // The view shifts each `day` so `fmtDate` (which renders in that same
+    // fixed offset) shows the calendar day the backend counted.
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      by_day: [{ day: 1_788_000_000, requests: 3, prompt_tokens: 0, completion_tokens: 0, total_tokens: 3 }],
+      tz_offset_secs: 8 * 3600,
+    })
+    const w = await mountUsage()
+    expect(w.vm.tzOffset).toBe(8 * 3600)
+    expect(w.vm.by_day[0].day).toBe(1_788_000_000 + 8 * 3600)
+  })
+
+  it('renders the day column in the backend timezone', async () => {
+    // 2026-09-30 16:00 UTC == 2026-10-01 00:00 Asia/Shanghai. The backend
+    // counts it as October 1st; without the offset the browser (UTC in this
+    // suite) would render September 30th.
+    fetchUsage.mockResolvedValue({
+      ...ROWS,
+      by_day: [{ day: 1_790_784_000, requests: 3, prompt_tokens: 0, completion_tokens: 0, total_tokens: 3 }],
+      tz_offset_secs: 8 * 3600,
+    })
+    const w = await mountUsage()
+    const dayCells = w.findAll('.el-table__body-wrapper')[3].findAll('td')
+    expect(dayCells[0].text()).toBe('2026-10-01')
   })
 })

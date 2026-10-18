@@ -1284,8 +1284,16 @@ pub async fn usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let user = check_auth(&state, &headers)?;
+    // `range` counts **calendar days**, not a sliding hours window. Today is
+    // range=1 and starts at local midnight; range=7 is the 7 calendar days
+    // ending today (6 previous midnights + today). The offset is captured
+    // once per request so the boundary, the GROUP BY buckets and the client
+    // rendering all agree on the same timezone.
     let days = q.range.clamp(1, 90);
-    let since = crate::db::now() - days * 86400;
+    let now = crate::db::now();
+    let tz_offset = crate::db::utc_offset_at(now);
+    let today_midnight = crate::db::local_midnight_with_offset(now, tz_offset);
+    let since = today_midnight - (days - 1) * 86400;
     let allowed = token_names_for_user(&state.pool, user.id, user.is_admin).await;
 
     // A predicate that limits to the caller's tokens, or empty when admin.
@@ -1306,7 +1314,7 @@ pub async fn usage(
     };
     let user_binds = if user.is_admin { Vec::new() } else { allowed };
 
-    // by_day (GROUP BY day bucket)
+    // by_day (GROUP BY local-midnight bucket)
     //
     // Since 0015 a `logs` row is one client request, so `COUNT(*)` is the
     // request count the page always claimed to show. It used to over-count by
@@ -1314,8 +1322,16 @@ pub async fn usage(
     // the winning attempt carries usage, and a failed hop always had none.
     // The per-channel breakdown likewise now attributes tokens to the channel
     // that actually served the request rather than to every channel tried.
+    //
+    // Buckets are local-time midnights (`((created_at + offset)/86400)*86400
+    // - offset`), so the `day` keys line up with the `YYYY-MM-DD` the client
+    // renders from them — a UTC-day bucket would read as "today" starting at
+    // 08:00 in Asia/Shanghai and the chart labels would disagree with the
+    // table. The offset captured above is applied to every row; for the
+    // deployments this targets (no DST, or UTC containers) that is exact, and
+    // even where DST exists it only shifts the boundary-day label.
     let by_day_sql = format!(
-        "SELECT (created_at / 86400) * 86400 AS k,
+        "SELECT ((created_at + ?) / 86400) * 86400 - ? AS k,
                 COUNT(*) AS reqs,
                 SUM(prompt_tokens) AS p,
                 SUM(completion_tokens) AS c,
@@ -1328,7 +1344,7 @@ pub async fn usage(
     for n in &user_binds {
         day_query = day_query.bind(n);
     }
-    day_query = day_query.bind(since);
+    day_query = day_query.bind(tz_offset).bind(tz_offset).bind(since);
     let day_rows = day_query
         .fetch_all(&state.pool)
         .await
@@ -1427,6 +1443,11 @@ pub async fn usage(
 
     Ok(Json(json!({
         "range_days": days,
+        // Seconds east of UTC for the process timezone at the time of the
+        // request. The client shifts the `by_day[].day` keys by this so the
+        // chart labels match what `fmtDate` renders locally, and the same
+        // offset is what the backend used for the "today" boundary.
+        "tz_offset_secs": tz_offset,
         "totals": {
             "requests": totals.get::<i64, _>("reqs"),
             "prompt_tokens": totals.get::<i64, _>("p"),

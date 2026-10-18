@@ -56,6 +56,32 @@ pub fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// The UTC offset in effect at unix time `ts`, for the process timezone.
+/// Uses `localtime_r` so the answer follows `TZ` / `/etc/localtime` and DST
+/// transitions are picked up at the historical time, not just now.
+pub fn utc_offset_at(ts: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // `time_t` is 64-bit on both GNU and musl 1.2+; pass `i64` directly so we
+    // don't depend on the deprecated `libc::time_t` alias.
+    let ok = unsafe { libc::localtime_r(&ts, &mut tm) };
+    if ok.is_null() {
+        return 0; // Unknown local time — fall back to UTC rather than panic.
+    }
+    // tm_gmtoff is GNU/BSD; on musl it is also present. This is the seconds
+    // east of UTC, exactly what we need to shift a UTC-day bucket.
+    tm.tm_gmtoff
+}
+
+/// Local-midnight unix timestamp for `ts`, given an explicit UTC offset
+/// (seconds east of UTC). `2026-10-18 17:39 CST` with +28800 ->
+/// `2026-10-18 00:00 CST` (a unix second value). This is the "start of
+/// today" boundary for calendar-day statistics.
+pub fn local_midnight_with_offset(ts: i64, offset: i64) -> i64 {
+    // Shift into the local timeline, floor to the UTC-day boundary, shift back.
+    // `div_euclid` (not `/`) keeps negative timestamps (pre-1970) correct.
+    ((ts + offset).div_euclid(86_400)) * 86_400 - offset
+}
+
 /// SQLITE_CONSTRAINT_UNIQUE. Written out as a named constant because the
 /// numeric result code is easy to mistype and, when it is, the handler that
 /// depends on it silently degrades to a 500 instead of a 409 — there is no

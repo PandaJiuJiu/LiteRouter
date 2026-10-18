@@ -72,6 +72,10 @@ const props = defineProps({
   labelKey: { type: String, default: 'key' },
   /** Render the label as `YYYY-MM-DD` instead of the raw key. */
   isDay: { type: Boolean, default: false },
+  /** Seconds east of UTC used by the backend's `by_day` buckets. Passed to
+      `fmtDate` so the tooltip shows the same calendar day the backend
+      counted, even when its timezone differs from the browser's. */
+  tzOffset: { type: Number, default: 0 },
   /** Human label for the plotted metric, shown in the tooltip. */
   metricLabel: { type: String, default: '' },
 })
@@ -137,7 +141,9 @@ const barHeight = (row) => Math.max(0, plotBottom - yScale(valueOf(row)))
 // The tooltip names the hovered bar; the x-axis itself is unlabelled so a busy
 // dimension doesn't turn into a wall of overlapping rotated text.
 const labelText = (row) => {
-  const raw = props.isDay ? fmtDate(row?.day) : String(row?.[props.labelKey] ?? '')
+  const raw = props.isDay
+    ? fmtDate(row?.day, props.tzOffset)
+    : String(row?.[props.labelKey] ?? '')
   return raw.length > 18 ? `${raw.slice(0, 17)}…` : raw
 }
 

@@ -40,12 +40,19 @@ export function fmtCompact(n) {
  * locale and would disagree with the `YYYY-MM-DD` the backend already stores
  * in `by_day[].day`, so the same day would sort or read differently depending
  * on who is looking.
+ *
+ * `tzOffsetSecs` shifts the timestamp into a fixed timezone before reading
+ * the date parts (seconds east of UTC, e.g. 28800 for Asia/Shanghai). The
+ * usage endpoint buckets by local midnight and returns this offset alongside
+ * the day keys, so passing it here keeps the chart label on the same
+ * calendar day the backend counted.
  */
-export function fmtDate(unixDay) {
+export function fmtDate(unixDay, tzOffsetSecs = 0) {
   if (!unixDay) return ''
-  const d = new Date(unixDay * 1000)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
+  const shifted = unixDay * 1000 + (tzOffsetSecs || 0) * 1000
+  const d = new Date(shifted)
+  const y = d.getUTCFullYear()
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(d.getUTCDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
 }

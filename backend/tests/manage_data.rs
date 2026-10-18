@@ -919,6 +919,43 @@ async fn failed_requests_land_in_an_empty_channel_bucket() {
 }
 
 #[tokio::test]
+async fn today_range_starts_at_local_midnight() {
+    // "今日" (range=1) must start at the local calendar day's 00:00, not at
+    // `now - 86400`. The boundary follows the process timezone, so we derive
+    // it the same way the endpoint does instead of hardcoding an offset.
+    let h = Harness::with_admin().await;
+    let (admin, _) = two_users(&h).await;
+    let now = literouter::db::now();
+    let offset = literouter::db::utc_offset_at(now);
+    let today_midnight = literouter::db::local_midnight_with_offset(now, offset);
+
+    // 00:30 local today — inside the natural day, and also inside a naive
+    // rolling 24h window (it is later than `now - 86400`).
+    let early_today = today_midnight + 30 * 60;
+    // 23:30 local yesterday — outside the natural day, yet *inside* a naive
+    // rolling 24h window whenever `now` is past ~00:30 local. This is the
+    // row that distinguishes calendar-day semantics from a sliding window.
+    let late_yesterday = today_midnight - 30 * 60;
+
+    insert_log(h.pool(), "bob-token", early_today, 5).await;
+    insert_log(h.pool(), "bob-token", late_yesterday, 500).await;
+
+    let (_, body) =
+        support::call_json(&h.router, "GET", "/api/usage?range=1", None, Some(&admin)).await;
+    assert_eq!(body["range_days"], 1);
+    assert_eq!(
+        body["totals"]["total_tokens"], 5,
+        "yesterday's traffic must be excluded"
+    );
+    let by_day = body["by_day"].as_array().unwrap();
+    assert_eq!(by_day.len(), 1, "one local-day bucket for today");
+    assert_eq!(by_day[0]["day"], today_midnight);
+    assert_eq!(by_day[0]["total_tokens"], 5);
+    // The client needs the same offset to render those day keys.
+    assert_eq!(body["tz_offset_secs"], offset);
+}
+
+#[tokio::test]
 async fn the_usage_range_excludes_older_activity() {
     let h = Harness::with_admin().await;
     let (admin, _) = two_users(&h).await;
