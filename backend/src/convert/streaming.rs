@@ -333,11 +333,12 @@ impl OpenAiToAnthropicStream {
     /// rethinking rather than a different placeholder.
     ///
     /// Whether the reasoning reaches the client at all is upstream's choice,
-    /// not ours: `disable_upstream_thinking` already asks for none, and a
-    /// model that honours it never emits a fragment. This is the fallback for
-    /// the ones that don't — u2-flash's OpenAI endpoint being the case that
-    /// motivated it, where the reasoning still consumes the caller's whole
-    /// `max_tokens` and the reply would otherwise arrive as `content: null`.
+    /// not ours: the gateway forwards the client's request as it stands and
+    /// never asks an upstream to stop thinking, so a model that thinks
+    /// unconditionally emits a fragment whether we like it or not. This is the
+    /// fallback for that case — u2-flash's OpenAI endpoint being one, where
+    /// the reasoning still consumes the caller's whole `max_tokens` and the
+    /// reply would otherwise arrive as `content: null`.
     fn emit_reasoning(&mut self, reasoning: &str, out: &mut Vec<String>) {
         if reasoning.is_empty() {
             return;

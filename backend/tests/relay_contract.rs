@@ -1104,11 +1104,12 @@ async fn anthropic_ready(base_url: &str, model: &str) -> (Harness, String) {
 }
 
 #[tokio::test]
-async fn an_anthropic_upstream_is_told_not_to_think() {
-    // The whole reason this exists: Claude Code's auxiliary calls (its
-    // Bash-safety classifier among them) have to come back inside a tight
-    // `max_tokens`, and a model that thinks unconditionally spends that budget
-    // on reasoning and returns an empty message. See `disable_upstream_thinking`.
+async fn an_anthropic_upstream_gets_the_clients_body_unchanged() {
+    // The gateway forwards what the client sent. It used to inject
+    // `thinking: {"type": "disabled"}` here, which upstream providers that
+    // require thinking answer with a 400 — "requires adaptive thinking;
+    // thinking.type=disabled is not allowed". Nothing but `model` is ours to
+    // rewrite; the rest is the caller's.
     let server = MockServer::start().await;
     anthropic_upstream_ok(&server).await;
     let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
@@ -1117,11 +1118,15 @@ async fn an_anthropic_upstream_is_told_not_to_think() {
 
     let reqs = server.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
-    assert_eq!(sent["thinking"], json!({ "type": "disabled" }));
+    assert!(sent.get("thinking").is_none());
+    assert!(sent.get("enable_thinking").is_none());
 }
 
 #[tokio::test]
-async fn an_openai_upstream_is_told_not_to_think() {
+async fn an_openai_upstream_gets_no_thinking_flag() {
+    // `enable_thinking` is not part of the OpenAI schema. The gateway used to
+    // send it anyway, on the assumption that relays ignore unknown fields —
+    // an assumption not every upstream shares.
     let server = MockServer::start().await;
     upstream_ok(&server).await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
@@ -1130,13 +1135,15 @@ async fn an_openai_upstream_is_told_not_to_think() {
 
     let reqs = server.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
-    assert_eq!(sent["enable_thinking"], json!(false));
+    assert!(sent.get("enable_thinking").is_none());
+    assert!(sent.get("thinking").is_none());
 }
 
 #[tokio::test]
 async fn a_client_that_asked_for_thinking_keeps_it() {
     // Overriding an explicit request would silently change what the caller
-    // billed for and what it sees in the transcript.
+    // billed for and what it sees in the transcript. The gateway now never
+    // touches the field, so the client's own choice is what arrives.
     let server = MockServer::start().await;
     anthropic_upstream_ok(&server).await;
     let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
@@ -1156,9 +1163,10 @@ async fn a_client_that_asked_for_thinking_keeps_it() {
 }
 
 #[tokio::test]
-async fn the_flag_reaches_an_upstream_reached_by_conversion() {
-    // Protocol conversion rebuilds the body from scratch, so the flag has to
-    // be applied after the rebuild — not before it, or it is simply lost.
+async fn conversion_does_not_add_a_thinking_flag() {
+    // Protocol conversion rebuilds the body from scratch, so it is the point
+    // where a flag could sneak in unnoticed. It doesn't: the converted body
+    // carries only what the converter maps across.
     let server = MockServer::start().await;
     upstream_ok(&server).await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
@@ -1167,7 +1175,57 @@ async fn the_flag_reaches_an_upstream_reached_by_conversion() {
 
     let reqs = server.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
-    assert_eq!(sent["enable_thinking"], json!(false));
+    assert!(sent.get("enable_thinking").is_none());
+    assert!(sent.get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn a_passthrough_upstream_receives_no_field_the_client_did_not_send() {
+    // The whole contract in one assertion: on a channel that speaks the
+    // client's own protocol, the body that leaves the gateway is the body
+    // that came in, with `model` rewritten for the route. Every other
+    // top-level key the client sent is still there, and nothing was added.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    anthropic_chat(
+        &h,
+        &key,
+        "claude-x",
+        json!({
+            "system": "be brief",
+            "temperature": 0.2,
+            "metadata": { "user_id": "u-1" },
+        }),
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["model"], json!("claude-x"));
+    assert_eq!(sent["system"], json!("be brief"));
+    assert_eq!(sent["temperature"], json!(0.2));
+    assert_eq!(sent["metadata"], json!({ "user_id": "u-1" }));
+    // Nothing beyond what the client sent (plus the rewritten model).
+    let mut sent_keys: Vec<&str> = sent
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    sent_keys.sort();
+    assert_eq!(
+        sent_keys,
+        vec![
+            "max_tokens",
+            "messages",
+            "metadata",
+            "model",
+            "system",
+            "temperature"
+        ]
+    );
 }
 
 // ===================== client info =====================
