@@ -1354,7 +1354,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(winner.status)
             .bind(u.prompt)
             .bind(u.completion)
-            .bind(u.total)
+            .bind(u.total())
             .bind(&e.request_model)
             .bind(winner.latency_ms)
             .bind(e.streaming as i64)
@@ -1389,7 +1389,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(winner.status)
             .bind(u.prompt)
             .bind(u.completion)
-            .bind(u.total)
+            .bind(u.total())
             .bind(e.created_at)
             .bind(&e.request_model)
             .bind(winner.latency_ms)
@@ -1459,7 +1459,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         channel_name: winner.channel_name.clone(),
         status_code: winner.status,
         latency_ms: winner.latency_ms,
-        total_tokens: u.total,
+        total_tokens: u.total(),
         created_at: e.created_at,
         failed_count,
         client_ip: e.client_ip.clone(),

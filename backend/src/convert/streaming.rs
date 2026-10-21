@@ -13,19 +13,63 @@ use crate::db;
 pub struct Usage {
     pub prompt: i64,
     pub completion: i64,
-    pub total: i64,
     /// Anthropic: prompt tokens served from the prompt cache (billed cheap).
     pub cache_read: i64,
     /// Anthropic: prompt tokens written into the cache (billed a premium).
     pub cache_creation: i64,
     /// OpenAI: reasoning tokens, a subset of `completion`.
     pub reasoning: i64,
+    /// The upstream reported its own `total_tokens`, so the total is that
+    /// number and not something we summed.
+    ///
+    /// It matters because the two protocols count the same thing
+    /// differently, and the difference is not visible in the field names.
+    /// OpenAI's `prompt_tokens` already includes the tokens served from
+    /// cache; Anthropic's `input_tokens` is the *uncached remainder* only,
+    /// and the cache counters sit beside it. So an Anthropic-shaped total
+    /// has to add the cache in, while an OpenAI-shaped one must not —
+    /// adding it there would count the cached tokens twice.
+    ///
+    /// Anthropic has no `total_tokens` field at all, so the presence of one
+    /// is what tells the two apart. Every upstream in the wild reports
+    /// exactly one of the two shapes; none mixes them.
+    pub total_is_authoritative: bool,
+    /// The upstream's own `total_tokens`, kept so it can win over our own
+    /// arithmetic. Only meaningful when `total_is_authoritative`.
+    pub reported_total: i64,
 }
 
 impl Usage {
     /// True when nothing billable was reported.
     pub fn is_empty(&self) -> bool {
         self.prompt == 0 && self.completion == 0
+    }
+
+    /// How many tokens this request actually had the upstream handle.
+    ///
+    /// The two protocols count the prompt differently, and the difference
+    /// is invisible in the field names: OpenAI's `prompt_tokens` is the
+    /// whole prompt, cache hits included, while Anthropic's `input_tokens`
+    /// is only the part that missed the cache — the cache is in its own
+    /// counters. Anthropic has no `total_tokens` field, so the total has
+    /// to be summed, and summing it without the cache would report a
+    /// request that read 522,249 tokens from the cache as having handled
+    /// 247.
+    ///
+    /// This is computed from the merged counters rather than per block,
+    /// because no single block has the whole picture: Anthropic splits its
+    /// usage across `message_start` (the input counts) and `message_delta`
+    /// (the output count), and either half alone would be a total missing
+    /// the other.
+    pub fn total(&self) -> i64 {
+        if self.total_is_authoritative {
+            // The upstream's own number, but never below the parts: an
+            // upstream reporting less than prompt + completion would
+            // under-bill.
+            self.reported_total.max(self.prompt + self.completion)
+        } else {
+            self.prompt + self.cache_read + self.cache_creation + self.completion
+        }
     }
 
     /// Fold a later usage report into this one, field by field.
@@ -43,10 +87,12 @@ impl Usage {
     pub fn merge(&mut self, other: Usage) {
         self.prompt = self.prompt.max(other.prompt);
         self.completion = self.completion.max(other.completion);
-        self.total = self.total.max(other.total);
         self.cache_read = self.cache_read.max(other.cache_read);
         self.cache_creation = self.cache_creation.max(other.cache_creation);
         self.reasoning = self.reasoning.max(other.reasoning);
+        // One authoritative report is enough to make the total trustworthy.
+        self.total_is_authoritative |= other.total_is_authoritative;
+        self.reported_total = self.reported_total.max(other.reported_total);
     }
 }
 
@@ -95,24 +141,31 @@ pub fn parse_usage_obj(u: &Value) -> Usage {
     let reasoning = usage_detail(u, "completion_tokens_details", &["reasoning_tokens"]).max(
         usage_detail(u, "output_tokens_details", &["thinking_tokens"]),
     );
-    // Trust the upstream's total when present, but never let it come out
-    // below the parts we summed ourselves.
-    let total = usage_field(u, &["total_tokens"]).max(prompt + completion);
+    let cache_read = usage_field(u, &["cache_read_input_tokens"]).max(usage_detail(
+        u,
+        "prompt_tokens_details",
+        &["cached_tokens"],
+    ));
+    let cache_creation = usage_field(u, &["cache_creation_input_tokens"]).max(usage_detail(
+        u,
+        "prompt_tokens_details",
+        &["cache_write_tokens"],
+    ));
+    // The upstream's own total, when it gave one. OpenAI reports it, and
+    // it already counts the cached tokens: its `prompt_tokens` is the whole
+    // prompt. Anthropic has no such field, and its `input_tokens` is only
+    // the part that missed the cache — so there the total is the sum of
+    // the parts, cache included. See `Usage::total`.
+    let reported_total = usage_field(u, &["total_tokens"]);
+    let total_is_authoritative = u.get("total_tokens").and_then(|t| t.as_i64()).is_some();
     Usage {
         prompt,
         completion,
-        total,
-        cache_read: usage_field(u, &["cache_read_input_tokens"]).max(usage_detail(
-            u,
-            "prompt_tokens_details",
-            &["cached_tokens"],
-        )),
-        cache_creation: usage_field(u, &["cache_creation_input_tokens"]).max(usage_detail(
-            u,
-            "prompt_tokens_details",
-            &["cache_write_tokens"],
-        )),
+        cache_read,
+        cache_creation,
         reasoning,
+        total_is_authoritative,
+        reported_total,
     }
 }
 
@@ -787,6 +840,20 @@ impl SseConverter for AnthropicToOpenAiStream {
                     if parsed.prompt > 0 {
                         self.usage.prompt = parsed.prompt;
                     }
+                    // The cache counters are taken from here rather than
+                    // from `message_start`: this block reports the cache
+                    // hits on their own, while `message_start` folds the
+                    // uncached remainder into the same number. MiniMax
+                    // does exactly that — its `message_start` reports
+                    // 522,382 cache hits for a request whose real cache
+                    // hits are 522,249, the difference being the 133
+                    // uncached input tokens.
+                    if parsed.cache_read > 0 {
+                        self.usage.cache_read = parsed.cache_read;
+                    }
+                    if parsed.cache_creation > 0 {
+                        self.usage.cache_creation = parsed.cache_creation;
+                    }
                 }
             }
             _ => {}
@@ -825,6 +892,25 @@ impl SseConverter for AnthropicToOpenAiStream {
             json!(reason),
         ));
         // final usage chunk (mirrors openai's include_usage stream tail)
+        //
+        // OpenAI counts the prompt as the whole thing, cache hits
+        // included; Anthropic counts `input_tokens` as the part that
+        // missed the cache. So the number the client gets is the Anthropic
+        // remainder plus the cache, and the cache itself goes to
+        // `prompt_tokens_details.cached_tokens` where OpenAI puts it.
+        let cached = self.usage.cache_read;
+        let prompt_total = self.usage.prompt + cached + self.usage.cache_creation;
+        let mut usage = json!({
+            "prompt_tokens": prompt_total,
+            "completion_tokens": self.usage.completion,
+            "total_tokens": self.usage.total().max(prompt_total + self.usage.completion)
+        });
+        if cached > 0 || self.usage.cache_creation > 0 {
+            usage["prompt_tokens_details"] = json!({
+                "cached_tokens": cached,
+                "cache_write_tokens": self.usage.cache_creation
+            });
+        }
         out.push(format!(
             "data: {}\n\n",
             json!({
@@ -833,11 +919,7 @@ impl SseConverter for AnthropicToOpenAiStream {
                 "created": self.created,
                 "model": self.model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": self.usage.prompt,
-                    "completion_tokens": self.usage.completion,
-                    "total_tokens": self.usage.total
-                }
+                "usage": usage
             })
         ));
         out.push("data: [DONE]\n\n".to_string());

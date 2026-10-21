@@ -617,19 +617,19 @@ fn malformed_error_bodies_fall_back_to_defaults() {
 fn usage_parses_the_openai_spelling() {
     let u =
         parse_usage_obj(&json!({"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}));
-    assert_eq!((u.prompt, u.completion, u.total), (10, 4, 14));
+    assert_eq!((u.prompt, u.completion, u.total()), (10, 4, 14));
 }
 
 #[test]
 fn usage_parses_the_anthropic_spelling() {
     let u = parse_usage_obj(&json!({"input_tokens": 10, "output_tokens": 4}));
-    assert_eq!((u.prompt, u.completion, u.total), (10, 4, 14));
+    assert_eq!((u.prompt, u.completion, u.total()), (10, 4, 14));
 }
 
 #[test]
 fn a_missing_total_is_recomputed_from_the_parts() {
     let u = parse_usage_obj(&json!({"prompt_tokens": 7, "completion_tokens": 3}));
-    assert_eq!(u.total, 10);
+    assert_eq!(u.total(), 10);
 }
 
 #[test]
@@ -638,7 +638,7 @@ fn an_upstream_total_below_the_parts_is_never_trusted() {
     // at face value, so the sum wins.
     let u =
         parse_usage_obj(&json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 2}));
-    assert_eq!(u.total, 10);
+    assert_eq!(u.total(), 10);
 }
 
 #[test]
@@ -648,7 +648,7 @@ fn reasoning_tokens_are_read_from_the_nested_details_object() {
     assert_eq!(u.reasoning, 6);
     // reasoning is a subset of completion, not an addition to it.
     assert_eq!(u.completion, 8);
-    assert_eq!(u.total, 18);
+    assert_eq!(u.total(), 18);
 }
 
 #[test]
@@ -669,6 +669,54 @@ fn openai_cache_counters_are_picked_up() {
                 "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 15}}));
     assert_eq!(u.cache_read, 40);
     assert_eq!(u.cache_creation, 15);
+}
+
+#[test]
+fn an_anthropic_total_counts_the_cached_tokens() {
+    // Anthropic's `input_tokens` is the part of the prompt that missed the
+    // cache — the cache is in its own counters. So the total has to add
+    // them, or a request that read 522,249 tokens from the cache is
+    // recorded as having handled 247.
+    //
+    // The numbers are the ones from a real call: 133 uncached input, 114
+    // output, 522,249 cache hits.
+    let u = parse_usage_obj(&json!({
+        "input_tokens": 133, "output_tokens": 114,
+        "cache_read_input_tokens": 522249, "cache_creation_input_tokens": 0
+    }));
+    assert_eq!(u.total(), 522_496);
+}
+
+#[test]
+fn an_anthropic_total_counts_the_cache_writes_too() {
+    let u = parse_usage_obj(&json!({
+        "input_tokens": 100, "output_tokens": 10,
+        "cache_read_input_tokens": 40, "cache_creation_input_tokens": 15
+    }));
+    assert_eq!(u.total(), 165);
+}
+
+#[test]
+fn an_openai_total_is_not_inflated_by_its_own_cache_count() {
+    // The other side of the same coin: OpenAI's `prompt_tokens` already
+    // includes the cached tokens, so adding the cache again would count
+    // them twice.
+    let u = parse_usage_obj(&json!({
+        "prompt_tokens": 141794, "completion_tokens": 1410, "total_tokens": 143204,
+        "prompt_tokens_details": {"cached_tokens": 141668}
+    }));
+    assert_eq!(u.total(), 143_204);
+}
+
+#[test]
+fn an_upstream_total_is_never_believed_below_the_parts() {
+    // The upstream's own total wins when it is at least the sum of the
+    // parts, and loses when it is smaller — an upstream under-reporting
+    // its own total would under-bill.
+    let u = parse_usage_obj(&json!({
+        "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 50
+    }));
+    assert_eq!(u.total(), 110);
 }
 
 #[test]

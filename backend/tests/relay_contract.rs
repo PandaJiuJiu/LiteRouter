@@ -1860,6 +1860,11 @@ async fn a_streamed_anthropic_response_records_its_reasoning_tokens() {
     let row = await_full_log_row(h.pool()).await;
     assert_eq!(row.get::<i64, _>("reasoning_tokens"), 359);
     assert_eq!(row.get::<i64, _>("cache_read_tokens"), 288776);
+    // The total counts what the request actually handled: the uncached
+    // input, the cache hits, and the output. Anthropic's `input_tokens` is
+    // only the uncached remainder, so a total that stopped there would
+    // report 1,084 for a request that processed 289,860 tokens.
+    assert_eq!(row.get::<i64, _>("total_tokens"), 289_860);
 }
 
 #[tokio::test]

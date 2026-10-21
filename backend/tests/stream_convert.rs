@@ -688,6 +688,69 @@ fn anthropic_cache_counters_survive_message_delta() {
 }
 
 #[test]
+fn an_anthropic_stream_totals_the_cached_tokens() {
+    // The whole point of the fix: Anthropic's `input_tokens` is the part
+    // that missed the cache, so the total has to add the cache in. Without
+    // it a request that read 522,249 tokens from the cache is recorded as
+    // having handled 247.
+    //
+    // The two blocks are the ones a real upstream sends: `message_start`
+    // folds the uncached remainder into the cache count (522,382), and
+    // `message_delta` reports the two properly (133 uncached, 522,249
+    // cached). The total comes from the latter.
+    let mut c = AnthropicToOpenAiStream::new("m");
+    c.on_data(
+        &json!({"type":"message_start","message":{"id":"msg_1","usage":{
+        "input_tokens":0,"output_tokens":0,
+        "cache_read_input_tokens":522382,"cache_creation_input_tokens":0}}})
+        .to_string(),
+    );
+    c.on_data(
+        &json!({"type":"message_delta","usage":{
+        "input_tokens":133,"output_tokens":114,"cache_read_input_tokens":522249}})
+        .to_string(),
+    );
+    let u = c.usage().unwrap();
+    assert_eq!(u.cache_read, 522_249);
+    assert_eq!(u.total(), 522_496);
+}
+
+#[test]
+fn the_client_facing_usage_counts_the_cached_tokens_too() {
+    // The same correction on the way out: an OpenAI client expects
+    // `prompt_tokens` to be the whole prompt, with the cached part in
+    // `prompt_tokens_details.cached_tokens`. Anthropic's `input_tokens` is
+    // only the uncached remainder, so the two are added before they
+    // cross.
+    let mut c = AnthropicToOpenAiStream::new("m");
+    c.on_data(
+        &json!({"type":"message_start","message":{"id":"msg_1","usage":{
+        "input_tokens":133,"output_tokens":0,"cache_read_input_tokens":522249}}})
+        .to_string(),
+    );
+    c.on_data(
+        &json!({"type":"message_delta","usage":{"input_tokens":133,"output_tokens":114}})
+            .to_string(),
+    );
+    let events = c.finish();
+    // `finish()` ends with the `[DONE]` sentinel; the usage chunk is the
+    // one before it.
+    let tail = events
+        .iter()
+        .rev()
+        .find(|e| e.contains("chat.completion.chunk"))
+        .unwrap();
+    let payload: Value = serde_json::from_str(tail.trim_start_matches("data: ").trim()).unwrap();
+    assert_eq!(payload["usage"]["prompt_tokens"], 522_382);
+    assert_eq!(payload["usage"]["completion_tokens"], 114);
+    assert_eq!(payload["usage"]["total_tokens"], 522_496);
+    assert_eq!(
+        payload["usage"]["prompt_tokens_details"]["cached_tokens"],
+        522_249
+    );
+}
+
+#[test]
 fn a_tool_use_stream_emits_an_opening_chunk_then_argument_fragments() {
     let mut c = AnthropicToOpenAiStream::new("m");
     let mut events = c.on_data(
@@ -870,7 +933,7 @@ fn usage_from_sse_payload_handles_null_usage() {
     let u = result.expect("null usage must return Some(Usage), not None");
     assert_eq!(u.prompt, 0);
     assert_eq!(u.completion, 0);
-    assert_eq!(u.total, 0);
+    assert_eq!(u.total(), 0);
 }
 
 #[test]
