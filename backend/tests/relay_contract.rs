@@ -1263,10 +1263,40 @@ async fn a_client_that_asked_for_thinking_keeps_it() {
 }
 
 #[tokio::test]
-async fn conversion_does_not_add_a_thinking_flag() {
+async fn conversion_translates_the_clients_thinking_intent() {
     // Protocol conversion rebuilds the body from scratch, so it is the point
-    // where a flag could sneak in unnoticed. It doesn't: the converted body
-    // carries only what the converter maps across.
+    // where the client's thinking intent either survives or is lost. It
+    // survives: an Anthropic client that asked for thinking off gets the
+    // OpenAI spelling of that, and the upstream is told.
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    anthropic_chat(
+        &h,
+        &key,
+        "gpt-4o",
+        json!({ "thinking": { "type": "disabled" } }),
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    // `none` is the exact spelling of "off" and upstreams that require
+    // reasoning reject it with a 400, so the lowest level that still works
+    // is what crosses.
+    assert_eq!(sent["reasoning_effort"], json!("minimal"));
+    assert!(sent.get("enable_thinking").is_none());
+    assert!(sent.get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn conversion_does_not_add_a_thinking_flag() {
+    // The other half of the contract, and the one that matters most: a
+    // client that said nothing about thinking gets nothing added. The
+    // upstream's own default is the right answer for "unspecified" — the
+    // gateway picking a level on the client's behalf is the bug this
+    // replaced.
     let server = MockServer::start().await;
     upstream_ok(&server).await;
     let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
@@ -1275,6 +1305,7 @@ async fn conversion_does_not_add_a_thinking_flag() {
 
     let reqs = server.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(sent.get("reasoning_effort").is_none());
     assert!(sent.get("enable_thinking").is_none());
     assert!(sent.get("thinking").is_none());
 }

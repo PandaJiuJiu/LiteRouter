@@ -818,3 +818,105 @@ fn a_buffered_request_asks_for_no_stream_options() {
     let out = anthropic_req_to_openai(&v(r#"{"messages":[],"stream":false}"#), "gpt-4o");
     assert!(out.get("stream_options").is_none(), "{out}");
 }
+
+// ===================== thinking intent =====================
+
+#[test]
+fn the_effort_level_crosses_to_the_openai_spelling() {
+    // `output_config.effort` and `reasoning_effort` are the same scale, so
+    // the level passes through unchanged.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"output_config":{"effort":"high"}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("high"));
+}
+
+#[test]
+fn an_adaptive_thinking_request_becomes_the_middle_level() {
+    // "the model decides how much to think" has no exact level; the middle
+    // one is the honest reading of it.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"thinking":{"type":"adaptive"}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("medium"));
+}
+
+#[test]
+fn a_budgeted_thinking_request_becomes_the_middle_level() {
+    // `budget_tokens` is a token count and a level is not, so the count
+    // cannot be carried across.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"thinking":{"type":"enabled","budget_tokens":1024}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("medium"));
+}
+
+#[test]
+fn a_thinking_disabled_request_becomes_the_lowest_level() {
+    // Not `none`: that is the exact spelling, and upstreams that require
+    // reasoning reject it with a 400 — the exact translation is the one
+    // that breaks the request.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"thinking":{"type":"disabled"}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("minimal"));
+}
+
+#[test]
+fn the_effort_level_wins_over_the_thinking_switch() {
+    // The level is the precise control; the switch only says on or off.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("low"));
+}
+
+#[test]
+fn a_request_that_said_nothing_gets_no_level() {
+    // The upstream's own default is the right answer for "unspecified".
+    let out = anthropic_req_to_openai(&v(r#"{"messages":[]}"#), "gpt-4o");
+    assert!(out.get("reasoning_effort").is_none(), "{out}");
+}
+
+#[test]
+fn an_unknown_effort_level_is_not_forwarded() {
+    // A level the upstream doesn't know is a 400 ("Invalid option"), and the
+    // gateway would be the one that introduced it.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"output_config":{"effort":"turbo"}}"#),
+        "gpt-4o",
+    );
+    assert!(out.get("reasoning_effort").is_none(), "{out}");
+
+    // An unknown level with a usable switch behind it still uses the switch.
+    let out = anthropic_req_to_openai(
+        &v(r#"{"messages":[],"output_config":{"effort":"turbo"},"thinking":{"type":"disabled"}}"#),
+        "gpt-4o",
+    );
+    assert_eq!(out["reasoning_effort"], json!("minimal"));
+}
+
+#[test]
+fn the_openai_effort_level_crosses_back_to_anthropic() {
+    let out = openai_req_to_anthropic(
+        &v(r#"{"messages":[],"reasoning_effort":"xhigh"}"#),
+        "claude-x",
+    );
+    assert_eq!(out["output_config"]["effort"], json!("xhigh"));
+}
+
+#[test]
+fn enable_thinking_does_not_become_an_anthropic_thinking_block() {
+    // Its "off" spelling is `thinking: {type: "disabled"}`, and Anthropic
+    // upstreams reject that outright — "thinking.type `disabled` is not
+    // supported by this model" — so translating it would turn a working
+    // request into a failing one.
+    let out = openai_req_to_anthropic(&v(r#"{"messages":[],"enable_thinking":false}"#), "claude-x");
+    assert!(out.get("thinking").is_none(), "{out}");
+    assert!(out.get("output_config").is_none(), "{out}");
+}

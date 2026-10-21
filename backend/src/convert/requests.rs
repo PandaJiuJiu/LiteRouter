@@ -131,6 +131,78 @@ fn anthropic_messages_to_openai(messages: &Value, out: &mut Vec<Value>) {
     }
 }
 
+/// The effort levels both protocols agree on.
+///
+/// Anthropic's `output_config.effort` and OpenAI's `reasoning_effort` are
+/// the same scale with the same names, so a value from one is meaningful to
+/// the other. The set is closed on purpose: an unrecognised value is
+/// dropped rather than forwarded, because an upstream that doesn't know
+/// the level answers 400 ("Invalid option: expected one of ...") and the
+/// request dies on a field the gateway introduced.
+const EFFORT_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Anthropic's thinking configuration -> the OpenAI `reasoning_effort` level.
+///
+/// None means the client didn't say anything about thinking, and the
+/// gateway must not say something on its behalf: the upstream's own
+/// default is the right answer for "unspecified".
+///
+/// `output_config.effort` wins over `thinking` when both are present. The
+/// effort level is the precise control — Anthropic's own docs make it the
+/// recommended way to tune thinking depth — while `thinking` is only an
+/// on/off switch, and one that no longer carries a size on the models that
+/// matter: `budget_tokens` is deprecated on the 4.6+ generation, and
+/// `{type: "adaptive"}` means "the model decides", which no OpenAI level
+/// names exactly.
+///
+/// The switch maps onto the levels as:
+///
+/// | `thinking.type` | level | why not something closer |
+/// |---|---|---|
+/// | `adaptive` | `medium` | "the model decides" has no exact level |
+/// | `enabled` | `medium` | `budget_tokens` is a token count; a level is not |
+/// | `disabled` | `minimal` | `none` is the exact spelling, but upstreams that require reasoning reject it with a 400 |
+///
+/// That last row is the important one. `reasoning_effort: "none"` is what
+/// "disabled" really means, and MiniMax's endpoint answers it with
+/// "Reasoning is mandatory for this endpoint and cannot be disabled" —
+/// so the exact translation is the one that breaks the request, and the
+/// lowest level that still works is the honest approximation.
+fn thinking_to_reasoning_effort(req: &Value) -> Option<&'static str> {
+    if let Some(effort) = req
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(|e| e.as_str())
+    {
+        if let Some(level) = EFFORT_LEVELS.iter().find(|l| **l == effort) {
+            return Some(level);
+        }
+        // An unknown level is dropped, but the thinking switch below may
+        // still say something useful.
+    }
+    match req
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+    {
+        Some("adaptive") | Some("enabled") => Some("medium"),
+        Some("disabled") => Some("minimal"),
+        _ => None,
+    }
+}
+
+/// OpenAI's reasoning controls -> Anthropic's `output_config.effort`.
+///
+/// Only the effort level crosses. `enable_thinking` deliberately does not:
+/// its "off" spelling is `thinking: {type: "disabled"}`, and Anthropic
+/// upstreams reject that outright — "thinking.type `disabled` is not
+/// supported by this model" — so translating it would turn a request that
+/// works into one that fails.
+fn reasoning_effort_to_output_config(req: &Value) -> Option<&'static str> {
+    let effort = req.get("reasoning_effort").and_then(|e| e.as_str())?;
+    EFFORT_LEVELS.iter().find(|l| **l == effort).copied()
+}
+
 /// Anthropic Messages request -> OpenAI ChatCompletions request.
 pub fn anthropic_req_to_openai(req: &Value, model: &str) -> Value {
     let mut messages: Vec<Value> = Vec::new();
@@ -202,6 +274,13 @@ pub fn anthropic_req_to_openai(req: &Value, model: &str) -> Value {
                 _ => out["tool_choice"] = json!("auto"),
             }
         }
+    }
+    // The client's thinking intent, translated. A client that asked for a
+    // particular depth of thinking gets that depth upstream instead of
+    // the upstream's own default, and a client that said nothing gets
+    // nothing — the gateway doesn't pick a level on its behalf.
+    if let Some(effort) = thinking_to_reasoning_effort(req) {
+        out["reasoning_effort"] = json!(effort);
     }
     out
 }
@@ -362,6 +441,11 @@ pub fn openai_req_to_anthropic(req: &Value, model: &str) -> Value {
                 _ => out["tool_choice"] = json!({ "type": "auto" }),
             }
         }
+    }
+    // The effort level crosses; `enable_thinking` does not (see
+    // `reasoning_effort_to_output_config`).
+    if let Some(effort) = reasoning_effort_to_output_config(req) {
+        out["output_config"] = json!({ "effort": effort });
     }
     out
 }
