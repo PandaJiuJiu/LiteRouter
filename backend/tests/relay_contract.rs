@@ -2756,6 +2756,102 @@ async fn a_capture_is_truncated_and_marked_past_the_cap() {
 }
 
 #[tokio::test]
+async fn the_capture_records_the_headers_that_went_on_the_wire() {
+    // The capture used to write a hand-written list of the headers it
+    // expected to send. That is a guess, and it lied: it claimed an
+    // `anthropic-beta` was sent when the gateway dropped it. What lands in
+    // the file now is what actually went out.
+    let h = Harness::with_admin().await;
+    h.state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "claude-x", "max_tokens": 10, "messages": [] })),
+        Some(&token.key),
+        &[("anthropic-beta", "context-management-2025-06-27")],
+    )
+    .await;
+
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    support::wait_for_debug(h.pool(), id, std::time::Duration::from_secs(1)).await;
+    let dir = support::debug_log_dir(h.pool()).join(id.to_string());
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("req.meta.json")).unwrap()).unwrap();
+
+    assert_eq!(
+        meta["headers"]["anthropic-beta"],
+        "context-management-2025-06-27"
+    );
+    assert_eq!(meta["headers"]["anthropic-version"], "2023-06-01");
+    assert_eq!(meta["headers"]["content-type"], "application/json");
+}
+
+#[tokio::test]
+async fn the_capture_does_not_record_the_upstream_key() {
+    // The capture lands on disk under the data directory. The upstream key
+    // is the one thing in it that must not.
+    let h = Harness::with_admin().await;
+    h.state
+        .debug_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", "", &server.uri(), "claude-x", true).await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "claude-x", "max_tokens": 10, "messages": [] })),
+        Some(&token.key),
+        &[("anthropic-beta", "context-management-2025-06-27")],
+    )
+    .await;
+
+    support::wait_for_logs(h.pool(), 1, std::time::Duration::from_secs(1)).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM logs ORDER BY id DESC LIMIT 1")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    support::wait_for_debug(h.pool(), id, std::time::Duration::from_secs(1)).await;
+    let dir = support::debug_log_dir(h.pool()).join(id.to_string());
+    let raw = std::fs::read_to_string(dir.join("req.meta.json")).unwrap();
+
+    // The channel's key is what the relay authenticates with; it must not
+    // be readable in the capture.
+    let upstream_key: String = sqlx::query_scalar("SELECT api_key FROM channels WHERE name = 'ch'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    assert!(
+        !raw.contains(&upstream_key),
+        "the capture leaked the upstream key"
+    );
+    assert!(raw.contains("[REDACTED]"));
+}
+
+#[tokio::test]
 async fn a_streaming_request_rejects_a_json_200_and_fails_over() {
     // The streaming side of the same failure. We can't buffer a live SSE body
     // to check its shape, but a JSON content-type on a stream request means

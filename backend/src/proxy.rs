@@ -1628,6 +1628,62 @@ fn with_header_if_valid(
     }
 }
 
+/// The request side of a hop, as the debug capture records it.
+///
+/// The capture is written per hop, and the request half of it is the same
+/// three things every time: where the request went, what it carried, and
+/// which headers it went out with. Bundling them keeps the capture
+/// functions' argument lists short and makes it obvious that the recorded
+/// headers are the ones that actually went on the wire.
+struct CapturedRequest {
+    url: String,
+    body: Vec<u8>,
+    headers: Value,
+}
+
+impl CapturedRequest {
+    fn to_debug_request(&self) -> DebugRequest {
+        DebugRequest {
+            url: self.url.clone(),
+            method: "POST".to_string(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            body_truncated: false,
+            timestamp: crate::db::now(),
+        }
+    }
+}
+
+/// The request headers to record in a debug capture.
+///
+/// These are the headers that actually go on the wire, not a hand-written
+/// list of the ones we expect to send — a guess is how the capture came to
+/// claim an `anthropic-beta` was sent when the gateway dropped it, and how
+/// it kept claiming `anthropic-version` on a request that never carried it.
+///
+/// Credentials are redacted: the capture lands on disk under the data
+/// directory, readable by whoever can read the debug logs, and the upstream
+/// key is the one thing in there that must not be. The `authorization` and
+/// `x-api-key` headers are the two that carry it.
+fn capture_request_headers(headers: &reqwest::header::HeaderMap) -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        let recorded = if lower == "authorization" || lower == "x-api-key" {
+            json!("[REDACTED]")
+        } else {
+            match value.to_str() {
+                Ok(v) => json!(v),
+                // A header value that isn't valid UTF-8 can't be rendered;
+                // recording its length is more useful than dropping it.
+                Err(_) => json!(format!("<{} bytes>", value.as_bytes().len())),
+            }
+        };
+        out.insert(lower, recorded);
+    }
+    Value::Object(out)
+}
+
 /// Outcome of one upstream attempt, classified into four buckets so the
 /// caller can dispatch without re-checking status codes. The relay never
 /// returns a failure to the client — every `Http` / `InvalidBody` /
@@ -1765,7 +1821,23 @@ async fn try_upstream(
     )
     .body(body.clone());
 
-    match req.send().await {
+    // Build the request rather than letting `send()` do it, so the headers
+    // that actually go on the wire can be recorded. `RequestBuilder::send()`
+    // is `build()` + `Client::execute_request()`, so this is the same path —
+    // it just lets the capture see the real header set instead of a
+    // hand-written guess at it. A hand-written guess is how the capture came
+    // to claim an `anthropic-beta` was sent when the gateway dropped it.
+    let request = match req.build() {
+        Ok(r) => r,
+        Err(e) => return UpstreamOutcome::Transport(describe_transport_error(&e)),
+    };
+    let captured = CapturedRequest {
+        url: url.clone(),
+        body: body.clone(),
+        headers: capture_request_headers(request.headers()),
+    };
+
+    match client.execute(request).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
@@ -1774,23 +1846,14 @@ async fn try_upstream(
                 // they return.
                 let refs = UpstreamRefs::from_headers(resp.headers());
                 if is_streaming {
-                    return upstream_2xx_streaming_peek(
-                        resp,
-                        status,
-                        upstream_protocol,
-                        &url,
-                        &body,
-                        start_time,
-                        refs,
-                    )
-                    .await;
+                    return upstream_2xx_streaming_peek(resp, status, captured, start_time, refs)
+                        .await;
                 }
                 return upstream_2xx_buffered(
                     resp,
                     status,
                     upstream_protocol,
-                    &url,
-                    &body,
+                    captured,
                     start_time,
                     refs,
                 )
@@ -1843,9 +1906,7 @@ async fn try_upstream(
 async fn upstream_2xx_streaming_peek(
     mut resp: reqwest::Response,
     status: u16,
-    upstream_protocol: &str,
-    url: &str,
-    request_body: &[u8],
+    request: CapturedRequest,
     start_time: tokio::time::Instant,
     refs: UpstreamRefs,
 ) -> UpstreamOutcome {
@@ -1870,20 +1931,7 @@ async fn upstream_2xx_streaming_peek(
     let capture = DebugCapture::new();
 
     // Set up request info
-    let mut req_headers = serde_json::Map::new();
-    req_headers.insert("content-type".to_string(), json!("application/json"));
-    req_headers.insert("authorization".to_string(), json!("[REDACTED]"));
-    if upstream_protocol == "anthropic" {
-        req_headers.insert("anthropic-version".to_string(), json!("2023-06-01"));
-    }
-    capture.set_request(DebugRequest {
-        url: url.to_string(),
-        method: "POST".to_string(),
-        headers: json!(req_headers),
-        body: request_body.to_vec(),
-        body_truncated: false,
-        timestamp: crate::db::now(),
-    });
+    capture.set_request(request.to_debug_request());
 
     // Set up response info
     let latency_ms = start_time.elapsed().as_millis() as i64;
@@ -1957,8 +2005,7 @@ async fn upstream_2xx_buffered(
     resp: reqwest::Response,
     status: u16,
     upstream_protocol: &str,
-    url: &str,
-    request_body: &[u8],
+    request: CapturedRequest,
     start_time: tokio::time::Instant,
     refs: UpstreamRefs,
 ) -> UpstreamOutcome {
@@ -1967,20 +2014,7 @@ async fn upstream_2xx_buffered(
     let latency_ms = start_time.elapsed().as_millis() as i64;
 
     // Set up request info
-    let mut req_headers = serde_json::Map::new();
-    req_headers.insert("content-type".to_string(), json!("application/json"));
-    req_headers.insert("authorization".to_string(), json!("[REDACTED]"));
-    if upstream_protocol == "anthropic" {
-        req_headers.insert("anthropic-version".to_string(), json!("2023-06-01"));
-    }
-    capture.set_request(DebugRequest {
-        url: url.to_string(),
-        method: "POST".to_string(),
-        headers: json!(req_headers),
-        body: request_body.to_vec(),
-        body_truncated: false,
-        timestamp: crate::db::now(),
-    });
+    capture.set_request(request.to_debug_request());
 
     // Set up response info
     let mut resp_headers = serde_json::Map::new();
