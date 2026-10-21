@@ -131,15 +131,14 @@ fn anthropic_messages_to_openai(messages: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// The effort levels both protocols agree on.
-///
-/// Anthropic's `output_config.effort` and OpenAI's `reasoning_effort` are
-/// the same scale with the same names, so a value from one is meaningful to
-/// the other. The set is closed on purpose: an unrecognised value is
-/// dropped rather than forwarded, because an upstream that doesn't know
-/// the level answers 400 ("Invalid option: expected one of ...") and the
-/// request dies on a field the gateway introduced.
+/// The effort levels OpenAI's `reasoning_effort` accepts.
 const EFFORT_LEVELS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The effort levels Anthropic's `output_config.effort` accepts.
+///
+/// A subset of [`EFFORT_LEVELS`]: Anthropic has no `minimal`, its lowest
+/// level is `low`.
+const ANTHROPIC_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Anthropic's thinking configuration -> the OpenAI `reasoning_effort` level.
 ///
@@ -193,14 +192,40 @@ fn thinking_to_reasoning_effort(req: &Value) -> Option<&'static str> {
 
 /// OpenAI's reasoning controls -> Anthropic's `output_config.effort`.
 ///
-/// Only the effort level crosses. `enable_thinking` deliberately does not:
-/// its "off" spelling is `thinking: {type: "disabled"}`, and Anthropic
-/// upstreams reject that outright — "thinking.type `disabled` is not
-/// supported by this model" — so translating it would turn a request that
-/// works into one that fails.
+/// None means the client said nothing about thinking, and the gateway
+/// must not say something on its behalf.
+///
+/// `reasoning_effort` is the standard spelling and crosses as-is when
+/// Anthropic knows the level. It doesn't know `minimal` — its lowest is
+/// `low` — so that one steps down to it rather than being dropped: the
+/// client asked for the least thinking, and `low` is the least Anthropic
+/// can do.
+///
+/// `enable_thinking` is the vendor-private spelling, used by the Chinese
+/// relays (DeepSeek, Qwen and kin). Its "off" value has no exact
+/// Anthropic counterpart: `thinking: {type: "disabled"}` is the obvious
+/// one, and Anthropic upstreams reject it outright — "thinking.type
+/// `disabled` is not supported by this model" — so translating it that
+/// way would turn a request that works into one that fails. The lowest
+/// effort level is the honest approximation, and it is what Anthropic's
+/// own documentation recommends for "think less": drop `thinking`, lower
+/// `output_config.effort`.
 fn reasoning_effort_to_output_config(req: &Value) -> Option<&'static str> {
-    let effort = req.get("reasoning_effort").and_then(|e| e.as_str())?;
-    EFFORT_LEVELS.iter().find(|l| **l == effort).copied()
+    if let Some(effort) = req.get("reasoning_effort").and_then(|e| e.as_str()) {
+        return match effort {
+            // The level Anthropic has no name for steps down to its lowest.
+            "minimal" => Some("low"),
+            other => ANTHROPIC_EFFORT_LEVELS
+                .iter()
+                .find(|l| **l == other)
+                .copied(),
+        };
+    }
+    match req.get("enable_thinking") {
+        Some(Value::Bool(false)) => Some("low"),
+        Some(Value::Bool(true)) => Some("medium"),
+        _ => None,
+    }
 }
 
 /// Anthropic Messages request -> OpenAI ChatCompletions request.

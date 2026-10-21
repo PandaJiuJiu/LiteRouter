@@ -911,12 +911,40 @@ fn the_openai_effort_level_crosses_back_to_anthropic() {
 }
 
 #[test]
-fn enable_thinking_does_not_become_an_anthropic_thinking_block() {
+fn enable_thinking_off_becomes_the_lowest_effort() {
     // Its "off" spelling is `thinking: {type: "disabled"}`, and Anthropic
     // upstreams reject that outright — "thinking.type `disabled` is not
-    // supported by this model" — so translating it would turn a working
-    // request into a failing one.
+    // supported by this model" — so translating it that way would turn a
+    // working request into a failing one. The lowest effort level is the
+    // honest approximation, and it's what Anthropic's own documentation
+    // recommends for "think less": drop `thinking`, lower the effort.
     let out = openai_req_to_anthropic(&v(r#"{"messages":[],"enable_thinking":false}"#), "claude-x");
     assert!(out.get("thinking").is_none(), "{out}");
+    assert_eq!(out["output_config"]["effort"], json!("low"));
+}
+
+#[test]
+fn enable_thinking_on_becomes_the_middle_effort() {
+    let out = openai_req_to_anthropic(&v(r#"{"messages":[],"enable_thinking":true}"#), "claude-x");
+    assert!(out.get("thinking").is_none(), "{out}");
+    assert_eq!(out["output_config"]["effort"], json!("medium"));
+}
+
+#[test]
+fn a_minimal_effort_steps_down_to_the_level_anthropic_has() {
+    // Anthropic's scale starts at `low`; there is no `minimal` on it.
+    let out = openai_req_to_anthropic(
+        &v(r#"{"messages":[],"reasoning_effort":"minimal"}"#),
+        "claude-x",
+    );
+    assert_eq!(out["output_config"]["effort"], json!("low"));
+}
+
+#[test]
+fn an_unknown_effort_level_is_not_forwarded_to_anthropic() {
+    let out = openai_req_to_anthropic(
+        &v(r#"{"messages":[],"reasoning_effort":"turbo"}"#),
+        "claude-x",
+    );
     assert!(out.get("output_config").is_none(), "{out}");
 }

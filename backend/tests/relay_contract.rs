@@ -1311,6 +1311,71 @@ async fn conversion_does_not_add_a_thinking_flag() {
 }
 
 #[tokio::test]
+async fn an_openai_clients_effort_reaches_an_anthropic_upstream() {
+    // The other direction: an OpenAI client on a channel that only speaks
+    // Anthropic. The effort level is the same scale on both sides, so it
+    // crosses — and the upstream gets `output_config.effort`, which is
+    // where Anthropic expects it.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    // No OpenAI base URL: this channel speaks Anthropic only, so the
+    // OpenAI-shaped request has to be converted.
+    support::insert_channel(h.pool(), "ch", "", &server.uri(), "gpt-4o", true).await;
+
+    support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        })),
+        Some(&token.key),
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(sent["output_config"]["effort"], json!("high"));
+    assert!(sent.get("reasoning_effort").is_none(), "{sent}");
+}
+
+#[tokio::test]
+async fn an_openai_client_saying_nothing_gets_no_effort_from_an_anthropic_upstream() {
+    // Same contract as the other direction: silence stays silence.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let h = Harness::with_admin().await;
+    let admin_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username='admin'")
+        .fetch_one(h.pool())
+        .await
+        .unwrap();
+    let token = support::insert_token(h.pool(), "relay", admin_id).await;
+    support::insert_channel(h.pool(), "ch", "", &server.uri(), "gpt-4o", true).await;
+
+    support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": "gpt-4o", "messages": [] })),
+        Some(&token.key),
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(sent.get("output_config").is_none(), "{sent}");
+    assert!(sent.get("thinking").is_none(), "{sent}");
+}
+
+#[tokio::test]
 async fn a_passthrough_upstream_receives_no_field_the_client_did_not_send() {
     // The whole contract in one assertion: on a channel that speaks the
     // client's own protocol, the body that leaves the gateway is the body
