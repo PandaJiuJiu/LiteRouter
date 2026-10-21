@@ -274,24 +274,32 @@ export default {
     yes: '是',
     no: '否',
     field: {
+      // The label column is a fixed width shared by both tables on this
+      // page, so every label here has to fit on one line. Where the field
+      // has a name in the API, that name is the label — it is what an
+      // admin greps for in a log row, and it is shorter than a prose
+      // description. The description rides along as the hint next to the
+      // value instead.
       token: '令牌',
-      protocol: '客户端协议',
+      protocol: '协议',
       clientIp: '客户端 IP',
       time: '时间',
-      modelRoute: '请求模型 → 转发模型',
+      modelRoute: '模型',
       total: '合计',
-      input: '输入（prompt / input）',
-      output: '输出（completion / output）',
-      cacheRead: '缓存命中（cache_read）',
-      cacheWrite: '缓存写入（cache_creation）',
-      reasoning: '推理（reasoning）',
-      ttft: '首 Token 响应（TTFT）',
+      input: '输入',
+      output: '输出',
+      cacheRead: 'cache_read',
+      cacheWrite: 'cache_creation',
+      reasoning: 'reasoning',
+      ttft: 'TTFT',
       // 仅当客户端自己带了 x-request-id 时才出现。
-      clientRequestId: '客户端请求 ID（x-request-id）',
-      gatewayRequestId: '网关请求 ID（x-litrouter-request-id）',
+      clientRequestId: 'x-request-id',
+      gatewayRequestId: 'x-litrouter-request-id',
     },
-    cacheReadHint: '—— 按 ~0.1 倍计费',
-    cacheWriteHint: '—— 按 ~1.25 倍计费',
+    inputHint: '—— 输入（prompt / input）',
+    outputHint: '—— 输出（completion / output）',
+    cacheReadHint: '—— 缓存命中，按 ~0.1 倍计费',
+    cacheWriteHint: '—— 缓存写入，按 ~1.25 倍计费',
     reasoningHint: '—— 已含在输出中',
     ttftHint: '—— 首 token 响应时间',
     attemptTotal: '共 {n} 次尝试',

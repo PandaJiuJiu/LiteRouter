@@ -42,6 +42,9 @@
           <el-descriptions-item :label="t('logDetail.field.protocol')">{{ log.protocol || '—' }}</el-descriptions-item>
           <el-descriptions-item :label="t('logDetail.field.clientIp')">{{ log.client_ip || '—' }}</el-descriptions-item>
           <el-descriptions-item :label="t('logDetail.field.time')">{{ formatTime(log.created_at) }}</el-descriptions-item>
+          <!-- The value is the arrow, so the label only has to name the
+               field: "请求模型 → 转发模型" said the same thing twice and
+               was the one label too long to fit the column. -->
           <el-descriptions-item :label="t('logDetail.field.modelRoute')">
             {{ log.request_model || '—' }} → {{ log.upstream_model || log.request_model || '—' }}
           </el-descriptions-item>
@@ -130,8 +133,14 @@
         <h3>{{ t('logDetail.sectionTokens') }}</h3>
         <el-descriptions :column="1" border>
           <el-descriptions-item :label="t('logDetail.field.total')">{{ log.total_tokens.toLocaleString() }}</el-descriptions-item>
-          <el-descriptions-item :label="t('logDetail.field.input')">{{ log.prompt_tokens.toLocaleString() }}</el-descriptions-item>
-          <el-descriptions-item :label="t('logDetail.field.output')">{{ log.completion_tokens.toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.input')">
+            {{ log.prompt_tokens.toLocaleString() }}
+            <span class="hint">{{ t('logDetail.inputHint') }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item :label="t('logDetail.field.output')">
+            {{ log.completion_tokens.toLocaleString() }}
+            <span class="hint">{{ t('logDetail.outputHint') }}</span>
+          </el-descriptions-item>
           <el-descriptions-item v-if="log.cache_read_tokens > 0" :label="t('logDetail.field.cacheRead')">
             {{ log.cache_read_tokens.toLocaleString() }}
             <span class="hint">{{ t('logDetail.cacheReadHint') }}</span>
@@ -290,10 +299,16 @@ onUnmounted(() => {
 .mono.sub {
   color: #909399;
 }
-/* Fix the label column so the long "请求模型 → 转发模型" label doesn't
-   stretch it and leave a canyon of whitespace before each value. */
+/* The label column. Both tables on this page share one width, so their
+   values line up down the page — the width is fixed rather than fitted to
+   each table's longest label, which is what made the two tables disagree.
+   `nowrap` is the other half: Element Plus renders the label as an
+   inline-block span, and a label that wraps is a label that reads as two
+   things. The labels are short enough to fit (the longest is
+   "x-litrouter-request-id"), so nothing has to wrap. */
 :deep(.el-descriptions__label) {
-  width: 168px;
+  width: 148px;
+  white-space: nowrap;
 }
 .note {
   margin: 6px 0 0;

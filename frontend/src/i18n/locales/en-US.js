@@ -283,24 +283,32 @@ export default {
     yes: 'yes',
     no: 'no',
     field: {
+      // The label column is a fixed width shared by both tables on this
+      // page, so every label here has to fit on one line. Where the field
+      // has a name in the API, that name is the label — it is what an
+      // admin greps for in a log row, and it is shorter than a prose
+      // description. The description rides along as the hint next to the
+      // value instead.
       token: 'Token',
-      protocol: 'Client protocol',
+      protocol: 'Protocol',
       clientIp: 'Client IP',
       time: 'Time',
-      modelRoute: 'Requested model → forwarded model',
+      modelRoute: 'Model',
       total: 'Total',
-      input: 'Input (prompt / input)',
-      output: 'Output (completion / output)',
-      cacheRead: 'Cache read (cache_read)',
-      cacheWrite: 'Cache write (cache_creation)',
-      reasoning: 'Reasoning (reasoning)',
-      ttft: 'Time to First Token (TTFT)',
+      input: 'Input',
+      output: 'Output',
+      cacheRead: 'cache_read',
+      cacheWrite: 'cache_creation',
+      reasoning: 'reasoning',
+      ttft: 'TTFT',
       // Shown only when the client sent one.
-      clientRequestId: 'Client request-ID (x-request-id)',
-      gatewayRequestId: 'Gateway request-ID (x-litrouter-request-id)',
+      clientRequestId: 'x-request-id',
+      gatewayRequestId: 'x-litrouter-request-id',
     },
-    cacheReadHint: '— billed at ~0.1×',
-    cacheWriteHint: '— billed at ~1.25×',
+    inputHint: '— input (prompt / input)',
+    outputHint: '— output (completion / output)',
+    cacheReadHint: '— cache read, billed at ~0.1×',
+    cacheWriteHint: '— cache write, billed at ~1.25×',
     reasoningHint: '— already included in output',
     ttftHint: '— Time to First Token',
     attemptTotal: '{n} attempts',
