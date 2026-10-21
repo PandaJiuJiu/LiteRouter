@@ -26,6 +26,11 @@
         <div class="stat-label">{{ t('usage.stat.totalTokens') }}</div>
         <div class="stat-value">{{ fmtNum(totes.total_tokens) }}</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ t('usage.stat.cacheReadTokens') }}</div>
+        <div class="stat-value">{{ fmtNum(totes.cache_read_tokens) }}</div>
+        <div class="stat-hint">{{ (totes.cache_hit_rate ?? 0).toFixed(1) }}%</div>
+      </div>
     </div>
 
     <div class="chart-layout">
@@ -37,6 +42,7 @@
             <el-radio-button value="prompt_tokens">{{ t('usage.col.promptTokens') }}</el-radio-button>
             <el-radio-button value="completion_tokens">{{ t('usage.col.completionTokens') }}</el-radio-button>
             <el-radio-button value="total_tokens">{{ t('usage.col.totalTokens') }}</el-radio-button>
+            <el-radio-button value="cache_read_tokens">{{ t('usage.col.cacheReadTokens') }}</el-radio-button>
           </el-radio-group>
         </div>
         <usage-bar-chart
@@ -99,7 +105,7 @@ const activeTab = ref('token')
 // Which numeric column the chart plots. Defaults to total tokens (the headline
 // number); switching it re-renders the same rows against another field.
 const metric = ref('total_tokens')
-const totes = ref({ requests: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })
+const totes = ref({ requests: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cache_read_tokens: 0, cache_hit_rate: 0 })
 const by_token = ref([])
 const by_model = ref([])
 const by_channel = ref([])
@@ -129,6 +135,7 @@ const metricLabel = computed(
       prompt_tokens: t('usage.col.promptTokens'),
       completion_tokens: t('usage.col.completionTokens'),
       total_tokens: t('usage.col.totalTokens'),
+      cache_read_tokens: t('usage.col.cacheReadTokens'),
     })[metric.value] || '',
 )
 
@@ -192,6 +199,13 @@ onMounted(load)
   font-size: 22px;
   font-weight: 600;
   color: #303133;
+}
+/* The cache-hit rate under the cached-token count: the number that says
+   how much of the prompt was served from cache. */
+.stat-hint {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
 }
 .stat-card.highlight .stat-value {
   color: #409eff;

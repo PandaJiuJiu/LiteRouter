@@ -143,7 +143,7 @@
           </el-descriptions-item>
           <el-descriptions-item v-if="log.cache_read_tokens > 0" :label="t('logDetail.field.cacheRead')">
             {{ log.cache_read_tokens.toLocaleString() }}
-            <span class="hint">{{ t('logDetail.cacheReadHint') }}</span>
+            <span class="hint">{{ t('logDetail.cacheReadHint') }} {{ cacheHitRate }}%</span>
           </el-descriptions-item>
           <el-descriptions-item v-if="log.cache_creation_tokens > 0" :label="t('logDetail.field.cacheWrite')">
             {{ log.cache_creation_tokens.toLocaleString() }}
@@ -237,6 +237,15 @@ const anyUpstreamRefs = computed(() =>
     (a) => a.upstream_request_id || a.upstream_cf_ray || a.upstream_generation_id
   )
 )
+
+// The share of the prompt that came from the cache. `prompt_tokens` is the
+// whole prompt on every protocol, so the cached part over the whole is the
+// rate — and it says the same thing whichever upstream served the request.
+const cacheHitRate = computed(() => {
+  const prompt = log.value?.prompt_tokens ?? 0
+  if (prompt <= 0) return '0.0'
+  return (((log.value?.cache_read_tokens ?? 0) * 1000) / prompt).toFixed(0) / 10
+})
 
 function attemptRowClass({ row }) {
   return row.skipped ? 'is-skipped' : ''

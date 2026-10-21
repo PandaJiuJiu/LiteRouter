@@ -1335,7 +1335,8 @@ pub async fn usage(
                 COUNT(*) AS reqs,
                 SUM(prompt_tokens) AS p,
                 SUM(completion_tokens) AS c,
-                SUM(total_tokens) AS t
+                SUM(total_tokens) AS t,
+                SUM(cache_read_tokens) AS cr
          FROM logs{0}{1} created_at >= ? GROUP BY k ORDER BY k",
         clause,
         if clause.is_empty() { " WHERE" } else { " AND" }
@@ -1356,7 +1357,8 @@ pub async fn usage(
             "SELECT {0} AS k, COUNT(*) AS reqs,
                 SUM(prompt_tokens) AS p,
                 SUM(completion_tokens) AS c,
-                SUM(total_tokens) AS t
+                SUM(total_tokens) AS t,
+                SUM(cache_read_tokens) AS cr
              FROM logs{1}{2} created_at >= ? GROUP BY {0} ORDER BY t DESC",
             col,
             clause,
@@ -1398,7 +1400,8 @@ pub async fn usage(
     let totals_sql = format!(
         "SELECT COUNT(*) AS reqs, COALESCE(SUM(prompt_tokens),0) AS p,
                 COALESCE(SUM(completion_tokens),0) AS c,
-                COALESCE(SUM(total_tokens),0) AS t
+                COALESCE(SUM(total_tokens),0) AS t,
+                COALESCE(SUM(cache_read_tokens),0) AS cr
          FROM logs{0}{1} created_at >= ?",
         clause,
         if clause.is_empty() { " WHERE" } else { " AND" }
@@ -1413,15 +1416,34 @@ pub async fn usage(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    /// The share of the prompt that was served from the prompt cache.
+    ///
+    /// `prompt_tokens` is the whole prompt — cache hits included, on every
+    /// protocol — so the cached part over the whole is the rate, and it
+    /// means the same thing whichever upstream served the request.
+    ///
+    /// Returns a percentage with one decimal, or 0 when there was no
+    /// prompt at all: a ratio of nothing is nothing, not an error.
+    fn cache_hit_rate(cache_read: i64, prompt_total: i64) -> f64 {
+        if prompt_total <= 0 {
+            return 0.0;
+        }
+        (cache_read as f64 * 1000.0 / prompt_total as f64).round() / 10.0
+    }
+
     fn map_group(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Value> {
         rows.into_iter()
             .map(|r| {
+                let prompt = r.get::<i64, _>("p");
+                let cached = r.get::<i64, _>("cr");
                 json!({
                     "key": r.get::<String, _>("k"),
                     "requests": r.get::<i64, _>("reqs"),
-                    "prompt_tokens": r.get::<i64, _>("p"),
+                    "prompt_tokens": prompt,
                     "completion_tokens": r.get::<i64, _>("c"),
                     "total_tokens": r.get::<i64, _>("t"),
+                    "cache_read_tokens": cached,
+                    "cache_hit_rate": cache_hit_rate(cached, prompt),
                 })
             })
             .collect()
@@ -1431,16 +1453,22 @@ pub async fn usage(
     let by_day: Vec<Value> = day_rows
         .into_iter()
         .map(|r| {
+            let prompt = r.get::<i64, _>("p");
+            let cached = r.get::<i64, _>("cr");
             json!({
                 "day": r.get::<i64, _>("k"),
                 "requests": r.get::<i64, _>("reqs"),
-                "prompt_tokens": r.get::<i64, _>("p"),
+                "prompt_tokens": prompt,
                 "completion_tokens": r.get::<i64, _>("c"),
                 "total_tokens": r.get::<i64, _>("t"),
+                "cache_read_tokens": cached,
+                "cache_hit_rate": cache_hit_rate(cached, prompt),
             })
         })
         .collect();
 
+    let total_prompt = totals.get::<i64, _>("p");
+    let total_cached = totals.get::<i64, _>("cr");
     Ok(Json(json!({
         "range_days": days,
         // Seconds east of UTC for the process timezone at the time of the
@@ -1450,9 +1478,11 @@ pub async fn usage(
         "tz_offset_secs": tz_offset,
         "totals": {
             "requests": totals.get::<i64, _>("reqs"),
-            "prompt_tokens": totals.get::<i64, _>("p"),
+            "prompt_tokens": total_prompt,
             "completion_tokens": totals.get::<i64, _>("c"),
             "total_tokens": totals.get::<i64, _>("t"),
+            "cache_read_tokens": total_cached,
+            "cache_hit_rate": cache_hit_rate(total_cached, total_prompt),
         },
         "by_day": by_day,
         "by_token": map_group(token_rows),

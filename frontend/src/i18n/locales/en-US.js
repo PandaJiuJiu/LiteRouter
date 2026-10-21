@@ -218,7 +218,7 @@ export default {
   usage: {
     description: 'Token usage and request statistics',
     range: { today: 'Today', days7: '7 days', days30: '30 days' },
-    stat: { promptTokens: 'Prompt tokens', completionTokens: 'Completion tokens', totalTokens: 'Total tokens' },
+    stat: { promptTokens: 'Prompt tokens', completionTokens: 'Completion tokens', totalTokens: 'Total tokens', cacheReadTokens: 'Cache hit tokens' },
     totalRequests: 'Total requests',
     tab: { token: 'By token', model: 'By model', channel: 'By channel', day: 'By day' },
     col: {
@@ -229,6 +229,8 @@ export default {
       promptTokens: 'Prompt',
       completionTokens: 'Completion',
       totalTokens: 'Total',
+      cacheReadTokens: 'Cache hits',
+      cacheHitRate: 'Cache hit rate',
       date: 'Date',
     },
     chart: {

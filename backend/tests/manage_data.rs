@@ -987,6 +987,61 @@ async fn the_usage_range_is_clamped_to_a_sane_window() {
     }
 }
 
+#[tokio::test]
+async fn the_usage_report_carries_the_cache_hits_and_the_hit_rate() {
+    // The cached tokens are the part of the prompt that was billed at a
+    // fraction of the price, and the rate is what says how much of the
+    // prompt they were. `prompt_tokens` is the whole prompt on every
+    // protocol, so the rate means the same thing whichever upstream served
+    // the request.
+    let h = Harness::with_admin().await;
+    let (admin, _) = two_users(&h).await;
+    let now = literouter::db::now();
+    sqlx::query(
+        "INSERT INTO logs (token_name, model, request_model, channel_name, status_code,
+                           created_at, prompt_tokens, completion_tokens, total_tokens,
+                           cache_read_tokens, upstream_model)
+         VALUES (?,?,?,?,200,?,?,?,?,?,?)",
+    )
+    .bind("bob-token")
+    .bind("gpt-4o")
+    .bind("gpt-4o")
+    .bind("ch")
+    .bind(now)
+    .bind(1000)
+    .bind(100)
+    .bind(1100)
+    .bind(750)
+    .bind("gpt-4o")
+    .execute(h.pool())
+    .await
+    .expect("insert log");
+
+    let (_, body) = support::call_json(&h.router, "GET", "/api/usage", None, Some(&admin)).await;
+    assert_eq!(body["totals"]["cache_read_tokens"], 750);
+    assert_eq!(body["totals"]["cache_hit_rate"], 75.0);
+    // Every breakdown carries the same two numbers, not just the headline.
+    let by_token = &body["by_token"][0];
+    assert_eq!(by_token["cache_read_tokens"], 750);
+    assert_eq!(by_token["cache_hit_rate"], 75.0);
+    let by_day = &body["by_day"][0];
+    assert_eq!(by_day["cache_read_tokens"], 750);
+    assert_eq!(by_day["cache_hit_rate"], 75.0);
+}
+
+#[tokio::test]
+async fn the_usage_report_reports_no_hit_rate_for_an_empty_prompt() {
+    // A ratio of nothing is nothing, not an error — and not a division by
+    // zero either.
+    let h = Harness::with_admin().await;
+    let (admin, _) = two_users(&h).await;
+    insert_log(h.pool(), "bob-token", literouter::db::now(), 0).await;
+
+    let (_, body) = support::call_json(&h.router, "GET", "/api/usage", None, Some(&admin)).await;
+    assert_eq!(body["totals"]["cache_hit_rate"], 0.0);
+    assert_eq!(body["totals"]["cache_read_tokens"], 0);
+}
+
 // ===================== retention =====================
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 // =========================== responses (non-streaming) ===========================
 
+use super::streaming::parse_usage_obj;
 use super::{json, Value};
 use crate::db;
 
@@ -84,28 +85,11 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
         .and_then(|r| r.as_str())
         .map(finish_openai_to_anthropic)
         .unwrap_or("end_turn");
-    // OpenAI counts the prompt as the whole thing, cache hits included;
-    // Anthropic counts `input_tokens` as the part that missed the cache
-    // and puts the cache in its own counters. So the OpenAI prompt is
-    // split here rather than copied: the cached part becomes
-    // `cache_read_input_tokens`, and what is left is `input_tokens`.
-    let openai_prompt = body
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cached = body
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cache_creation = body
-        .get("usage")
-        .and_then(|u| u.get("prompt_tokens_details"))
-        .and_then(|d| d.get("cache_write_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    // The usage goes through the same parser the request side uses, so the
+    // protocol difference is handled in one place: OpenAI counts the
+    // prompt as the whole thing, Anthropic as the part that missed the
+    // cache, and the neutral shape says the same thing either way.
+    let usage = body.get("usage").map(parse_usage_obj).unwrap_or_default();
     json!({
         "id": msg_id(body.get("id").and_then(|i| i.as_str()).unwrap_or("unknown")),
         "type": "message",
@@ -115,10 +99,10 @@ pub fn openai_resp_to_anthropic(body: &Value, model: &str) -> Value {
         "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
         "usage": {
-            "input_tokens": (openai_prompt - cached).max(0),
-            "output_tokens": body.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_i64()).unwrap_or(0),
-            "cache_read_input_tokens": cached,
-            "cache_creation_input_tokens": cache_creation,
+            "input_tokens": usage.input_uncached(),
+            "output_tokens": usage.output_total,
+            "cache_read_input_tokens": usage.cache_read,
+            "cache_creation_input_tokens": usage.cache_creation,
         }
     })
 }
@@ -168,41 +152,20 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
     if !reasoning.is_empty() {
         message["reasoning_content"] = Value::String(reasoning);
     }
-    // Anthropic counts `input_tokens` as the part of the prompt that
-    // missed the cache, with the cache in its own counters; OpenAI counts
-    // the prompt as the whole thing. So the two are added here, and the
-    // cached part goes to `prompt_tokens_details.cached_tokens` where
-    // OpenAI keeps it.
-    let input = body
-        .get("usage")
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cached = body
-        .get("usage")
-        .and_then(|u| u.get("cache_read_input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let cache_creation = body
-        .get("usage")
-        .and_then(|u| u.get("cache_creation_input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let output = body
-        .get("usage")
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let prompt_total = input + cached + cache_creation;
-    let mut usage = json!({
-        "prompt_tokens": prompt_total,
-        "completion_tokens": output,
-        "total_tokens": prompt_total + output
+    // The usage goes through the same parser the request side uses, so the
+    // protocol difference is handled in one place: the neutral shape
+    // already has the whole prompt in `input_total` and the cache beside
+    // it, which is exactly how OpenAI wants it.
+    let usage = body.get("usage").map(parse_usage_obj).unwrap_or_default();
+    let mut usage_out = json!({
+        "prompt_tokens": usage.input_total,
+        "completion_tokens": usage.output_total,
+        "total_tokens": usage.total()
     });
-    if cached > 0 || cache_creation > 0 {
-        usage["prompt_tokens_details"] = json!({
-            "cached_tokens": cached,
-            "cache_write_tokens": cache_creation
+    if usage.cache_read > 0 || usage.cache_creation > 0 {
+        usage_out["prompt_tokens_details"] = json!({
+            "cached_tokens": usage.cache_read,
+            "cache_write_tokens": usage.cache_creation
         });
     }
     json!({
@@ -211,6 +174,6 @@ pub fn anthropic_resp_to_openai(body: &Value, model: &str) -> Value {
         "created": db::now(),
         "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(model),
         "choices": [{ "index": 0, "message": message, "finish_reason": stop_reason }],
-        "usage": usage
+        "usage": usage_out
     })
 }

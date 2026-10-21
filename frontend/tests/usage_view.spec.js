@@ -44,7 +44,7 @@ beforeEach(() => {
 })
 
 describe('usage tables', () => {
-  it('gives every table a leading column plus the four shared numeric ones', async () => {
+  it('gives every table a leading column plus the shared numeric ones', async () => {
     // The four tabs used to carry hand-copied copies of the numeric columns; a
     // label or width change meant four edits and three misses.
     const w = await mountUsage()
@@ -53,6 +53,8 @@ describe('usage tables', () => {
       zhCN.usage.col.promptTokens,
       zhCN.usage.col.completionTokens,
       zhCN.usage.col.totalTokens,
+      zhCN.usage.col.cacheReadTokens,
+      zhCN.usage.col.cacheHitRate,
     ]
     for (let n = 0; n < 4; n++) {
       expect(headers(w, n).slice(1)).toEqual(shared)

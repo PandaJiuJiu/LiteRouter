@@ -210,7 +210,7 @@ export default {
   usage: {
     description: 'Token 用量与请求统计',
     range: { today: '今日', days7: '7 天', days30: '30 天' },
-    stat: { promptTokens: '输入 tokens', completionTokens: '输出 tokens', totalTokens: '总 tokens' },
+    stat: { promptTokens: '输入 tokens', completionTokens: '输出 tokens', totalTokens: '总 tokens', cacheReadTokens: '缓存命中 tokens' },
     totalRequests: '总请求数',
     tab: { token: '按 Token', model: '按 Model', channel: '按 Channel', day: '按日' },
     col: {
@@ -221,6 +221,8 @@ export default {
       promptTokens: '输入',
       completionTokens: '输出',
       totalTokens: '合计',
+      cacheReadTokens: '缓存命中',
+      cacheHitRate: '缓存命中率',
       date: '日期',
     },
     chart: {

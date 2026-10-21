@@ -553,7 +553,7 @@ fn usage_in_a_final_chunk_is_captured_and_reported() {
         &json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}).to_string(),
     );
     let u = c.usage().expect("usage");
-    assert_eq!((u.prompt, u.completion), (11, 5));
+    assert_eq!((u.input_total, u.output_total), (11, 5));
     // ...and surfaces in the closing message_delta.
     let d = datas(&c.finish());
     let md = d.iter().find(|x| x["type"] == "message_delta").unwrap();
@@ -658,7 +658,7 @@ fn input_and_output_counts_arrive_in_two_places_and_are_merged() {
     );
     c.on_data(&json!({"type":"message_delta","delta":{},"usage":{"output_tokens":3}}).to_string());
     let u = c.usage().expect("usage");
-    assert_eq!((u.prompt, u.completion), (7, 3));
+    assert_eq!((u.input_total, u.output_total), (7, 3));
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn message_delta_output_count_does_not_zero_the_input_count() {
             .to_string(),
     );
     c.on_data(&json!({"type":"message_delta","usage":{"output_tokens":2}}).to_string());
-    assert_eq!(c.usage().unwrap().prompt, 9);
+    assert_eq!(c.usage().unwrap().input_total, 9);
 }
 
 #[test]
@@ -931,8 +931,8 @@ fn usage_from_sse_payload_handles_null_usage() {
     // and if all chunks carry null usage, the final log row shows 0 tokens.
     let result = usage_from_sse_payload(r#"{"id":"c1","choices":[],"usage":null}"#);
     let u = result.expect("null usage must return Some(Usage), not None");
-    assert_eq!(u.prompt, 0);
-    assert_eq!(u.completion, 0);
+    assert_eq!(u.input_total, 0);
+    assert_eq!(u.output_total, 0);
     assert_eq!(u.total(), 0);
 }
 
@@ -942,8 +942,8 @@ fn usage_from_sse_payload_handles_anthropic_null_usage() {
     let result =
         usage_from_sse_payload(r#"{"type":"message_delta","message":{"usage":null},"usage":null}"#);
     let u = result.expect("null usage in anthropic shape must return Some(Usage)");
-    assert_eq!(u.prompt, 0);
-    assert_eq!(u.completion, 0);
+    assert_eq!(u.input_total, 0);
+    assert_eq!(u.output_total, 0);
 }
 
 #[test]

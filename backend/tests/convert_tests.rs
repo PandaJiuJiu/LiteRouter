@@ -617,13 +617,13 @@ fn malformed_error_bodies_fall_back_to_defaults() {
 fn usage_parses_the_openai_spelling() {
     let u =
         parse_usage_obj(&json!({"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}));
-    assert_eq!((u.prompt, u.completion, u.total()), (10, 4, 14));
+    assert_eq!((u.input_total, u.output_total, u.total()), (10, 4, 14));
 }
 
 #[test]
 fn usage_parses_the_anthropic_spelling() {
     let u = parse_usage_obj(&json!({"input_tokens": 10, "output_tokens": 4}));
-    assert_eq!((u.prompt, u.completion, u.total()), (10, 4, 14));
+    assert_eq!((u.input_total, u.output_total, u.total()), (10, 4, 14));
 }
 
 #[test]
@@ -647,7 +647,7 @@ fn reasoning_tokens_are_read_from_the_nested_details_object() {
                 "completion_tokens_details": {"reasoning_tokens": 6}}));
     assert_eq!(u.reasoning, 6);
     // reasoning is a subset of completion, not an addition to it.
-    assert_eq!(u.completion, 8);
+    assert_eq!(u.output_total, 8);
     assert_eq!(u.total(), 18);
 }
 
@@ -726,7 +726,7 @@ fn anthropic_reasoning_tokens_are_picked_up() {
     let u = parse_usage_obj(&json!({"input_tokens": 100, "output_tokens": 10,
                 "output_tokens_details": {"thinking_tokens": 6}}));
     assert_eq!(u.reasoning, 6);
-    assert_eq!(u.completion, 10);
+    assert_eq!(u.output_total, 10);
 }
 
 #[test]
@@ -760,7 +760,7 @@ fn absent_usage_fields_read_zero_instead_of_panicking() {
 fn sse_usage_is_read_from_the_openai_shape() {
     let u =
         usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
-    assert_eq!((u.prompt, u.completion), (5, 2));
+    assert_eq!((u.input_total, u.output_total), (5, 2));
 }
 
 #[test]
@@ -770,7 +770,7 @@ fn sse_usage_is_read_from_message_start() {
         r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
     )
     .unwrap();
-    assert_eq!(u.prompt, 9);
+    assert_eq!(u.input_total, 9);
 }
 
 #[test]
@@ -778,7 +778,7 @@ fn sse_usage_is_read_from_message_delta() {
     // ...and reports the final output count at the top level.
     let u =
         usage_from_sse_payload(r#"{"type":"message_delta","usage":{"output_tokens":7}}"#).unwrap();
-    assert_eq!(u.completion, 7);
+    assert_eq!(u.output_total, 7);
 }
 
 #[test]
@@ -812,8 +812,8 @@ fn merging_keeps_the_prompt_count_the_final_delta_left_out() {
     let mut total = start;
     total.merge(delta);
 
-    assert_eq!(total.prompt, 9, "the input count survives the delta");
-    assert_eq!(total.completion, 7);
+    assert_eq!(total.input_total, 9, "the input count survives the delta");
+    assert_eq!(total.output_total, 7);
 }
 
 #[test]
@@ -831,8 +831,11 @@ fn merging_keeps_the_cache_counts_a_later_frame_does_not_repeat() {
     total.merge(delta);
 
     assert_eq!(total.cache_read, 110798);
-    assert_eq!(total.prompt, 1);
-    assert_eq!(total.completion, 707);
+    // The whole prompt: the uncached remainder plus the cache. The
+    // normalised shape is what makes this one number rather than two that
+    // have to be added up by hand.
+    assert_eq!(total.input_total, 110_799);
+    assert_eq!(total.output_total, 707);
 }
 
 #[test]
@@ -844,8 +847,8 @@ fn merging_takes_the_largest_count_rather_than_adding() {
     acc.merge(
         usage_from_sse_payload(r#"{"usage":{"prompt_tokens":5,"completion_tokens":9}}"#).unwrap(),
     );
-    assert_eq!(acc.prompt, 5);
-    assert_eq!(acc.completion, 9);
+    assert_eq!(acc.input_total, 5);
+    assert_eq!(acc.output_total, 9);
 }
 
 #[test]

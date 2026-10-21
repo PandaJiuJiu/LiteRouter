@@ -1352,8 +1352,8 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(&winner.upstream_model)
             .bind(&winner.channel_name)
             .bind(winner.status)
-            .bind(u.prompt)
-            .bind(u.completion)
+            .bind(u.input_total)
+            .bind(u.output_total)
             .bind(u.total())
             .bind(&e.request_model)
             .bind(winner.latency_ms)
@@ -1387,8 +1387,8 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(&winner.upstream_model)
             .bind(&winner.channel_name)
             .bind(winner.status)
-            .bind(u.prompt)
-            .bind(u.completion)
+            .bind(u.input_total)
+            .bind(u.output_total)
             .bind(u.total())
             .bind(e.created_at)
             .bind(&e.request_model)
@@ -4392,13 +4392,13 @@ mod tests {
     #[test]
     fn usage_is_read_from_a_buffered_openai_response() {
         let u = parse_usage(br#"{"usage":{"prompt_tokens":5,"completion_tokens":2}}"#).unwrap();
-        assert_eq!((u.prompt, u.completion), (5, 2));
+        assert_eq!((u.input_total, u.output_total), (5, 2));
     }
 
     #[test]
     fn usage_is_read_from_a_buffered_anthropic_response() {
         let u = parse_usage(br#"{"usage":{"input_tokens":5,"output_tokens":2}}"#).unwrap();
-        assert_eq!((u.prompt, u.completion), (5, 2));
+        assert_eq!((u.input_total, u.output_total), (5, 2));
     }
 
     #[test]
