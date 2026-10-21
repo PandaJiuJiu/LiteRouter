@@ -1077,6 +1077,106 @@ async fn the_anthropic_version_header_is_forwarded_to_the_upstream() {
     );
 }
 
+#[tokio::test]
+async fn the_beta_header_is_forwarded_to_an_anthropic_upstream() {
+    // `anthropic-beta` is not an identity header — it is the switch that
+    // turns a beta feature on. A feature is inert without it, so dropping
+    // it would silently downgrade the caller's request: the body would
+    // carry `context_management` while the upstream was never told to
+    // honour it.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "claude-x", "max_tokens": 10,
+            "context_management": { "edits": [{ "type": "clear_thinking_20251015" }] },
+            "messages": []
+        })),
+        Some(&key),
+        &[("anthropic-beta", "context-management-2025-06-27")],
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs[0].headers.get("anthropic-beta").unwrap(),
+        "context-management-2025-06-27"
+    );
+}
+
+#[tokio::test]
+async fn a_request_without_a_beta_header_sends_none() {
+    // The other half of the contract: no header in, no header out. A
+    // gateway that invented one would be asking the upstream for a feature
+    // the caller never requested.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    anthropic_chat(&h, &key, "claude-x", json!({})).await;
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(reqs[0].headers.get("anthropic-beta").is_none());
+}
+
+#[tokio::test]
+async fn the_beta_header_is_not_sent_to_an_openai_upstream() {
+    // An OpenAI-shaped upstream has no such switch. The header would be
+    // noise there, and the body's shape differs too — conversion rebuilt
+    // it, so the beta features the flag names are not in it either.
+    let server = MockServer::start().await;
+    upstream_ok(&server).await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "gpt-4o", "max_tokens": 10, "messages": [] })),
+        Some(&key),
+        &[("anthropic-beta", "context-management-2025-06-27")],
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(reqs[0].headers.get("anthropic-beta").is_none());
+}
+
+#[tokio::test]
+async fn several_beta_flags_cross_as_one_header() {
+    // The SDKs pass multiple beta features in a single comma-separated
+    // header value. It has to arrive whole — splitting it into several
+    // headers, or dropping all but the first, would change which features
+    // the upstream honours.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "claude-x", "max_tokens": 10, "messages": [] })),
+        Some(&key),
+        &[(
+            "anthropic-beta",
+            "context-management-2025-06-27,fast-mode-2026-02-01",
+        )],
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs[0].headers.get("anthropic-beta").unwrap(),
+        "context-management-2025-06-27,fast-mode-2026-02-01"
+    );
+}
+
 // ===================== upstream thinking =====================
 
 /// A channel speaking Anthropic natively, returning a minimal message.

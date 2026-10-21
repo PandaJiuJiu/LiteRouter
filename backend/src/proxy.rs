@@ -1559,12 +1559,19 @@ fn error_response(
 /// `upstream_protocol` is the protocol the upstream actually speaks (which
 /// may differ from the client's when converting).
 ///
-/// Note what is *not* here: the client's own headers (`anthropic-beta`,
-/// `user-agent`, SDK plumbing) are deliberately dropped. The only things that
-/// cross are the two correlation IDs in [`UpstreamHeaders`], which is what
-/// keeps the request shape upstream sees identical for the two concurrent
-/// sessions of one account — everything that could tell them apart stays on
-/// our side of the wire.
+/// The client's identity headers (`user-agent`, SDK plumbing) are dropped:
+/// the only things that cross are the two correlation IDs in
+/// [`UpstreamHeaders`], which is what keeps the request shape upstream sees
+/// identical for the two concurrent sessions of one account — everything that
+/// could tell them apart stays on our side of the wire.
+///
+/// `anthropic-beta` is the exception, and it is not an identity header: it
+/// is the switch that turns on beta features (`context-management`,
+/// `compact`, `fast-mode`, `server-side-fallback`, `thinking-display-updates`).
+/// A beta feature is inert without it, so dropping it would silently
+/// downgrade the caller's request to a plain one. It crosses only when the
+/// upstream speaks Anthropic — an OpenAI-shaped upstream has no such switch,
+/// and the header would be noise at best.
 fn build_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -1578,10 +1585,14 @@ fn build_request(
             .get("anthropic-version")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("2023-06-01");
-        client
+        let mut r = client
             .post(format!("{}/v1/messages", base_url))
             .header("x-api-key", api_key)
-            .header("anthropic-version", version)
+            .header("anthropic-version", version);
+        if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+            r = with_header_if_valid(r, "anthropic-beta", beta);
+        }
+        r
     } else {
         client
             .post(format!("{}/chat/completions", base_url))
