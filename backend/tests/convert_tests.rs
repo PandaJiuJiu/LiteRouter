@@ -660,6 +660,47 @@ fn anthropic_cache_counters_are_picked_up() {
 }
 
 #[test]
+fn openai_cache_counters_are_picked_up() {
+    // The OpenAI spelling of the same two numbers. A relay that only knew
+    // the Anthropic one reported zero cache hits for every OpenAI-shaped
+    // upstream — and cache hits are billed at a fraction of a fresh token,
+    // so the usage report was overstating the bill by a wide margin.
+    let u = parse_usage_obj(&json!({"prompt_tokens": 100, "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 15}}));
+    assert_eq!(u.cache_read, 40);
+    assert_eq!(u.cache_creation, 15);
+}
+
+#[test]
+fn anthropic_reasoning_tokens_are_picked_up() {
+    // Anthropic spells the reasoning count `thinking_tokens` and nests it
+    // under `output_tokens_details`, not `completion_tokens_details`.
+    let u = parse_usage_obj(&json!({"input_tokens": 100, "output_tokens": 10,
+                "output_tokens_details": {"thinking_tokens": 6}}));
+    assert_eq!(u.reasoning, 6);
+    assert_eq!(u.completion, 10);
+}
+
+#[test]
+fn a_provider_reporting_both_spellings_counts_each_number_once() {
+    // Anthropic reports the reasoning count in `output_tokens_details`, and
+    // some relays mirror it into `completion_tokens_details` too. The two
+    // are the same number, so the larger wins rather than the sum.
+    let u = parse_usage_obj(&json!({"input_tokens": 100, "output_tokens": 10,
+                "output_tokens_details": {"thinking_tokens": 6},
+                "completion_tokens_details": {"reasoning_tokens": 6}}));
+    assert_eq!(u.reasoning, 6);
+}
+
+#[test]
+fn a_provider_reporting_only_the_anthropic_cache_spelling_is_not_doubled() {
+    let u = parse_usage_obj(&json!({"input_tokens": 100, "output_tokens": 10,
+                "cache_read_input_tokens": 40,
+                "prompt_tokens_details": {"cached_tokens": 40}}));
+    assert_eq!(u.cache_read, 40);
+}
+
+#[test]
 fn absent_usage_fields_read_zero_instead_of_panicking() {
     let u = parse_usage_obj(&json!({}));
     assert!(u.is_empty());

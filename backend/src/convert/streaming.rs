@@ -58,17 +58,43 @@ fn usage_field(u: &Value, names: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
+/// Read a token count out of a nested `details` object, e.g.
+/// `prompt_tokens_details.cached_tokens`.
+///
+/// The nesting is where the two protocols disagree most: OpenAI puts the
+/// cache counts under `prompt_tokens_details` and the reasoning under
+/// `completion_tokens_details`, while Anthropic puts the cache counts at
+/// the top level and the reasoning under `output_tokens_details`.
+fn usage_detail(u: &Value, container: &str, names: &[&str]) -> i64 {
+    u.get(container).map(|d| usage_field(d, names)).unwrap_or(0)
+}
+
 /// Build a `Usage` from an upstream `usage` object, accepting both the
-/// OpenAI and Anthropic spellings for the shared fields.
+/// OpenAI and Anthropic spellings for every field.
+///
+/// The two protocols report the same three numbers under different names,
+/// and each spelling is authoritative for a different upstream:
+///
+/// | | OpenAI | Anthropic |
+/// |---|---|---|
+/// | cache read | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` |
+/// | cache write | `prompt_tokens_details.cache_write_tokens` | `cache_creation_input_tokens` |
+/// | reasoning | `completion_tokens_details.reasoning_tokens` | `output_tokens_details.thinking_tokens` |
+///
+/// Reading only one spelling of each loses the other protocol's numbers
+/// outright: a relay that knows `cache_read_input_tokens` but not
+/// `cached_tokens` reports zero cache hits for every OpenAI-shaped
+/// upstream, and one that knows `reasoning_tokens` but not `thinking_tokens`
+/// reports zero reasoning for every Anthropic-shaped one. Both spellings
+/// are read, and the larger wins — a provider that reports the same number
+/// under both spellings (Anthropic does, in its `output_tokens_details`)
+/// means it once, not twice.
 pub fn parse_usage_obj(u: &Value) -> Usage {
     let prompt = usage_field(u, &["prompt_tokens", "input_tokens"]);
     let completion = usage_field(u, &["completion_tokens", "output_tokens"]);
-    // OpenAI nests it under completion_tokens_details; Anthropic reports no
-    // equivalent on the response object.
-    let reasoning = u
-        .get("completion_tokens_details")
-        .map(|d| usage_field(d, &["reasoning_tokens"]))
-        .unwrap_or(0);
+    let reasoning = usage_detail(u, "completion_tokens_details", &["reasoning_tokens"]).max(
+        usage_detail(u, "output_tokens_details", &["thinking_tokens"]),
+    );
     // Trust the upstream's total when present, but never let it come out
     // below the parts we summed ourselves.
     let total = usage_field(u, &["total_tokens"]).max(prompt + completion);
@@ -76,8 +102,16 @@ pub fn parse_usage_obj(u: &Value) -> Usage {
         prompt,
         completion,
         total,
-        cache_read: usage_field(u, &["cache_read_input_tokens"]),
-        cache_creation: usage_field(u, &["cache_creation_input_tokens"]),
+        cache_read: usage_field(u, &["cache_read_input_tokens"]).max(usage_detail(
+            u,
+            "prompt_tokens_details",
+            &["cached_tokens"],
+        )),
+        cache_creation: usage_field(u, &["cache_creation_input_tokens"]).max(usage_detail(
+            u,
+            "prompt_tokens_details",
+            &["cache_write_tokens"],
+        )),
         reasoning,
     }
 }

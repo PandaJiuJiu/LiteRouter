@@ -1631,6 +1631,23 @@ async fn await_log_row(pool: &sqlx::SqlitePool) -> sqlx::sqlite::SqliteRow {
     panic!("no log row was written for the streamed request");
 }
 
+/// The settled log row, with every column — [`await_log_row`] only selects
+/// the three it needs.
+async fn await_full_log_row(pool: &sqlx::SqlitePool) -> sqlx::sqlite::SqliteRow {
+    for _ in 0..100 {
+        if let Ok(row) = sqlx::query("SELECT * FROM logs ORDER BY id DESC LIMIT 1")
+            .fetch_one(pool)
+            .await
+        {
+            if row.get::<i64, _>("status_code") > 0 {
+                return row;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no log row was written for the streamed request");
+}
+
 #[tokio::test]
 async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
     let server = MockServer::start().await;
@@ -1664,6 +1681,89 @@ async fn a_streamed_request_records_its_usage_from_the_stream_tail() {
     let row = await_log_row(h.pool()).await;
     assert_eq!(row.get::<i64, _>("stream"), 1);
     assert_eq!(row.get::<i64, _>("total_tokens"), 15);
+}
+
+#[tokio::test]
+async fn a_streamed_openai_response_records_its_cache_hits() {
+    // The OpenAI spelling of the cache counters. Every streamed request
+    // through an OpenAI-shaped upstream used to record zero cache hits,
+    // because only the Anthropic spelling was read — and cache hits are
+    // billed at a fraction of a fresh token, so the usage report was
+    // overstating the bill.
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":4,",
+        "\"prompt_tokens_details\":{\"cached_tokens\":81505,\"cache_write_tokens\":120}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = relay_ready(&server.uri(), "gpt-4o").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({ "model": "gpt-4o", "stream": true, "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    let row = await_full_log_row(h.pool()).await;
+    assert_eq!(row.get::<i64, _>("cache_read_tokens"), 81505);
+    assert_eq!(row.get::<i64, _>("cache_creation_tokens"), 120);
+}
+
+#[tokio::test]
+async fn a_streamed_anthropic_response_records_its_reasoning_tokens() {
+    // The Anthropic spelling of the reasoning count. Every streamed request
+    // through an Anthropic-shaped upstream used to record zero reasoning
+    // tokens, for the same reason.
+    let server = MockServer::start().await;
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-x\",\"usage\":{\"input_tokens\":447,\"output_tokens\":0,\"cache_read_input_tokens\":288776,\"cache_creation_input_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":447,\"output_tokens\":637,\"output_tokens_details\":{\"thinking_tokens\":359}}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    let resp = support::call(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "claude-x", "max_tokens": 64, "stream": true, "messages": [] })),
+        Some(&key),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+    let row = await_full_log_row(h.pool()).await;
+    assert_eq!(row.get::<i64, _>("reasoning_tokens"), 359);
+    assert_eq!(row.get::<i64, _>("cache_read_tokens"), 288776);
 }
 
 #[tokio::test]
