@@ -41,8 +41,9 @@ docker pull ghcr.io/pandajiujiu/literouter:latest
 
 The image is **public** — no login is required. The package page
 (<https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>)
-lists all published versions and doubles as the changelog entry point
-(see the [CHANGELOG](CHANGELOG.md) for per-version details).
+lists all published image tags. What changed in each version is on the
+[Releases page](https://github.com/PandaJiuJiu/LiteRouter/releases) — the
+release notes for a version end with the `docker pull` line for its tag.
 
 Then run it. Save this as `compose.yml` next to your data directory:
 

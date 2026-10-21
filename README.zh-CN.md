@@ -39,7 +39,7 @@
 docker pull ghcr.io/pandajiujiu/literouter:latest
 ```
 
-**镜像为公开**，无需登录即可拉取。包页面（<https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>）列出所有已发布版本，各版本的变更详情见 [CHANGELOG](CHANGELOG.md)。
+**镜像为公开**，无需登录即可拉取。包页面（<https://github.com/PandaJiuJiu/LiteRouter/pkgs/container/literouter>）列出所有已发布的镜像标签；每个版本改了什么见 [Releases 页面](https://github.com/PandaJiuJiu/LiteRouter/releases)——版本说明的末尾就是该版本标签的 `docker pull` 命令。
 
 然后运行。把下面内容存为 `compose.yml`，放在数据目录旁边：
 

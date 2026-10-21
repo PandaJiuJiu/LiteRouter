@@ -6,6 +6,34 @@
 
 ---
 
+## [0.0.19] - 2026-10-22
+
+自 v0.0.18 起共 10 个提交，聚焦用量统计的口径统一与客户端请求的如实转发。
+
+### 新增
+
+- **用量页新增缓存命中统计**：新增「缓存命中 tokens」与「缓存命中率」两列，四个用量维度（按 Token / 按 Model / 按 Channel / 按日）同步展示。缓存命中的 token 按折扣计价，一个从不提及缓存的用量报表无法回答"这单账单里有多少是缓存省下来的"，命中率则直接说明提示词缓存到底有没有生效
+- **协议间统一的 token 口径**：两个协议用不同的名字报同样的量，差异藏在字段名里——OpenAI 的 `prompt_tokens` 是整个 prompt（含缓存命中），Anthropic 的 `input_tokens` 只是**没命中缓存**的部分，缓存量在旁边单独的计数器里。网关过去原样存上游的值，同一列在不同协议下含义不同，聚合查询无法直接比较两条路径。现在解析层做翻译而非拷贝，下游统一用一套词汇；新增第三种协议只是解析器多一条分支
+
+### 修复
+
+- **缓存与推理 token 一律丢失其一**：解析器只认得每个计数器的一种拼写，两条路径各丢一半——走 OpenAI 形态上游的请求（12,718 次）全部记为零缓存命中，而上游明明在每次调用报告 25 万缓存 token；走 Anthropic 形态上游的请求（10,359 次）全部记为零推理 token。两种拼写现在都读，取较大值
+- **总 token 漏算缓存**：一次读取了 333,773 缓存 token 的请求被记为只消耗了 1,429。总 token 过去是 `prompt + completion`，而 Anthropic 的 `input_tokens` 只是未命中缓存的余量，缓存部分从未计入。这不只是个显示数字——日配额和用量聚合都按 `total_tokens` 求和，意味着一条走原生 Anthropic 渠道的请求只按实际消耗的 1/56 计数，配额实际上没有被执行
+- **不再向 Anthropic 上游注入 `thinking: disabled`**：网关过去无条件地要求所有上游"不要思考"。这个标记是为 Claude Code 的短辅助调用引入的（其推理会吃掉整个 `max_tokens` 预算并返回 `content: null`），但"中转站会忽略未知字段"的假设只在 OpenAI 方言成立——Anthropic 方言更严格，MiniMax-M3.1-Flash 要求 adaptive thinking，直接以 400 拒绝 `thinking.type=disabled`；火山引擎的原生 Anthropic 端点同样拒绝，修复前累计 10,901 次连续 400、零成功。这两个渠道此前"能用"只是因为故障转移掩盖了每一次失败。现在透传渠道只改写 `model`，其余请求体逐字节原样转发
+- **透传客户端的 `anthropic-beta` 请求头**：这个头是 beta 特性的开关（上下文管理、压缩、fast mode、服务端回退、思考展示更新），没有它 beta 特性就是哑的。丢弃它是在"隐藏客户端身份"时被顺带删掉的——但它不是身份头，关联 ID 已经足以让同一账号的并发会话无法区分。客户端带 `context_management` 字段时上游却从未被告知要遵守它。现在该头在上游说 Anthropic 时完整透传（多个 beta 标志可逗号分隔），OpenAI 形态的上游不发送
+- **协议转换时保留客户端的思考意图**：请求转换器从零重建请求体，只搬运认识的字段，Anthropic 的思考控制不在其中——客户端说明想要多深的思考，到达 OpenAI 上游时完全没有这个指示，上游只好用自己的默认值。这不是罕见情况：Claude Code 每次请求都带 `thinking` 和 `output_config.effort`。现在两个方向都跨协议携带该意图，客户端没说的则一个字段都不加（替客户端挑一个思考等级，和当初注入 `thinking: disabled` 是同一种错误，只是失败得更安静）
+- **用量页「今日」按本地零点计数**：此前用 `now - 86400`（滚动 24 小时窗口）且按 UTC 零点分组。现在从进程时区的本地零点开始，按日分组也按本地零点，响应带 `tz_offset_secs`，前端按后端计数所用的同一时区渲染日期
+- **调试捕获记录真正发上线的请求头**：捕获写的是一份手写的"预期发送"头清单（`content-type`、`authorization`，上游说 Anthropic 时再加 `anthropic-version`）——是猜的，而且两头都撒谎：声称发了实际被丢掉的 `anthropic-beta`，也声称发了实际没有的 `anthropic-version`。现在请求先构建再发出，头从构建好的请求上读取；凭据在写入时脱敏
+
+### 其他
+
+- **数据库迁移 `0038_normalize_prompt_tokens`**：把历史上 Anthropic 形态行的 `prompt_tokens` 换算成"输入总量"口径。原始数据都在库里，可精确重算，无需从别处回捞。判据是转换模式配合客户端协议——`none` 只表示"客户端协议 == 上游协议"，所以 OpenAI 客户端打 OpenAI 渠道也是 `none`，那一行不该加缓存
+- **日志详情页标签列不再折行**：两张表的首列宽度统一为固定 148px，标签改用 API 里的真实字段名（x-request-id、x-litrouter-request-id、cache_read、cache_creation、reasoning）——这正是管理员在日志行里会 grep 的名字。原先的说明文字移到数值旁的提示里，信息没有丢失
+- **发布流程固化为项目级 skill**：`.claude/skills/release/SKILL.md` 记录完整的发版流程（版本号同步、CHANGELOG 写法、门禁、tag 与镜像发布、Release 页创建），并写明版本号必须三处一致——本次发布同时终结了历史遗留的 tag 与产品版本号漂移（v0.0.18 实际装的是 0.0.16）
+- **本次起 tag 与产品版本号一致**：tag 即版本号（`v0.0.19` 装 `0.0.19`），设置页显示的版本与镜像标签从此对得上
+
+---
+
 ## [0.0.16] - 2026-10-15
 
 自 v0.0.10 起共 7 个提交，聚焦 CI 发布流水线与 GHCR 自动化。
@@ -327,6 +355,7 @@
 
 ---
 
+[0.0.19]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.19
 [0.0.16]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.16
 [0.0.10]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.10
 [0.0.5]: https://github.com/PandaJiuJiu/LiteRouter/releases/tag/v0.0.5
