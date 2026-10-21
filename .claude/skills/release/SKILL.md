@@ -277,3 +277,36 @@ docker stop literouter-smoke
   `--notes-file` does work.
 - **The repo has no CI on `main` being a gate** — CI runs on push and PR,
   but nothing blocks a merge. The local gate in step 1 is the real one.
+
+## The Release-page permission trap
+
+`gh release create` needs a token with **`contents: write`** on the repo. A
+fine-grained PAT scoped to the repo can read everything and still fail with:
+
+```
+HTTP 403: Resource not accessible by personal access token
+```
+
+The confusing part is that the same token pushes tags and branches fine —
+git push goes over SSH, which uses the SSH key, not the PAT. So the token's
+push permission is a red herring; the Release API is a separate grant.
+
+Check before assuming:
+
+```bash
+gh api -X GET user -i 2>&1 | grep -i "x-oauth-scopes"
+```
+
+A classic PAT shows `repo` (or `public_repo`) in that header. A fine-grained
+PAT shows **nothing** — no `X-OAuth-Scopes` header at all — and that absence
+is the tell that the grants are per-repository rather than per-scope.
+
+**If the Release can't be created, the release is not finished.** The image
+is already published and the tag exists, but the Releases page stays empty
+and the CHANGELOG's `/releases/tag/vX` link stays dead. Say so plainly and
+ask for a token with `contents: write` — do not report the release as
+complete, and do not strip the Release step from the skill to make it look
+like a normal path.
+
+The notes file is written to `/tmp/release-notes.md` before the CI wait, so
+it is ready the moment the image lands.
