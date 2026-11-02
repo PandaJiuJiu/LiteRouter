@@ -1179,6 +1179,68 @@ async fn several_beta_flags_cross_as_one_header() {
 
 // ===================== upstream thinking =====================
 
+#[tokio::test]
+async fn session_passthrough_forwarded_verbatim() {
+    // Each harness names its own per-conversation header, and the provider
+    // that requires one (OpenCode Go 400s with `missing_session_id`
+    // otherwise) recognizes the native names. The relay's job is to pass
+    // the client's own header through unchanged — no translation, no drop.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    support::call_with_headers(
+        &h.router,
+        "POST",
+        "/v1/messages",
+        Some(json!({ "model": "claude-x", "max_tokens": 10, "messages": [] })),
+        Some(&key),
+        &[
+            ("x-claude-code-session-id", "ses_cc_4711"),
+            ("x-opencode-session", "ses_oc_8242"),
+        ],
+    )
+    .await;
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs[0].headers.get("x-claude-code-session-id").unwrap(),
+        "ses_cc_4711"
+    );
+    assert_eq!(
+        reqs[0].headers.get("x-opencode-session").unwrap(),
+        "ses_oc_8242"
+    );
+}
+
+#[tokio::test]
+async fn a_session_header_that_the_client_never_sent_is_not_invented() {
+    // The other half of the contract. A gateway that mints a per-request ID
+    // would defeat the whole point — the upstream sees the same conversation
+    // as endless different ones and loses prompt-cache affinity. Silence on
+    // our wire is what reaches the upstream, gate and all.
+    let server = MockServer::start().await;
+    anthropic_upstream_ok(&server).await;
+    let (h, key) = anthropic_ready(&server.uri(), "claude-x").await;
+
+    anthropic_chat(&h, &key, "claude-x", json!({})).await;
+
+    let reqs = server.received_requests().await.unwrap();
+    for name in [
+        "x-opencode-session",
+        "x-claude-code-session-id",
+        "x-deepseek-harness-session-id",
+        "x-session-affinity",
+        "thread-id",
+        "session-id",
+    ] {
+        assert!(
+            reqs[0].headers.get(name).is_none(),
+            "invented a {name} the client never sent"
+        );
+    }
+}
+
 /// A channel speaking Anthropic natively, returning a minimal message.
 async fn anthropic_upstream_ok(server: &MockServer) {
     Mock::given(method("POST"))

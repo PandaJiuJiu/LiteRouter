@@ -115,6 +115,9 @@ pub async fn send(
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
+    if let Some((name, value)) = synthetic_session_header(url, model) {
+        req = req.header(name, value);
+    }
     let resp = match req.json(&probe_body(model)).send().await {
         Ok(r) => r,
         Err(e) if e.is_timeout() => return ProbeOutcome::Timeout(timeout),
@@ -128,5 +131,145 @@ pub async fn send(
             status,
             detail: crate::proxy::read_error_detail(resp).await,
         }
+    }
+}
+
+/// The synthetic session header a probe carries when the target expects one.
+///
+/// Real traffic identifies each conversation the way the client asked for
+/// it — the relay re-sends the client's own session header verbatim (see
+/// `proxy::SESSION_PASSTHROUGH_HEADERS`). A probe is not a conversation: it
+/// should never *invent* per-request IDs for a provider that meters
+/// sessions, and it should never omit the identifier for a provider that
+/// **gates on it**. OpenCode Go does the second thing: requests without
+/// `x-opencode-session` are rejected with 400 `missing_session_id`, which
+/// made a perfectly alive channel read as dead — the breaker backed off a
+/// healthy provider and the test button showed 400s carrying no signal.
+///
+/// So on an OpenCode host the probe speaks as its own conversation: one
+/// stable synthetic ID per (upstream, model), deterministic across
+/// restarts. The value is ours by construction — recognisable, and not any
+/// client's conversation.
+///
+/// Scoped to `opencode.ai` and not fired everywhere: vendors not in on the
+/// convention ignore unknown headers today, but "probe-shaped extra header"
+/// is not a wire shape other providers have agreed to meet us halfway on.
+///
+/// The hash is `DefaultHasher::new()`, whose keys are fixed — the same
+/// (url, model) pair derives the same value across processes, so the
+/// provider sees one long-lived conversation rather than a fresh one per
+/// probe.
+fn synthetic_session_header(url: &str, model: &str) -> Option<(&'static str, String)> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_owned();
+    if host != "opencode.ai" && !host.ends_with(".opencode.ai") {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, url.as_bytes());
+    std::hash::Hasher::write(&mut h, model.as_bytes());
+    Some((
+        "x-opencode-session",
+        format!("litrouter-probe-{:016x}", std::hash::Hasher::finish(&h)),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ---------- synthetic_session_header ----------
+
+    #[test]
+    fn an_opencode_target_gets_a_stable_probe_conversation() {
+        let (name, first) = synthetic_session_header(
+            "https://opencode.ai/inference/go/openai/v1/chat/completions",
+            "beam-free",
+        )
+        .expect("an opencode.ai url must produce a session id");
+        assert_eq!(name, "x-opencode-session");
+        assert!(first.starts_with("litrouter-probe-"), "got {first:?}");
+
+        // Deterministic, not random: the same (upstream, model) pair is the
+        // same conversation for the provider across probe calls and process
+        // restarts, which is what "one stable id per conversation" means.
+        assert_eq!(
+            synthetic_session_header(
+                "https://opencode.ai/inference/go/openai/v1/chat/completions",
+                "beam-free"
+            ),
+            Some((name, first.clone())),
+            "the same probe changed its conversation"
+        );
+        // Different model = different conversation, so two models' probes
+        // are never conflated into one session bucket upstream; so is a
+        // different endpoint — each upstream gets its own.
+        assert_ne!(
+            synthetic_session_header(
+                "https://opencode.ai/inference/go/openai/v1/chat/completions",
+                "deepseek-v4.1-flash",
+            )
+            .unwrap(),
+            (name, first.clone())
+        );
+        assert_ne!(
+            synthetic_session_header(
+                "https://api.opencode.ai/inference/go/openai/v1/chat/completions",
+                "beam-free",
+            )
+            .unwrap(),
+            (name, first)
+        );
+    }
+
+    #[test]
+    fn everyone_else_gets_no_session_header() {
+        // The check must not pass merely because the host *contains* the
+        // tokens — `notopencode.ai` is some unrelated vendor.
+        for url in [
+            "https://notopencode.ai/v1/chat/completions",
+            "http://127.0.0.1:8080/chat/completions",
+            "opencode.ai/v1/chat/completions",
+        ] {
+            assert!(
+                synthetic_session_header(url, "beam-free").is_none(),
+                "{url} must get no synthetic session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_to_another_vendor_carries_no_session_header() {
+        // The negative half through the real send path: the header is
+        // injected only where it gates, so an unknown vendor sees an
+        // ordinary probe-shaped request. (The positive half can't go through
+        // `send` in a test — there is no opencode.ai endpoint to hit on
+        // localhost — it lives in the pure-function tests above.)
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let url = format!("{}/chat/completions", server.uri());
+
+        let outcome = send(
+            &reqwest::Client::new(),
+            &url,
+            &[("Authorization", "Bearer test")],
+            "beam-free",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(outcome.is_success(), "probe prerequisite: got {outcome:?}");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs[0].headers.get("x-opencode-session").is_none(),
+            "invented a session header for a vendor that never asked for one"
+        );
     }
 }

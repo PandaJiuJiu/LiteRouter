@@ -1572,6 +1572,35 @@ fn error_response(
 /// downgrade the caller's request to a plain one. It crosses only when the
 /// upstream speaks Anthropic — an OpenAI-shaped upstream has no such switch,
 /// and the header would be noise at best.
+///
+/// The headers named in [`SESSION_PASSTHROUGH_HEADERS`] are the other
+/// exception: conversation correlation, not identity. See there.
+/// The headers the upstreams that care about it (OpenCode Go since 2026-09
+/// rejects requests without one) actually recognize, forwarded **verbatim**
+/// when the client sent them — name and value untouched.
+///
+/// Why no agent-to-agent translation (`x-claude-code-session-id` →
+/// `x-opencode-session`, say): every harness carries a stable
+/// per-conversation ID in its own header, and the providers that require one
+/// accept the native names — so "the client's value is authoritative,
+/// forward it as-is" needs no knowledge of how any harness or provider
+/// names things, while a translation table between the two sides could only
+/// ever be incomplete. This is conversation correlation, not identity —
+/// forwarding it does not weaken the deliberate drop of `user-agent` above.
+///
+/// Absent headers stay absent (no header in, no header out), and each is
+/// still funneled through [`with_header_if_valid`]: an unrenderable value is
+/// dropped rather than latched as a builder error that `.send()` would
+/// report as a transport failure, burning a real failover hop on garbage.
+const SESSION_PASSTHROUGH_HEADERS: [&str; 6] = [
+    "x-opencode-session",
+    "x-claude-code-session-id",
+    "x-deepseek-harness-session-id",
+    "x-session-affinity",
+    "thread-id",
+    "session-id",
+];
+
 fn build_request(
     client: &reqwest::Client,
     base_url: &str,
@@ -1605,6 +1634,11 @@ fn build_request(
     req = with_header_if_valid(req, LITREQUESTER_ID_HEADER, ids.gateway_request_id);
     if !ids.client_request_id.is_empty() {
         req = with_header_if_valid(req, "x-request-id", ids.client_request_id);
+    }
+    for name in SESSION_PASSTHROUGH_HEADERS {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            req = with_header_if_valid(req, name, value);
+        }
     }
     req.header("Content-Type", "application/json")
 }
