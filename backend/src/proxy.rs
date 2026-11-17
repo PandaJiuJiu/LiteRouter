@@ -2241,6 +2241,12 @@ async fn record_outcome_in_breaker(
             .breaker
             .record(breaker_key, Outcome::Failure(reason, backoff_hint))
             .await;
+        // Announce the trip once, on the transition that opens the breaker.
+        // A channel that stays broken would otherwise announce itself on
+        // every request that reaches it.
+        if transition.kind == breaker::TransitionKind::Inserted {
+            breaker::log_tripped(breaker_key, &transition.reason);
+        }
         let event_kind = match transition.kind {
             breaker::TransitionKind::Inserted => Some(BreakerEventKind::Tripped),
             breaker::TransitionKind::Updated => Some(BreakerEventKind::ReTripped),
@@ -2336,10 +2342,14 @@ impl StreamLog {
                 last.ok = false;
                 last.error = label;
             }
-            self.state
+            let transition = self
+                .state
                 .breaker
                 .record(&self.breaker_key, Outcome::Failure(reason, None))
                 .await;
+            if transition.kind == breaker::TransitionKind::Inserted {
+                breaker::log_tripped(&self.breaker_key, &transition.reason);
+            }
         } else if let Some(reason) = abort_reason {
             // Stream ended without an explicit error but without a terminator
             // either. Record the diagnostic reason so it's visible in the log list.
@@ -3858,13 +3868,16 @@ async fn relay(
                     // Not a 429 and not a transport error, so neither counter
                     // moves: the final-status decision lands on 502, which is
                     // right — we got a response, it just wasn't usable.
-                    state
+                    let transition = state
                         .breaker
                         .record(
                             &breaker_key,
                             Outcome::Failure(format!("HTTP {code}: {detail}"), None),
                         )
                         .await;
+                    if transition.kind == breaker::TransitionKind::Inserted {
+                        breaker::log_tripped(&breaker_key, &transition.reason);
+                    }
                     // Keep the offending body for the log detail page. Only
                     // the last one is retained, so a long failover chain
                     // writes one file, not one per hop.
@@ -3893,10 +3906,13 @@ async fn relay(
                     );
                     all_errors.push(format!("{} ({}): {}", cand.name, target_model, err_msg));
                     transport_err_count += 1;
-                    state
+                    let transition = state
                         .breaker
                         .record(&breaker_key, Outcome::Failure(err_msg.clone(), None))
                         .await;
+                    if transition.kind == breaker::TransitionKind::Inserted {
+                        breaker::log_tripped(&breaker_key, &transition.reason);
+                    }
                     // Fall through to the next candidate / next target.
                 }
             }

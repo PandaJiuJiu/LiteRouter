@@ -19,6 +19,14 @@
 //! enumerating them. To probe such a channel we fetch the live model list
 //! from `GET /v1/models` and cache it for `model_cache_ttl`. Configured
 //! non-wildcard `models` lists are used verbatim with no extra round-trip.
+//!
+//! ## Console output
+//!
+//! The probe ticker runs forever, so a channel that stays broken would
+//! print a line on every tick — in a container that is most of the log.
+//! Only the two *transitions* are printed: the trip (the breaker opened)
+//! and the recovery (it closed again). Everything in between is recorded
+//! in the `breaker_events` table and shown in the admin panel.
 
 use crate::breaker::{self, Outcome, TransitionKind};
 use crate::breaker_history::{record_breaker_event, BreakerEventKind, BreakerEventRow};
@@ -159,10 +167,16 @@ async fn sweep(
             }
             let result = probe_one(state, &ch, m).await;
             let success = result.is_success();
+            let key = breaker::breaker_key(&channel_name, m);
+            // `record()` reports `Removed` for any success, including one
+            // for a key that was not tracked. Ask the breaker whether this
+            // key was actually open *before* recording, so "recovered" is
+            // only announced for a real recovery.
+            let was_open = state.breaker.get_key_state(&key).await.is_some();
             let transition = state
                 .breaker
                 .record(
-                    &breaker::breaker_key(&channel_name, m),
+                    &key,
                     if success {
                         Outcome::Success
                     } else {
@@ -185,12 +199,32 @@ async fn sweep(
                         channel_name: channel_name.clone(),
                         target_model: m.clone(),
                         event,
-                        reason: transition.reason,
+                        reason: transition.reason.clone(),
                         backoff_secs: transition.backoff_secs,
                     },
                 );
             }
-            log_probe(&channel_name, m, &result);
+            // Console output: the trip and the recovery are the two moments
+            // worth a line. Everything in between — a probe that fails
+            // again, backoff doubling — repeats on every tick and would
+            // bury the log. The full history lives in `breaker_events`.
+            match transition.kind {
+                TransitionKind::Inserted => breaker::log_tripped(&key, &transition.reason),
+                TransitionKind::Removed if was_open => breaker::log_recovered(&key),
+                _ => {}
+            }
+            // With debug logging on, every probe is spelled out — the
+            // escape hatch for "why is the breaker still open?" when the
+            // two transition lines above don't say enough.
+            if state
+                .debug_logging
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                crate::logging::debug(format!(
+                    "breaker probe channel={channel_name} model={m} {}",
+                    probe_detail(&result)
+                ));
+            }
             report.probed += 1;
             if success {
                 report.recovered += 1;
@@ -258,18 +292,17 @@ async fn probe_one(state: &AppState, ch: &ProbeChannel, model: &str) -> ProbeOut
     crate::probe::send(&client, &url, &headers, model, PROBE_TIMEOUT).await
 }
 
-/// One info line per probe. Sample:
-///   breaker probe channel=openrouter model=gpt-4 result=success
-///   breaker probe channel=huoshan model=glm-5.3 result=failure status=429
-fn log_probe(channel: &str, model: &str, result: &ProbeOutcome) {
-    let status = match result {
+/// The outcome of one probe, spelled out for the debug-log line.
+/// Sample: `result=success` / `result=failure status=429` /
+/// `result=failure error=transport: dns`.
+fn probe_detail(result: &ProbeOutcome) -> String {
+    match result {
         ProbeOutcome::Success => "result=success".to_string(),
         ProbeOutcome::Http { status, .. } => format!("result=failure status={status}"),
         // Already carries its own `transport: ` prefix from
         // `describe_transport_error` — don't add a second one.
         other => format!("result=failure error={}", other.reason()),
-    };
-    println!("breaker probe channel={channel} model={model} {status}");
+    }
 }
 
 async fn load_probe_channel(

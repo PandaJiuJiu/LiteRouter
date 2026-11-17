@@ -96,7 +96,7 @@ pub enum Outcome {
 /// caller so an upstream module can decide what history row to append without
 /// re-querying internal state. `disabled → None` is its own case so the
 /// hot path can short-circuit cleanly.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionKind {
     /// Breaker disabled — record() was a no-op.
     None,
@@ -387,6 +387,62 @@ pub fn split_key_owned(key: &str) -> (String, String) {
         Some((c, m)) => (c.to_string(), m.to_string()),
         None => (String::new(), key.to_string()),
     }
+}
+
+/// Console line for the moment a channel/model leaves rotation.
+///
+/// The container log is where an operator looks first when a channel
+/// starts failing, so the trip gets a line. It gets exactly one: the
+/// breaker re-probes a broken channel for as long as it stays broken, and
+/// a line per probe would bury everything else in the log.
+pub fn log_tripped(key: &str, reason: &str) {
+    crate::logging::warn(trip_line(key, reason));
+}
+
+/// The text of the trip line, without the newline — a separate function so
+/// the format can be asserted on.
+pub fn trip_line(key: &str, reason: &str) -> String {
+    let (channel, model) = split_key_owned(key);
+    format!(
+        "breaker tripped channel={channel} model={model} reason={}",
+        one_line(reason)
+    )
+}
+
+/// Console line for the moment a channel/model comes back.
+///
+/// The probe path is the recovery reporter: it is the only path that
+/// closes a breaker on purpose. The relay path can also close one, but
+/// only in a race — it skips open keys, so the success it records belongs
+/// to a key that was never open unless a concurrent request tripped it
+/// microseconds earlier. Too rare to be worth a line on the hot path.
+pub fn log_recovered(key: &str) {
+    crate::logging::info(recovered_line(key));
+}
+
+/// The text of the recovery line, without the newline.
+pub fn recovered_line(key: &str) -> String {
+    let (channel, model) = split_key_owned(key);
+    format!("breaker recovered channel={channel} model={model}")
+}
+
+/// Flatten a reason to a single line so one upstream message can't turn a
+/// single log entry into a dozen.
+fn one_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 // ---- HTTP handlers (admin) ------------------------------------------------
@@ -975,6 +1031,41 @@ mod tests {
         assert!(
             second < first,
             "expected the countdown to advance: {first} -> {second}"
+        );
+    }
+
+    // ---------- one_line ----------
+
+    #[test]
+    fn a_reason_becomes_a_single_line() {
+        // An upstream error body can carry newlines; the log line must not
+        // turn into a dozen.
+        assert_eq!(
+            one_line("HTTP 500:\n  {\"error\": {\"message\": \"boom\"}}\n"),
+            "HTTP 500: {\"error\": {\"message\": \"boom\"}}"
+        );
+        assert_eq!(one_line("  transport: dns  "), "transport: dns");
+        assert_eq!(one_line(""), "");
+    }
+
+    // ---------- trip_line / recovered_line ----------
+
+    #[test]
+    fn the_trip_line_names_the_channel_the_model_and_the_reason() {
+        assert_eq!(
+            trip_line(
+                &breaker_key("openrouter", "stealth/crouton-alpha"),
+                "transport: dns"
+            ),
+            "breaker tripped channel=openrouter model=stealth/crouton-alpha reason=transport: dns"
+        );
+    }
+
+    #[test]
+    fn the_recovery_line_names_the_channel_and_the_model() {
+        assert_eq!(
+            recovered_line(&breaker_key("openrouter", "stealth/crouton-alpha")),
+            "breaker recovered channel=openrouter model=stealth/crouton-alpha"
         );
     }
 }

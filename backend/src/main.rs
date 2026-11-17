@@ -1,8 +1,15 @@
-use literouter::{breaker_probe, build_router, build_state, db};
+use literouter::{breaker_probe, build_router, build_state, db, logging};
 
 #[tokio::main]
 async fn main() {
     let db_path = std::env::var("LITEROUTER_DB").unwrap_or_else(|_| "literouter.db".to_string());
+    let log_dir = std::env::var("LITEROUTER_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| logging::default_dir(&db_path));
+    if let Err(e) = logging::init(log_dir.clone()) {
+        eprintln!("failed to open log file in {}: {e}", log_dir.display());
+    }
+
     let pool = db::init_pool(&db_path).await;
     let state = build_state(pool).await;
 
@@ -24,11 +31,12 @@ async fn main() {
                     .filter(|d| *d > 0)
                     .unwrap_or(7);
                 match db::cleanup_old_logs(&pool, days).await {
-                    Ok(n) if n > 0 => {
-                        println!("log cleanup: removed {} rows older than {}d", n, days)
-                    }
+                    Ok(n) if n > 0 => logging::info(format!(
+                        "log cleanup: removed {} rows older than {}d",
+                        n, days
+                    )),
                     Ok(_) => {}
-                    Err(e) => eprintln!("log cleanup failed: {}", e),
+                    Err(e) => logging::error(format!("log cleanup failed: {}", e)),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
@@ -63,7 +71,7 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "12000".to_string());
     let addr = format!("0.0.0.0:{}", port);
-    println!("literouter listening on http://{}", addr);
+    logging::info(format!("literouter listening on http://{}", addr));
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind failed");
@@ -71,10 +79,11 @@ async fn main() {
     // scope for handlers that take `ConnectInfo<SocketAddr>` — without it
     // axum rejects the extractor and the relay can't record a client IP when
     // there's no reverse proxy setting X-Forwarded-For.
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    .unwrap();
+    .await;
+    logging::shutdown();
+    serve_result.unwrap();
 }
