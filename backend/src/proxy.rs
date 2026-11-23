@@ -2226,7 +2226,7 @@ async fn record_outcome_in_breaker(
     if code == 429 {
         *retriable_429_count += 1;
     }
-    if code != 400 && code != 422 {
+    if code != 400 && code != 422 && code != 401 && code != 403 && code != 404 {
         // Prefer the upstream's own wording so the panel says *why* it
         // tripped (`HTTP 429: Rate limit exceeded`) instead of a bare code;
         // `clip_reason` inside the breaker trims an over-long message.
