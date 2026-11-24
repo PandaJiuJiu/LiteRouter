@@ -159,6 +159,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/users/:id",
             axum::routing::put(users::update_user).delete(users::delete_user),
         )
+        // Relay clients (Claude Code, SDKs) legitimately send request bodies
+        // well past axum's 2 MB default — a single image-heavy turn can exceed
+        // it. `Bytes` enforces `DefaultBodyLimit` while buffering the *inbound*
+        // body; the limit is transport-level and protocol-agnostic, so without
+        // raising it every large-but-valid request gets a 413 before `relay`
+        // ever runs. 64 MB leaves headroom over the ~32 MB upstream image
+        // ceiling. Outbound requests (reqwest in `try_upstream`) have no such
+        // cap, so this only governs client → gateway.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         // The SPA is served from a different origin during development (vite
         // on :5173) and the gateway is called from arbitrary SDK hosts in
         // production, so CORS stays permissive.
