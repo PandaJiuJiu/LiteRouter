@@ -1052,6 +1052,12 @@ pub async fn list_logs(
                 "prompt_tokens": r.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": r.get::<i64, _>("completion_tokens"),
                 "total_tokens": r.get::<i64, _>("total_tokens"),
+                // Raw inbound request body size in bytes. Not a token count
+                // and never added to any total — it answers "how big was the
+                // request" for rows whose upstream never reported usage (e.g.
+                // failures, which otherwise show 0 tokens). `try_get`: rows
+                // predating migration 0039.
+                "request_bytes": r.try_get::<i64, _>("request_bytes").unwrap_or(0),
                 // `logs.latency_ms` is written by `log_request` (see migration
                 // 0014) for every row — admin uses it on the list page to
                 // spot slow requests alongside the status code. The detail
@@ -1235,6 +1241,10 @@ pub async fn get_log(
             "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
             "completion_tokens": row.get::<i64, _>("completion_tokens"),
             "total_tokens": row.get::<i64, _>("total_tokens"),
+            // Raw inbound request body size in bytes. Not a token count;
+            // present so failed/zero-usage rows still show how big the
+            // request was. `try_get`: rows predating migration 0039.
+            "request_bytes": row.try_get::<i64, _>("request_bytes").unwrap_or(0),
             "cache_read_tokens": row.get::<i64, _>("cache_read_tokens"),
             "cache_creation_tokens": row.get::<i64, _>("cache_creation_tokens"),
             "reasoning_tokens": row.get::<i64, _>("reasoning_tokens"),

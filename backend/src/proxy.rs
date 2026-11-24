@@ -928,33 +928,45 @@ fn new_request_id(token_name: &str, model: &str) -> String {
 /// `log_request` once the request settles. Returns the new `logs.id`, or
 /// `None` if the insert fails (the relay proceeds anyway — the final
 /// `log_request` will insert the row then).
+/// The per-request facts `insert_pending_log` needs, bundled so the function
+/// stays under clippy's argument-count limit without an `#[allow]`. Every
+/// field is known at request arrival, before any upstream work, which is
+/// exactly why they're written on the pending row: a client that hangs up
+/// mid-relay still leaves its size and protocol behind.
+struct PendingMeta<'a> {
+    request_model: &'a str,
+    protocol: &'a str,
+    streaming: bool,
+    request_bytes: i64,
+}
+
 async fn insert_pending_log(
     pool: &SqlitePool,
     token_name: &str,
-    request_model: &str,
-    protocol: &str,
-    streaming: bool,
     client_info: &ClientInfo,
     request_id: &str,
+    meta: &PendingMeta<'_>,
 ) -> Option<i64> {
     let res = sqlx::query(
         "INSERT INTO logs \
          (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, \
           total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, \
           upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, \
-          failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id) \
-         VALUES (?, ?, '', 0, 0, 0, 0, ?, ?, 0, ?, ?, '', '', '', 0, 0, 0, 0, ?, ?, 0, 0, ?, ?)",
+          failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id, \
+          request_bytes) \
+         VALUES (?, ?, '', 0, 0, 0, 0, ?, ?, 0, ?, ?, '', '', '', 0, 0, 0, 0, ?, ?, 0, 0, ?, ?, ?)",
     )
     .bind(token_name)
-    .bind(request_model) // `model` — overwritten on finalize; keeps list fallback sane
+    .bind(meta.request_model) // `model` — overwritten on finalize; keeps list fallback sane
     .bind(now())
-    .bind(request_model)
-    .bind(streaming as i64)
-    .bind(protocol)
+    .bind(meta.request_model)
+    .bind(meta.streaming as i64)
+    .bind(meta.protocol)
     .bind(&client_info.ip)
     .bind(&client_info.user_agent)
     .bind(request_id)
     .bind(&client_info.request_id)
+    .bind(meta.request_bytes)
     .execute(pool)
     .await
     .ok()?;
@@ -1317,6 +1329,11 @@ struct LogEntry {
     /// final row and event so the list order and detail page reflect when
     /// the request started, not when it settled.
     created_at: i64,
+    /// Raw inbound request body size in bytes, recorded before any upstream
+    /// work — so even a request that failed (or was skipped by the breaker)
+    /// leaves its size behind. Transport-level, protocol-agnostic, and
+    /// **not** a token count: never added to any token total.
+    request_bytes: i64,
 }
 
 /// Write the `logs` row plus one `log_attempts` row per hop, atomically.
@@ -1345,7 +1362,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
                  latency_ms=?, stream=?, protocol=?, convert=?, upstream_model=?, error=?, \
                  cache_read_tokens=?, cache_creation_tokens=?, reasoning_tokens=?, \
                  failed_count=?, client_ip=?, user_agent=?, client_aborted=?, ttft_ms=?, \
-                 client_request_id=? \
+                 client_request_id=?, request_bytes=? \
                  WHERE id=?",
             )
             .bind(&e.token_name)
@@ -1371,6 +1388,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(e.client_aborted as i64)
             .bind(e.ttft_ms)
             .bind(&e.client_request_id)
+            .bind(e.request_bytes)
             .bind(id)
             .execute(&mut *tx)
             .await;
@@ -1381,7 +1399,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         }
         None => {
             let res = sqlx::query(
-                "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO logs (token_name, model, channel_name, status_code, prompt_tokens, completion_tokens, total_tokens, created_at, request_model, latency_ms, stream, protocol, convert, upstream_model, error, cache_read_tokens, cache_creation_tokens, reasoning_tokens, failed_count, client_ip, user_agent, client_aborted, ttft_ms, request_id, client_request_id, request_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&e.token_name)
             .bind(&winner.upstream_model)
@@ -1408,6 +1426,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
             .bind(e.ttft_ms)
             .bind(&e.request_id)
             .bind(&e.client_request_id)
+            .bind(e.request_bytes)
             .execute(&mut *tx)
             .await;
             match res {
@@ -3225,6 +3244,10 @@ struct RelayCtx<'a> {
     log_id: Option<i64>,
     /// Unix timestamp (seconds) when the request arrived.
     created_at: i64,
+    /// Raw inbound request body size in bytes, threaded through to the
+    /// final log row so success and failure alike record how big the
+    /// request was. Not a token count.
+    request_bytes: i64,
 }
 
 /// Convert an upstream response into the client response, returning the
@@ -3272,6 +3295,7 @@ async fn respond_from_upstream(
         request_id: ctx.request_id.to_string(),
         log_id: ctx.log_id,
         created_at: ctx.created_at,
+        request_bytes: ctx.request_bytes,
     };
 
     let (status, content_type, bytes, capture, refs) = match body {
@@ -3549,11 +3573,14 @@ async fn relay(
     let log_id = insert_pending_log(
         &state.pool,
         &token_name,
-        &model,
-        protocol,
-        is_streaming,
         &client_info,
         &request_id,
+        &PendingMeta {
+            request_model: &model,
+            protocol,
+            streaming: is_streaming,
+            request_bytes: body.len() as i64,
+        },
     )
     .await;
 
@@ -3619,6 +3646,10 @@ async fn relay(
     // The upstream body from the most recent unusable-2xx hop, if any. Held
     // rather than written immediately so only the final failure is persisted.
     let mut last_capture: Option<DebugCapture> = None;
+    // The inbound request's size, captured before the loop: the loop body
+    // shadows `body` (with the upstream response body in the Ok arm), and
+    // every log row needs the *request* size regardless of how the hop ended.
+    let request_bytes = body.len() as i64;
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
@@ -3778,6 +3809,7 @@ async fn relay(
                             request_id: &request_id,
                             log_id,
                             created_at,
+                            request_bytes,
                         },
                         target_model,
                         cand,
@@ -3969,6 +4001,7 @@ async fn relay(
             request_id: request_id.clone(),
             log_id,
             created_at,
+            request_bytes,
         };
         // Synchronous log write so tests and admin UI see it immediately.
         pending_guard.disarm();
@@ -4048,6 +4081,7 @@ async fn relay(
         request_id: request_id.clone(),
         log_id,
         created_at,
+        request_bytes,
     };
     // Synchronous log write so tests and admin UI see it immediately. Debug
     // file writes stay async off the response path.

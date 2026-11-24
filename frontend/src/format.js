@@ -18,6 +18,23 @@ export function tableNum(_row, _column, value) {
 }
 
 /**
+ * Human-readable byte size: 0 -> "0 B", 1536 -> "1.5 KB", 33554432 -> "32 MB".
+ * Used for `logs.request_bytes` — the raw inbound body size, which is a
+ * transport-level measurement, not a token count. One decimal place, trailing
+ * ".0" dropped; binary units (1024) so it lines up with what an admin sees
+ * in `ls -l` / file properties.
+ */
+export function fmtBytes(n) {
+  const v = Number(n || 0)
+  if (v <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(v) / Math.log(1024)), units.length - 1)
+  const scaled = v / Math.pow(1024, i)
+  const rounded = Math.round(scaled * 10) / 10
+  return `${rounded} ${units[i]}`
+}
+
+/**
  * Short form for axis ticks: 1_234 -> "1.2K", 5_000_000 -> "5M". Keeps the
  * y-axis labels narrow (a token axis regularly reaches seven digits) while
  * staying numeric enough to read at a glance. At most one decimal place, and

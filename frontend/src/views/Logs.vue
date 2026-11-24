@@ -134,6 +134,13 @@
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
+      <el-table-column :label="t('logs.col.requestSize')" width="100">
+        <template #default="{ row }">
+          <span v-if="row.pending === true" class="hint">—</span>
+          <span v-else-if="row.request_bytes > 0" class="num" :title="t('logs.requestSizeHint')">{{ fmtBytes(row.request_bytes) }}</span>
+          <span v-else class="hint">—</span>
+        </template>
+      </el-table-column>
       <el-table-column :label="t('logs.col.tokens')" width="110" prop="total_tokens">
         <template #default="{ row }">
           <span v-if="row.pending === true" class="hint">—</span>
@@ -185,6 +192,7 @@ import { useI18n } from 'vue-i18n'
 import { listLogFilterOptions, listLogs, openLogStream } from '../api'
 import { loadSession, session } from '../session'
 import { debugLogging, loadDebugLogging, toggleDebugLogging } from '../debug'
+import { fmtBytes } from '../format'
 
 const { t } = useI18n()
 const router = useRouter()

@@ -244,10 +244,14 @@ export default {
       upstreamModel: '转发模型',
       statusCode: '状态码',
       duration: '耗时',
+      requestSize: '请求体积',
     },
     noChannel: '无渠道',
     failTipTitle: '前 {count} 次转发失败，已自动切换渠道',
     failBadge: '失败 {count} 次',
+    // 原始入站请求体大小。传输层测量，不是 token 数——不计入任何 token 合计；
+    // 失败/零用量的行也能据此看出请求有多大。
+    requestSizeHint: '—— 入站请求体大小（字节），不是 token',
     // 客户端提前掐断的流：200 是真的，0 token 是客户端没等到的流末尾用量。
     // 不是失败，所以用中性标签，不走失败 hop 的红色样式。
     aborted: '客户端已取消',
@@ -294,6 +298,9 @@ export default {
       cacheWrite: 'cache_creation',
       reasoning: 'reasoning',
       ttft: 'TTFT',
+      // 原始入站请求体大小，放在 token 区块里给失败行的"0 token"提供上下文。
+      // 不是 token 数。
+      requestSize: '请求体积',
       // 仅当客户端自己带了 x-request-id 时才出现。
       clientRequestId: 'x-request-id',
       gatewayRequestId: 'x-litrouter-request-id',
@@ -304,6 +311,7 @@ export default {
     cacheWriteHint: '—— 缓存写入',
     reasoningHint: '—— 已含在输出中',
     ttftHint: '—— 首 token 响应时间',
+    requestSizeHint: '—— 入站请求体大小，不计入 token',
     attemptTotal: '共 {n} 次尝试',
     attemptSkipped: '跳过 {n} 次',
     attemptFailed: '失败 {n} 次',

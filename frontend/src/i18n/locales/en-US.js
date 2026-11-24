@@ -252,10 +252,15 @@ export default {
       upstreamModel: 'Forwarded model',
       statusCode: 'Status',
       duration: 'Duration',
+      requestSize: 'Req size',
     },
     noChannel: 'no channel',
     failTipTitle: 'First {count} forwarding attempts failed — the channel was switched automatically',
     failBadge: '{count} failed',
+    // Raw inbound request body size. A transport measurement, not a token
+    // count — never added to any token total; present so failed/zero-usage
+    // rows still show how big the request was.
+    requestSizeHint: '— inbound request body size (bytes), not tokens',
     // A stream the client hung up on: the 200 is real, the 0 tokens are the
     // usage tail the client never waited for. Not a failure, so it gets its
     // own neutral tag rather than the red treatment a failed hop gets.
@@ -303,6 +308,9 @@ export default {
       cacheWrite: 'cache_creation',
       reasoning: 'reasoning',
       ttft: 'TTFT',
+      // Raw inbound request body size, shown in the token section so a
+      // failed row's "0 tokens" has context. Not a token count.
+      requestSize: 'Request size',
       // Shown only when the client sent one.
       clientRequestId: 'x-request-id',
       gatewayRequestId: 'x-litrouter-request-id',
@@ -313,6 +321,7 @@ export default {
     cacheWriteHint: '— cache write',
     reasoningHint: '— already included in output',
     ttftHint: '— Time to First Token',
+    requestSizeHint: '— inbound request body size, not counted as tokens',
     attemptTotal: '{n} attempts',
     attemptSkipped: '{n} skipped',
     attemptFailed: '{n} failed',
