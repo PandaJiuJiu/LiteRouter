@@ -57,9 +57,15 @@
           <el-descriptions-item v-if="log.request_id" :label="t('logDetail.field.gatewayRequestId')">
             <span class="mono">{{ log.request_id }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="User-Agent">
-            <span v-if="log.user_agent" class="ua-full">{{ log.user_agent }}</span>
-            <span v-else class="hint">—</span>
+          <el-descriptions-item v-if="log.user_agent" label="User-Agent">
+            <span class="ua-full">{{ log.user_agent }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="!log.user_agent" label="User-Agent">
+            <span class="hint">—</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="log.request_bytes > 0" :label="t('logDetail.field.requestSize')">
+            {{ fmtBytes(log.request_bytes) }}
+            <span class="hint">{{ t('logDetail.requestSizeHint') }}</span>
           </el-descriptions-item>
         </el-descriptions>
       </section>
@@ -140,10 +146,6 @@
           <el-descriptions-item :label="t('logDetail.field.output')">
             {{ log.completion_tokens.toLocaleString() }}
             <span class="hint">{{ t('logDetail.outputHint') }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item :label="t('logDetail.field.requestSize')">
-            {{ fmtBytes(log.request_bytes) }}
-            <span class="hint">{{ t('logDetail.requestSizeHint') }}</span>
           </el-descriptions-item>
           <el-descriptions-item v-if="log.cache_read_tokens > 0" :label="t('logDetail.field.cacheRead')">
             {{ log.cache_read_tokens.toLocaleString() }}
