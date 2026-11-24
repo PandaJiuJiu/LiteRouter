@@ -1268,6 +1268,43 @@ async fn insert_attempt_row(
     Some(res.last_insert_rowid())
 }
 
+/// Persist several breaker-skipped hops in one transaction. Skipped hops are
+/// settled at creation (no provisional row, no later update), so batching
+/// them is safe and avoids one DB round-trip per skip on the hot path.
+async fn flush_skipped_attempts(pool: &SqlitePool, log_id: Option<i64>, rows: &[(usize, Attempt)]) {
+    let Some(log_id) = log_id else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(mut tx) = pool.begin().await else {
+        return;
+    };
+    for (seq, a) in rows {
+        let _ = sqlx::query(
+            "INSERT INTO log_attempts (log_id, seq, upstream_model, channel_name, status_code, error, latency_ms, convert, ok, skipped, ttft_ms, upstream_request_id, upstream_cf_ray, upstream_generation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(log_id)
+        .bind(*seq as i64)
+        .bind(&a.upstream_model)
+        .bind(&a.channel_name)
+        .bind(a.status)
+        .bind(&a.error)
+        .bind(a.latency_ms)
+        .bind(convert_label(a.convert))
+        .bind(a.ok as i64)
+        .bind(a.skipped as i64)
+        .bind(a.ttft_ms)
+        .bind(&a.refs.request_id)
+        .bind(&a.refs.cf_ray)
+        .bind(&a.refs.generation_id)
+        .execute(&mut *tx)
+        .await;
+    }
+    let _ = tx.commit().await;
+}
+
 /// Settle the provisional row `insert_attempt_row` wrote, so the detail page
 /// stops showing the hop as in flight. Best-effort, like its counterpart.
 async fn update_attempt_row(pool: &SqlitePool, row_id: i64, a: &Attempt) {
@@ -3656,6 +3693,11 @@ async fn relay(
     // shadows `body` (with the upstream response body in the Ok arm), and
     // every log row needs the *request* size regardless of how the hop ended.
     let request_bytes = body.len() as i64;
+    // Breaker-skipped hops buffered for a single DB write + SSE broadcast.
+    // When many candidates are open-circuited, flushing per skip makes the
+    // relay spend hundreds of ms on SQLite/SSE before it reaches a live
+    // upstream; batching keeps the fast path fast.
+    let mut pending_skip_rows: Vec<(usize, Attempt)> = Vec::new();
     for (pin_channel, target_model) in &targets {
         let candidates = if pin_channel.is_empty() {
             match candidate_channels(state, target_model, protocol).await {
@@ -3663,6 +3705,10 @@ async fn relay(
                 Err(s) => {
                     // A real (if rare) gateway-side failure, not a client
                     // disconnect — disarm so the guard doesn't mislabel it.
+                    if !pending_skip_rows.is_empty() {
+                        flush_skipped_attempts(&state.pool, log_id, &pending_skip_rows).await;
+                        pending_skip_rows.clear();
+                    }
                     pending_guard.disarm();
                     return error_response(protocol, s, "internal error", None, &request_id);
                 }
@@ -3711,13 +3757,10 @@ async fn relay(
             // page shows the request tried it (admin still sees what was
             // skipped) but `all_errors` is *not* updated — the failure is
             // not a "real" upstream failure and shouldn't bias the
-            // final-status decision (block at 1652 area in old code).
+            // final-status decision.
             let breaker_key = breaker::breaker_key(&cand.name, target_model);
             if !state.breaker.allow(&breaker_key).await {
                 attempted += 1;
-                // A skip is decided here and now — no await can cut it off — so
-                // it is persisted and broadcast as a settled hop in one step,
-                // not provisional-then-update.
                 let skipped = Attempt::new(
                     target_model,
                     cand,
@@ -3729,7 +3772,16 @@ async fn relay(
                 .skipped();
                 let seq = breadcrumbs.attempts.lock().unwrap().len();
                 breadcrumbs.attempts.lock().unwrap().push(skipped.clone());
-                insert_attempt_row(&state.pool, log_id, seq, &skipped).await;
+                pending_skip_rows.push((seq, skipped));
+                continue;
+            }
+            // Flush any breaker-skipped hops accumulated before this real
+            // attempt. Batching turns N skips into one DB transaction + one
+            // SSE broadcast instead of N of each, which keeps the relay hot
+            // path fast when many candidates are open-circuited.
+            if !pending_skip_rows.is_empty() {
+                flush_skipped_attempts(&state.pool, log_id, &pending_skip_rows).await;
+                pending_skip_rows.clear();
                 broadcast_pending_chain(
                     state,
                     log_id,
@@ -3742,7 +3794,6 @@ async fn relay(
                     created_at,
                     &breadcrumbs,
                 );
-                continue;
             }
             attempted += 1;
             upstream_attempts += 1;
@@ -4042,9 +4093,27 @@ async fn relay(
         attempted,
         all_errors.join("\n  - ")
     );
-    // The relay exhausted every candidate; nothing is in flight anymore. Snapshot
-    // the chain now — the entry below owns it, and the guard is about to be
-    // disarmed before `log_request` writes the real (failed) result.
+    // The relay exhausted every candidate; nothing is in flight anymore.
+    // Flush any trailing breaker-skipped hops so the final log row and SSE
+    // event include the full chain.
+    if !pending_skip_rows.is_empty() {
+        flush_skipped_attempts(&state.pool, log_id, &pending_skip_rows).await;
+        pending_skip_rows.clear();
+        broadcast_pending_chain(
+            state,
+            log_id,
+            &request_id,
+            &token_name,
+            &model,
+            protocol,
+            is_streaming,
+            &client_info,
+            created_at,
+            &breadcrumbs,
+        );
+    }
+    // Snapshot the chain now — the entry below owns it, and the guard is about
+    // to be disarmed before `log_request` writes the real (failed) result.
     let all_attempts = breadcrumbs.attempts.lock().unwrap().clone();
     // Every attempt failed. Create a synthetic "all-failed" winner with an
     // empty channel_name so the parent row shows "—" for the channel rather
