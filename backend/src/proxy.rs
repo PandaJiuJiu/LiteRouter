@@ -1002,13 +1002,17 @@ struct RelayBreadcrumbs {
     /// `try_upstream` and cleared once its outcome arrives, so the guard's Drop
     /// can append it as the aborted hop even though no outcome ever did.
     inflight: Mutex<Option<Attempt>>,
+    /// Raw inbound request body size in bytes — carried so every pending
+    /// broadcast (including the initial one) can ship it to the frontend.
+    request_bytes: i64,
 }
 
 impl RelayBreadcrumbs {
-    fn new() -> Self {
+    fn new(request_bytes: i64) -> Self {
         Self {
             attempts: Mutex::new(Vec::new()),
             inflight: Mutex::new(None),
+            request_bytes,
         }
     }
 }
@@ -1218,6 +1222,7 @@ fn broadcast_pending_chain(
         user_agent: client_info.user_agent.clone(),
         client_request_id: client_info.request_id.clone(),
         client_aborted: false,
+        request_bytes: breadcrumbs.request_bytes,
         streaming,
         protocol: protocol.to_string(),
         request_id: request_id.to_string(),
@@ -1485,6 +1490,7 @@ async fn log_request(state: &AppState, e: &LogEntry) -> Option<LogEvent> {
         user_agent: e.user_agent.clone(),
         client_request_id: e.client_request_id.clone(),
         client_aborted: e.client_aborted,
+        request_bytes: e.request_bytes,
         streaming: e.streaming,
         protocol: e.protocol.clone(),
         request_id: e.request_id.clone(),
@@ -3589,7 +3595,7 @@ async fn relay(
     // below). Disarmed by each path that writes the real result. The
     // breadcrumbs let that settle still record the attempt chain the future
     // would otherwise take to the grave.
-    let breadcrumbs = Arc::new(RelayBreadcrumbs::new());
+    let breadcrumbs = Arc::new(RelayBreadcrumbs::new(body.len() as i64));
     let mut pending_guard = PendingLogGuard {
         state: state_arc.clone(),
         log_id,

@@ -74,6 +74,7 @@ pub struct LogEvent {
     /// exact `logs` row — and from there to the upstream hop that answered.
     pub client_request_id: String,
     pub client_aborted: bool,
+    pub request_bytes: i64,
     pub streaming: bool,
     pub protocol: String,
     /// `true` = request in flight (a `status_code = 0` row in `logs`);

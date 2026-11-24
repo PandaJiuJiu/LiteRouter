@@ -392,6 +392,7 @@ function transformSseEvent(event) {
     client_ip: event.client_ip || '',
     user_agent: event.user_agent || '',
     client_aborted: event.client_aborted,
+    request_bytes: event.request_bytes || 0,
     pending: event.pending,
     request_id: event.request_id,
     failed_attempts: failed,
